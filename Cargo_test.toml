@@ -1,0 +1,12 @@
+[package]
+name = "gstreamer_test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gstreamer = { workspace = true }
+gstreamer-app = { workspace = true }
+
+[[bin]]
+name = "temp"
+path = "src/temp.rs"

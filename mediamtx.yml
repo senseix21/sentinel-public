@@ -1,0 +1,36 @@
+
+# MediaMTX configuration
+# This is a default configuration for RTSP streaming
+
+paths:
+  record:
+    enable: true
+    recordPath: ./recordings
+  live:
+    enable: true
+    # Record the stream to disk
+    record: true
+    # Output format (mkv is better for recording)
+    outputFormat: mkv
+    # When to rotate the file (never for continuous recording)
+    fileRotate: never
+
+# RTSP server settings
+rtsp:
+  # Listen address
+  listenAddr: :8554
+  # TLS (optional)
+  # enable: true
+  # listenAddr: :8555
+  # certFile: cert.pem
+  # keyFile: key.pem
+
+# HTTP server settings
+http:
+  # Listen address
+  listenAddr: :8181
+  # Enable web UI
+  enableUI: true
+
+# Logging settings
+logLevel: info

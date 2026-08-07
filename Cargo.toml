@@ -1,0 +1,37 @@
+[package]
+name = "cam_rtsp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true, features = ["full"] }
+axum = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+uuid = { workspace = true, features = ["v4", "serde"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+clap = { workspace = true, features = ["derive"] }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio-util = { workspace = true, features = ["io"] }
+futures = { workspace = true }
+which = "4.4.2"
+dotenv = "0.15.0"
+
+
+# GStreamer dependencies (system libraries need to be installed separately)
+gstreamer = { workspace = true }
+gstreamer-app = { workspace = true }
+gstreamer-rtsp = { workspace = true }
+gstreamer-rtsp-server = { workspace = true }
+gstreamer-base = { workspace = true }
+
+[[bin]]
+name = "temp"
+path = "src/temp.rs"
+
+[[bin]]
+name = "test_forwarder"
+path = "src/test_forwarder.rs"
