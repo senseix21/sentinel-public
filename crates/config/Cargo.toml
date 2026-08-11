@@ -1,0 +1,16 @@
+[package]
+name = "surveillance-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+surveillance-camera = { path = "../camera" }
+surveillance-common = { path = "../common" }
+surveillance-media = { path = "../media" }
+surveillance-recorder = { path = "../recorder" }
+surveillance-storage = { path = "../storage" }
