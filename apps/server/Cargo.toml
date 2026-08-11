@@ -1,0 +1,22 @@
+[package]
+name = "surveillance-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+surveillance-camera = { path = "../../crates/camera" }
+surveillance-common = { path = "../../crates/common" }
+surveillance-config = { path = "../../crates/config" }
+surveillance-media = { path = "../../crates/media" }
+surveillance-recorder = { path = "../../crates/recorder" }
+surveillance-storage = { path = "../../crates/storage" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
