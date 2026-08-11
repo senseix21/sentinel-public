@@ -1,0 +1,34 @@
+# Reference values for the H.264 MVP constructor. The current Phase 3 server
+# loads required deployment values and secrets from the environment; this file
+# is documentation until the persistent configuration phase adds a TOML loader.
+
+[camera]
+connect_timeout_seconds = 5
+max_access_unit_bytes = 2097152
+max_nals_per_access_unit = 128
+reconnect_initial_milliseconds = 250
+reconnect_maximum_seconds = 30
+reconnect_jitter_basis_points = 2000
+teardown_timeout_seconds = 2
+reconnect_stable_session_reset_seconds = 30
+
+[supervision]
+maximum_cameras = 256
+command_queue_items = 64
+command_response_timeout_seconds = 10
+api_max_request_bytes = 16384
+api_io_timeout_seconds = 5
+api_concurrent_requests = 1
+
+[recording]
+segment_duration_seconds = 30
+fragment_duration_seconds = 1
+recorder_queue_items = 32
+live_queue_items = 4
+max_segment_bytes = 33554432
+max_fragment_bytes = 8388608
+max_segment_samples = 1000
+max_pipeline_memory_bytes = 113246208
+clock_drift_tolerance_seconds = 5
+lifecycle_event_items = 64
+reconciliation_scan_entries = 100000
