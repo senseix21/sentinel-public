@@ -1,0 +1,1 @@
+//! Timestamp-aware frame sampling.
