@@ -1,37 +1,44 @@
-[package]
-name = "cam_rtsp"
+[workspace]
+resolver = "2"
+members = [
+    "apps/server",
+    "apps/worker",
+    "crates/analytics",
+    "crates/api",
+    "crates/camera",
+    "crates/common",
+    "crates/config",
+    "crates/database",
+    "crates/detector",
+    "crates/events",
+    "crates/livekit",
+    "crates/media",
+    "crates/recorder",
+    "crates/rules",
+    "crates/storage",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.88"
 
-[dependencies]
-tokio = { workspace = true, features = ["full"] }
-axum = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-chrono = { workspace = true, features = ["serde"] }
-uuid = { workspace = true, features = ["v4", "serde"] }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
-clap = { workspace = true, features = ["derive"] }
-anyhow = { workspace = true }
-thiserror = { workspace = true }
-tokio-util = { workspace = true, features = ["io"] }
-futures = { workspace = true }
-which = "4.4.2"
-dotenv = "0.15.0"
+[workspace.dependencies]
+futures-util = "=0.3.33"
+jiff = { version = "=0.2.35", default-features = false, features = ["std"] }
+muxide = { version = "=0.2.5", default-features = false }
+retina = { version = "=0.4.19", default-features = false }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.149"
+tokio = { version = "=1.53.1", features = ["fs", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = { version = "=0.1.44", default-features = false, features = ["attributes", "std"] }
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["ansi", "env-filter", "fmt"] }
+url = "=2.5.8"
 
+[workspace.lints.rust]
+unsafe_code = "forbid"
 
-# GStreamer dependencies (system libraries need to be installed separately)
-gstreamer = { workspace = true }
-gstreamer-app = { workspace = true }
-gstreamer-rtsp = { workspace = true }
-gstreamer-rtsp-server = { workspace = true }
-gstreamer-base = { workspace = true }
-
-[[bin]]
-name = "temp"
-path = "src/temp.rs"
-
-[[bin]]
-name = "test_forwarder"
-path = "src/test_forwarder.rs"
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
