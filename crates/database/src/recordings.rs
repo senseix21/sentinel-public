@@ -1,0 +1,1 @@
+//! Recording metadata persistence adapter.
