@@ -1,0 +1,1 @@
+//! Detection contracts and results.
