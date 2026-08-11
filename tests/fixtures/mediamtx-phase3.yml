@@ -1,0 +1,35 @@
+logLevel: info
+logDestinations: [stdout]
+
+authMethod: internal
+authInternalUsers:
+  - user: fixture-publisher
+    pass: fixture-publisher-pass
+    ips: ["127.0.0.1"]
+    permissions:
+      - action: publish
+        path: "~^phase3-camera-[0-9]+$"
+  - user: fixture-reader
+    pass: fixture-reader-pass
+    ips: ["127.0.0.1"]
+    permissions:
+      - action: read
+        path: "~^phase3-camera-[0-9]+$"
+
+rtsp: true
+rtspTransports: [tcp]
+rtspAddress: 127.0.0.1:28554
+
+rtmp: false
+hls: false
+webrtc: false
+srt: false
+moq: false
+api: false
+metrics: false
+pprof: false
+playback: false
+
+paths:
+  "~^phase3-camera-[0-9]+$":
+
