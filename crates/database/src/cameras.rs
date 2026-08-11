@@ -1,0 +1,1 @@
+//! Camera persistence adapter.
