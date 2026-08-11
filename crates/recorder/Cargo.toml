@@ -1,0 +1,20 @@
+[package]
+name = "surveillance-recorder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+muxide.workspace = true
+surveillance-common = { path = "../common" }
+surveillance-media = { path = "../media" }
+surveillance-storage = { path = "../storage" }
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+surveillance-camera = { path = "../camera" }
