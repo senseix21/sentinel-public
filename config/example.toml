@@ -1,0 +1,14 @@
+# Deployment reference only. Never place real credentials or tokens here.
+# Required current environment variables:
+# SURVEILLANCE_CAMERA_ID=camera-01
+# SURVEILLANCE_RTSP_URL=rtsp://127.0.0.1:8554/camera-01
+# SURVEILLANCE_VIDEO_WIDTH=1920
+# SURVEILLANCE_VIDEO_HEIGHT=1080
+# SURVEILLANCE_RECORDING_ROOT=./recordings
+# SURVEILLANCE_HEALTH_BIND=127.0.0.1:3000
+# SURVEILLANCE_MAXIMUM_CAMERAS=256
+# SURVEILLANCE_COMMAND_QUEUE_ITEMS=64
+# SURVEILLANCE_COMMAND_TIMEOUT_SECONDS=10
+#
+# Authentication, when required, is injected separately through both
+# SURVEILLANCE_RTSP_USERNAME and SURVEILLANCE_RTSP_PASSWORD.
