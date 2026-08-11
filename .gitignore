@@ -1,1 +1,5 @@
 .env
+/target/
+auto.key
+auto.crt
+Multi-Camera_Security_
