@@ -15,6 +15,12 @@ Verified on 2026-08-12:
   was nondeterministic; the broken hook was removed and is not claimed.
 - LiveKit emitted RTP sender-report clock-skew/out-of-order warnings. This blocks
   a latency or correct real-time pacing claim for the CLI boundary.
+- The subsequent timestamp-authority slice makes every adapter send carry its
+  mapped RTP timestamp and epoch. The CLI declares `adapter_clock`, while a
+  deterministic retry adapter proves fresh epoch/timestamp origin and owned
+  disconnect/reconnect. API/metrics expose the authority without credentials.
+- Both the startup-outage and full LiveKit/RTSP/recording fixtures passed again
+  after the contract change.
 
 The final local workspace gate passed after this snapshot was created:
 

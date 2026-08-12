@@ -20,6 +20,11 @@ impl PublicationEpoch {
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 #[derive(Debug, Default)]
@@ -192,6 +197,14 @@ impl H264Adapter {
             return Err(AdaptationError::MalformedAccessUnit);
         }
         Ok(output)
+    }
+
+    pub fn timestamp(
+        &mut self,
+        epoch: PublicationEpoch,
+        access_unit: &H264AccessUnit,
+    ) -> Result<u32, AdaptationError> {
+        self.mapper.map(epoch, access_unit.timestamp())
     }
 }
 

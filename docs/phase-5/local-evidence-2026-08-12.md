@@ -34,6 +34,13 @@ prevention, lifecycle transitions, backoff bounds, single-NAL/FU-A/multi-slice
 packetization, parameterized-keyframe waits, nonzero timestamps, epoch reset,
 subscribe-only grants, and requested publication shutdown.
 
+The adapter contract now requires every send to carry a mapped 90 kHz timestamp
+and publication epoch and to declare its timestamp authority. A deterministic
+retry test forces the first send to fail and observes `(epoch 1, timestamp 0)`
+followed by `(epoch 2, timestamp 0)`, with two owned connects/disconnects and one
+reconnect. The CLI explicitly reports `adapter_clock`; API and Prometheus expose
+that limitation. Both Phase 5 fixtures passed again after this change.
+
 ## Evidence that blocks a local completion claim
 
 The released CLI socket adapter does not accept per-access-unit timestamps. It

@@ -48,6 +48,14 @@ boundary receives one reconstructed Annex-B access unit at a time, paced from
 media timestamps. It caches SPS/PPS, waits for a parameterized IDR after startup
 or discontinuity, and never decodes pixels.
 
+Every `PublicationAdapter` send now carries the Annex-B bytes, mapped 90 kHz RTP
+timestamp, and publication epoch. An adapter must declare whether media or its
+own clock is authoritative. The CLI declares `AdapterClock` because its released
+socket protocol cannot accept caller timestamps. Health/API/metrics expose this
+fact, so the CLI path cannot be mistaken for timestamp- or latency-qualified
+publication. A deterministic retry test proves a failed session is disconnected
+and the replacement session starts a fresh epoch and timestamp origin.
+
 Costs per access unit are:
 
 - existing immutable `Arc` NAL payloads remain shared by recorder and publisher;
@@ -99,6 +107,10 @@ deployment does not support Unix sockets.
 
 Do not remove the SDK-neutral domain, adaptation, ownership, health, or token
 contracts when replacing the adapter.
+
+The official encoded-ingest Rust SDK work was rechecked on 2026-08-12 and remains
+open as `livekit/rust-sdks` pull request 1048. The released `lk` 2.18.2 help lists
+Annex-B/length-prefixed socket input and an FPS hint, but no timestamped RTP input.
 
 ## Local acceptance evidence required
 

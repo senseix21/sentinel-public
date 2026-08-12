@@ -8,11 +8,31 @@ use tokio::{
 
 use crate::config::LiveKitConfig;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TimestampAuthority {
+    /// The adapter sends the caller-supplied 90 kHz media timestamp.
+    #[default]
+    Media,
+    /// The adapter derives timestamps internally and cannot support latency qualification.
+    AdapterClock,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct EncodedAccessUnit<'a> {
+    pub annex_b: &'a [u8],
+    pub rtp_timestamp: u32,
+    pub epoch: u64,
+}
+
 pub type AdapterFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AdapterError>> + Send + 'a>>;
 
 pub trait PublicationAdapter: Send + 'static {
+    fn timestamp_authority(&self) -> TimestampAuthority;
     fn connect(&mut self) -> AdapterFuture<'_, ()>;
-    fn send_access_unit<'a>(&'a mut self, annex_b: &'a [u8]) -> AdapterFuture<'a, ()>;
+    fn send_access_unit<'a>(
+        &'a mut self,
+        access_unit: EncodedAccessUnit<'a>,
+    ) -> AdapterFuture<'a, ()>;
     fn disconnect(&mut self) -> AdapterFuture<'_, ()>;
 }
 
@@ -91,6 +111,10 @@ impl CliPublicationAdapter {
 }
 
 impl PublicationAdapter for CliPublicationAdapter {
+    fn timestamp_authority(&self) -> TimestampAuthority {
+        TimestampAuthority::AdapterClock
+    }
+
     fn connect(&mut self) -> AdapterFuture<'_, ()> {
         Box::pin(async move {
             self.disconnect().await?;
@@ -146,7 +170,10 @@ impl PublicationAdapter for CliPublicationAdapter {
         })
     }
 
-    fn send_access_unit<'a>(&'a mut self, annex_b: &'a [u8]) -> AdapterFuture<'a, ()> {
+    fn send_access_unit<'a>(
+        &'a mut self,
+        access_unit: EncodedAccessUnit<'a>,
+    ) -> AdapterFuture<'a, ()> {
         Box::pin(async move {
             if self
                 .child
@@ -159,10 +186,13 @@ impl PublicationAdapter for CliPublicationAdapter {
                 .stream
                 .as_mut()
                 .ok_or_else(|| AdapterError::new(AdapterErrorKind::Connection))?;
-            tokio::time::timeout(self.config.ipc_write_timeout, stream.write_all(annex_b))
-                .await
-                .map_err(|_| AdapterError::new(AdapterErrorKind::Transport))?
-                .map_err(|_| AdapterError::new(AdapterErrorKind::Transport))
+            tokio::time::timeout(
+                self.config.ipc_write_timeout,
+                stream.write_all(access_unit.annex_b),
+            )
+            .await
+            .map_err(|_| AdapterError::new(AdapterErrorKind::Transport))?
+            .map_err(|_| AdapterError::new(AdapterErrorKind::Transport))
         })
     }
 
@@ -212,6 +242,7 @@ pub struct MemoryAdapter {
     pub fail_send_after: Option<usize>,
     pub connected: bool,
     pub access_units: Vec<Vec<u8>>,
+    pub timestamps: Vec<(u64, u32)>,
 }
 
 impl MemoryAdapter {
@@ -222,11 +253,16 @@ impl MemoryAdapter {
             fail_send_after: None,
             connected: false,
             access_units: Vec::new(),
+            timestamps: Vec::new(),
         }
     }
 }
 
 impl PublicationAdapter for MemoryAdapter {
+    fn timestamp_authority(&self) -> TimestampAuthority {
+        TimestampAuthority::Media
+    }
+
     fn connect(&mut self) -> AdapterFuture<'_, ()> {
         Box::pin(async move {
             if let Some(kind) = self.fail_connect {
@@ -237,7 +273,10 @@ impl PublicationAdapter for MemoryAdapter {
             }
         })
     }
-    fn send_access_unit<'a>(&'a mut self, annex_b: &'a [u8]) -> AdapterFuture<'a, ()> {
+    fn send_access_unit<'a>(
+        &'a mut self,
+        access_unit: EncodedAccessUnit<'a>,
+    ) -> AdapterFuture<'a, ()> {
         Box::pin(async move {
             if self
                 .fail_send_after
@@ -245,7 +284,9 @@ impl PublicationAdapter for MemoryAdapter {
             {
                 Err(AdapterError::new(AdapterErrorKind::Transport))
             } else {
-                self.access_units.push(annex_b.to_vec());
+                self.access_units.push(access_unit.annex_b.to_vec());
+                self.timestamps
+                    .push((access_unit.epoch, access_unit.rtp_timestamp));
                 Ok(())
             }
         })
@@ -270,7 +311,11 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         adapter
-            .send_access_unit(&[0, 0, 0, 1, 0x65])
+            .send_access_unit(EncodedAccessUnit {
+                annex_b: &[0, 0, 0, 1, 0x65],
+                rtp_timestamp: 42,
+                epoch: 7,
+            })
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         adapter
@@ -278,6 +323,7 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(adapter.access_units.len(), 1);
+        assert_eq!(adapter.timestamps, vec![(7, 42)]);
         assert!(!adapter.connected);
     }
 }

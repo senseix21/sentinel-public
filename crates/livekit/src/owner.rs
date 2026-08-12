@@ -10,7 +10,7 @@ use surveillance_media::{
 use tokio::sync::watch;
 
 use crate::{
-    adapter::{AdapterErrorKind, PublicationAdapter},
+    adapter::{AdapterErrorKind, EncodedAccessUnit, PublicationAdapter, TimestampAuthority},
     config::LiveKitConfig,
     domain::{PublicationFailureCategory, PublicationState},
     rtp::{H264Adapter, PacketizationConfig},
@@ -29,6 +29,7 @@ pub struct PublicationCounters {
     pub media_rejections: u64,
     pub send_failures: u64,
     pub shutdown_failures: u64,
+    pub timestamp_authority: TimestampAuthority,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,6 +60,7 @@ struct HealthState {
     state: Mutex<PublicationState>,
     failure: Mutex<Option<PublicationFailureCategory>>,
     counters: CounterState,
+    timestamp_authority: TimestampAuthority,
 }
 
 #[derive(Clone)]
@@ -72,15 +74,17 @@ impl PublicationHealth {
             state: Mutex::new(PublicationState::Disabled),
             failure: Mutex::new(None),
             counters: CounterState::default(),
+            timestamp_authority: TimestampAuthority::Media,
         }))
     }
     #[must_use]
-    pub fn enabled() -> Self {
+    pub fn enabled(timestamp_authority: TimestampAuthority) -> Self {
         Self(Arc::new(HealthState {
             enabled: true,
             state: Mutex::new(PublicationState::Starting),
             failure: Mutex::new(None),
             counters: CounterState::default(),
+            timestamp_authority,
         }))
     }
     #[must_use]
@@ -102,6 +106,7 @@ impl PublicationHealth {
                 media_rejections: load(&self.0.counters.media_rejections),
                 send_failures: load(&self.0.counters.send_failures),
                 shutdown_failures: load(&self.0.counters.shutdown_failures),
+                timestamp_authority: self.0.timestamp_authority,
             },
         }
     }
@@ -151,7 +156,7 @@ impl<A: PublicationAdapter> LivePublicationOwner<A> {
         adapter: A,
         input: MediaSubscriber<H264AccessUnit>,
     ) -> (Self, PublicationHealth) {
-        let health = PublicationHealth::enabled();
+        let health = PublicationHealth::enabled(adapter.timestamp_authority());
         (
             Self {
                 config,
@@ -169,6 +174,7 @@ impl<A: PublicationAdapter> LivePublicationOwner<A> {
                 .unwrap_or_else(|_| unreachable!("validated fixed packetization bounds"));
         let mut media = H264Adapter::new(packetization);
         let mut failures = 0_u32;
+        let mut publication_epoch = 0_u64;
         loop {
             if *shutdown.borrow() {
                 return self.stop(PublicationStopReason::Requested).await;
@@ -177,12 +183,16 @@ impl<A: PublicationAdapter> LivePublicationOwner<A> {
             increment(&self.health.0.counters.connection_attempts);
             match self.adapter.connect().await {
                 Ok(()) => {
+                    publication_epoch = publication_epoch.saturating_add(1);
                     increment(&self.health.0.counters.connection_successes);
                     if failures > 0 {
                         increment(&self.health.0.counters.reconnects);
                     }
                     self.health.transition(PublicationState::Publishing, None);
-                    match self.publish_session(&mut media, &mut shutdown).await {
+                    match self
+                        .publish_session(&mut media, publication_epoch, &mut shutdown)
+                        .await
+                    {
                         SessionExit::Requested => {
                             return self.stop(PublicationStopReason::Requested).await
                         }
@@ -227,6 +237,7 @@ impl<A: PublicationAdapter> LivePublicationOwner<A> {
     async fn publish_session(
         &mut self,
         media: &mut H264Adapter,
+        publication_epoch: u64,
         shutdown: &mut watch::Receiver<bool>,
     ) -> SessionExit {
         let mut ready = false;
@@ -279,7 +290,16 @@ impl<A: PublicationAdapter> LivePublicationOwner<A> {
                             increment(&self.health.0.counters.media_rejections);
                             continue;
                         };
-                        if self.adapter.send_access_unit(&annex_b).await.is_err() {
+                        let epoch = crate::rtp::PublicationEpoch::new(publication_epoch);
+                        let Ok(rtp_timestamp) = media.timestamp(epoch, &unit) else {
+                            increment(&self.health.0.counters.media_rejections);
+                            continue;
+                        };
+                        if self.adapter.send_access_unit(EncodedAccessUnit {
+                            annex_b: &annex_b,
+                            rtp_timestamp,
+                            epoch: epoch.get(),
+                        }).await.is_err() {
                             increment(&self.health.0.counters.send_failures);
                             return SessionExit::Retryable(PublicationFailureCategory::Transport);
                         }
@@ -362,6 +382,54 @@ mod tests {
     };
     use url::Url;
 
+    #[derive(Default)]
+    struct RestartEvidence {
+        connects: usize,
+        disconnects: usize,
+        sends: Vec<(u64, u32)>,
+    }
+
+    struct RestartOnceAdapter(Arc<Mutex<RestartEvidence>>);
+
+    impl PublicationAdapter for RestartOnceAdapter {
+        fn timestamp_authority(&self) -> TimestampAuthority {
+            TimestampAuthority::Media
+        }
+
+        fn connect(&mut self) -> crate::adapter::AdapterFuture<'_, ()> {
+            Box::pin(async move {
+                lock(&self.0).connects += 1;
+                Ok(())
+            })
+        }
+
+        fn send_access_unit<'a>(
+            &'a mut self,
+            access_unit: EncodedAccessUnit<'a>,
+        ) -> crate::adapter::AdapterFuture<'a, ()> {
+            Box::pin(async move {
+                let mut evidence = lock(&self.0);
+                evidence
+                    .sends
+                    .push((access_unit.epoch, access_unit.rtp_timestamp));
+                if evidence.sends.len() == 1 {
+                    Err(crate::adapter::AdapterError::new(
+                        AdapterErrorKind::Transport,
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn disconnect(&mut self) -> crate::adapter::AdapterFuture<'_, ()> {
+            Box::pin(async move {
+                lock(&self.0).disconnects += 1;
+                Ok(())
+            })
+        }
+    }
+
     fn config() -> LiveKitConfig {
         let camera = CameraId::new("camera-01").unwrap_or_else(|error| panic!("{error}"));
         LiveKitConfig {
@@ -422,5 +490,47 @@ mod tests {
         assert_eq!(exit.reason, PublicationStopReason::Requested);
         assert_eq!(health.snapshot().state, PublicationState::Stopped);
         assert_eq!(health.snapshot().counters.access_units, 1);
+    }
+
+    #[tokio::test]
+    async fn retry_owns_disconnect_and_starts_a_fresh_timestamp_epoch() {
+        let capacity = QueueCapacity::new(4).unwrap_or_else(|error| panic!("{error}"));
+        let (distributor, subscriptions) = MediaDistributor::new(capacity, capacity);
+        drop(subscriptions.recorder);
+        let evidence = Arc::new(Mutex::new(RestartEvidence::default()));
+        let (owner, health) = LivePublicationOwner::new(
+            config(),
+            RestartOnceAdapter(Arc::clone(&evidence)),
+            subscriptions.live,
+        );
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(owner.run(shutdown_rx));
+
+        distributor.publish(keyframe());
+        for _ in 0..100 {
+            if health.snapshot().counters.connection_attempts >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        distributor.publish(keyframe());
+        for _ in 0..100 {
+            if lock(&evidence).sends.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        shutdown_tx.send_replace(true);
+        let exit = task.await.unwrap_or_else(|error| panic!("{error}"));
+        let evidence = lock(&evidence);
+        assert_eq!(evidence.sends, vec![(1, 0), (2, 0)]);
+        assert!(evidence.connects >= 2);
+        assert!(evidence.disconnects >= 2);
+        assert_eq!(exit.snapshot.counters.reconnects, 1);
+        assert_eq!(
+            exit.snapshot.counters.timestamp_authority,
+            TimestampAuthority::Media
+        );
     }
 }

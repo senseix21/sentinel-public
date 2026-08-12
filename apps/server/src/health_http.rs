@@ -766,6 +766,7 @@ struct CameraResponse {
     live_publication_enabled: bool,
     live_publication_state: Option<String>,
     live_publication_failure: Option<String>,
+    live_publication_timestamp_authority: Option<&'static str>,
     live_published_access_units: u64,
     live_published_bytes: u64,
 }
@@ -836,6 +837,9 @@ impl From<&CameraStatusSnapshot> for CameraResponse {
                 .as_ref()
                 .and_then(|value| value.publication.last_failure)
                 .map(|value| format!("{value:?}")),
+            live_publication_timestamp_authority: snapshot.health.as_ref().map(|value| {
+                timestamp_authority_name(value.publication.counters.timestamp_authority)
+            }),
             live_published_access_units: snapshot
                 .health
                 .as_ref()
@@ -1148,6 +1152,15 @@ fn render_metrics(
             camera,
             publication_state_value(publication.state),
         );
+        metric(
+            &mut output,
+            "surveillance_livekit_media_timestamp_authority",
+            camera,
+            u8::from(matches!(
+                publication.counters.timestamp_authority,
+                surveillance_livekit::adapter::TimestampAuthority::Media
+            )),
+        );
         for (name, value) in [
             (
                 "surveillance_livekit_connection_attempts_total",
@@ -1198,6 +1211,16 @@ fn render_metrics(
         }
     }
     output
+}
+
+const fn timestamp_authority_name(
+    authority: surveillance_livekit::adapter::TimestampAuthority,
+) -> &'static str {
+    use surveillance_livekit::adapter::TimestampAuthority;
+    match authority {
+        TimestampAuthority::Media => "media",
+        TimestampAuthority::AdapterClock => "adapter_clock",
+    }
 }
 
 const fn publication_state_value(state: surveillance_livekit::domain::PublicationState) -> u8 {
