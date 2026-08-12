@@ -11,6 +11,7 @@ use std::{
 
 use surveillance_config::settings::{CameraCredentialsSettings, OneCameraSettings};
 use surveillance_database::DatabaseConfig;
+use surveillance_livekit::config::LiveKitSettings;
 use surveillance_storage::retention::{RetentionPolicy, StorageWatermarks};
 
 const CAMERA_ID: &str = "SURVEILLANCE_CAMERA_ID";
@@ -34,6 +35,12 @@ const RETENTION_BATCH_FILES: &str = "SURVEILLANCE_RETENTION_BATCH_FILES";
 const RETENTION_BATCH_BYTES: &str = "SURVEILLANCE_RETENTION_BATCH_BYTES";
 const RETENTION_INTERVAL_SECONDS: &str = "SURVEILLANCE_RETENTION_INTERVAL_SECONDS";
 const FFMPEG: &str = "SURVEILLANCE_FFMPEG";
+const LIVEKIT_URL: &str = "SURVEILLANCE_LIVEKIT_URL";
+const LIVEKIT_API_KEY: &str = "SURVEILLANCE_LIVEKIT_API_KEY";
+const LIVEKIT_API_SECRET: &str = "SURVEILLANCE_LIVEKIT_API_SECRET";
+const LIVEKIT_NAMESPACE: &str = "SURVEILLANCE_LIVEKIT_NAMESPACE";
+const LIVEKIT_CLI: &str = "SURVEILLANCE_LIVEKIT_CLI";
+const LIVEKIT_CLI_VERSION: &str = "SURVEILLANCE_LIVEKIT_CLI_VERSION";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SupervisionSettings {
@@ -215,14 +222,40 @@ fn load_with(
         (Some(username), Some(password)) => Some(CameraCredentialsSettings { username, password }),
         _ => return Err(EnvironmentConfigError::IncompleteCredentials),
     };
-    Ok(OneCameraSettings::h264_mvp(
+    let mut settings = OneCameraSettings::h264_mvp(
         camera_id,
         endpoint,
         credentials,
         width,
         height,
         recording_root,
-    ))
+    );
+    settings.livekit = match (
+        lookup(LIVEKIT_URL),
+        lookup(LIVEKIT_API_KEY),
+        lookup(LIVEKIT_API_SECRET),
+    ) {
+        (None, None, None) => None,
+        (Some(endpoint), Some(api_key), Some(api_secret)) => Some(LiveKitSettings {
+            endpoint,
+            api_key,
+            api_secret,
+            deployment_namespace: lookup(LIVEKIT_NAMESPACE)
+                .unwrap_or_else(|| "surveillance".to_owned()),
+            cli_path: lookup(LIVEKIT_CLI).map_or_else(|| PathBuf::from("lk"), PathBuf::from),
+            cli_version: lookup(LIVEKIT_CLI_VERSION).unwrap_or_else(|| "2.18.2".to_owned()),
+            queue_items: 4,
+            max_lag: Duration::from_millis(500),
+            max_access_unit_bytes: 2 * 1024 * 1024,
+            ipc_write_timeout: Duration::from_millis(250),
+            shutdown_timeout: Duration::from_secs(2),
+            reconnect_initial: Duration::from_millis(250),
+            reconnect_maximum: Duration::from_secs(30),
+            reconnect_stable_reset: Duration::from_secs(30),
+        }),
+        _ => return Err(EnvironmentConfigError::IncompleteLiveKitCredentials),
+    };
+    Ok(settings)
 }
 
 fn required(
@@ -247,6 +280,7 @@ pub enum EnvironmentConfigError {
     Missing(&'static str),
     InvalidPositiveInteger(&'static str),
     IncompleteCredentials,
+    IncompleteLiveKitCredentials,
     InvalidSocketAddress(&'static str),
     HealthBindNotLoopback,
     InvalidDatabaseConfiguration,
@@ -267,6 +301,9 @@ impl fmt::Display for EnvironmentConfigError {
             }
             Self::IncompleteCredentials => formatter
                 .write_str("RTSP username and password must either both be set or both be absent"),
+            Self::IncompleteLiveKitCredentials => formatter.write_str(
+                "LiveKit URL, API key, and API secret must either all be set or all be absent",
+            ),
             Self::InvalidSocketAddress(key) => {
                 write!(
                     formatter,

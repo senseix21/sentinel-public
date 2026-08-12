@@ -9,6 +9,7 @@ use surveillance_config::settings::{
     CameraCredentialsSettings, OneCameraConfig, OneCameraSettings,
 };
 use surveillance_database::PostgresRecordingRepository;
+use surveillance_livekit::token::DevelopmentTokenService;
 use surveillance_storage::recordings::{
     PlaybackPlan, RecordingCursor, RecordingResultLimit, RecordingSearch, RecordingTimeRange,
 };
@@ -52,6 +53,7 @@ pub async fn serve_health(
     playback: Option<PlaybackAssembler>,
     metadata: Option<MetadataWriterHandle>,
     phase4: Option<Phase4Metrics>,
+    viewer_tokens: Option<DevelopmentTokenService>,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     if !address.ip().is_loopback() {
@@ -71,7 +73,7 @@ pub async fn serve_health(
             }
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
-                if let Err(error) = Box::pin(handle_client(stream, &recording_root, &registry, &supervisor, recordings.as_ref(), playback.as_ref(), metadata.as_ref(), phase4.as_ref())).await {
+                if let Err(error) = Box::pin(handle_client(stream, &recording_root, &registry, &supervisor, recordings.as_ref(), playback.as_ref(), metadata.as_ref(), phase4.as_ref(), viewer_tokens.as_ref())).await {
                     tracing::debug!(%peer, %error, "API client request discarded");
                 }
             }
@@ -92,6 +94,7 @@ async fn handle_client(
     playback: Option<&PlaybackAssembler>,
     metadata: Option<&MetadataWriterHandle>,
     phase4: Option<&Phase4Metrics>,
+    viewer_tokens: Option<&DevelopmentTokenService>,
 ) -> io::Result<()> {
     let request = read_request(&mut stream).await?;
     if let (Some(repository), Some(assembler), Some((camera_id, query))) =
@@ -115,6 +118,7 @@ async fn handle_client(
         recordings,
         metadata,
         phase4,
+        viewer_tokens,
     )
     .await;
     tokio::time::timeout(IO_TIMEOUT, stream.write_all(response.as_bytes()))
@@ -337,10 +341,15 @@ async fn route(
         None,
         None,
         None,
+        None,
     )
     .await
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "API adapter receives explicit independently owned boundaries"
+)]
 async fn route_with_recordings(
     request: &[u8],
     recording_root: &std::path::Path,
@@ -349,6 +358,7 @@ async fn route_with_recordings(
     recordings: Option<&PostgresRecordingRepository>,
     metadata: Option<&MetadataWriterHandle>,
     phase4: Option<&Phase4Metrics>,
+    viewer_tokens: Option<&DevelopmentTokenService>,
 ) -> String {
     let Some(header_end) = find_header_end(request) else {
         return json_error("400 Bad Request", "invalid_request");
@@ -389,12 +399,17 @@ async fn route_with_recordings(
                 registry,
                 supervisor,
                 recordings,
+                viewer_tokens,
             )
             .await
         }
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "camera routing keeps resource dependencies explicit"
+)]
 async fn route_camera(
     method: &str,
     path: &str,
@@ -403,6 +418,7 @@ async fn route_camera(
     registry: &CameraHealthRegistry,
     supervisor: &CameraSupervisorHandle,
     recordings: Option<&PostgresRecordingRepository>,
+    viewer_tokens: Option<&DevelopmentTokenService>,
 ) -> String {
     let segments: Vec<_> = path.trim_matches('/').split('/').collect();
     if segments.len() < 3 || segments[0] != "api" || segments[1] != "cameras" {
@@ -419,6 +435,30 @@ async fn route_camera(
             return json_error("400 Bad Request", "invalid_recording_id");
         };
         return recording_detail(camera_id, recording_id, recording_root, recordings).await;
+    }
+    if method == "POST" && segments.as_slice() == ["api", "cameras", segments[2], "viewer-token"] {
+        if registry.snapshot(&camera_id).is_none() {
+            return json_error("404 Not Found", "camera_not_found");
+        }
+        let Some(service) = viewer_tokens else {
+            return json_error(
+                "503 Service Unavailable",
+                "livekit_token_issuer_unavailable",
+            );
+        };
+        return match service.issue_for_camera(&camera_id) {
+            Ok(access) => json_response(
+                "200 OK",
+                &ViewerAccessResponse {
+                    endpoint: access.endpoint(),
+                    room: access.room(),
+                    token: access.token(),
+                    expires_in_seconds: access.expires_in_seconds(),
+                    development_only: true,
+                },
+            ),
+            Err(_) => json_error("503 Service Unavailable", "livekit_token_issue_failed"),
+        };
     }
     match (method, segments.as_slice()) {
         ("GET", ["api", "cameras", _] | ["api", "cameras", _, "health"]) => {
@@ -438,6 +478,15 @@ async fn route_camera(
         }
         _ => json_error("404 Not Found", "not_found"),
     }
+}
+
+#[derive(Serialize)]
+struct ViewerAccessResponse<'a> {
+    endpoint: &'a str,
+    room: &'a str,
+    token: &'a str,
+    expires_in_seconds: u64,
+    development_only: bool,
 }
 
 #[derive(Serialize)]
@@ -714,6 +763,11 @@ struct CameraResponse {
     live_dropped: u64,
     recorder_completed_segments: u64,
     recorder_failed_segments: u64,
+    live_publication_enabled: bool,
+    live_publication_state: Option<String>,
+    live_publication_failure: Option<String>,
+    live_published_access_units: u64,
+    live_published_bytes: u64,
 }
 
 impl From<&CameraStatusSnapshot> for CameraResponse {
@@ -769,6 +823,27 @@ impl From<&CameraStatusSnapshot> for CameraResponse {
                 .health
                 .as_ref()
                 .map_or(0, |value| value.recorder.failed_segments),
+            live_publication_enabled: snapshot
+                .health
+                .as_ref()
+                .is_some_and(|value| value.publication.enabled),
+            live_publication_state: snapshot
+                .health
+                .as_ref()
+                .map(|value| format!("{:?}", value.publication.state)),
+            live_publication_failure: snapshot
+                .health
+                .as_ref()
+                .and_then(|value| value.publication.last_failure)
+                .map(|value| format!("{value:?}")),
+            live_published_access_units: snapshot
+                .health
+                .as_ref()
+                .map_or(0, |value| value.publication.counters.access_units),
+            live_published_bytes: snapshot
+                .health
+                .as_ref()
+                .map_or(0, |value| value.publication.counters.bytes),
         }
     }
 }
@@ -1060,8 +1135,84 @@ fn render_metrics(
         );
         queue_metrics(&mut output, camera, "recorder", snapshot.recorder_queue);
         queue_metrics(&mut output, camera, "live", snapshot.live_queue);
+        let publication = snapshot.publication;
+        metric(
+            &mut output,
+            "surveillance_livekit_enabled",
+            camera,
+            u8::from(publication.enabled),
+        );
+        metric(
+            &mut output,
+            "surveillance_livekit_state",
+            camera,
+            publication_state_value(publication.state),
+        );
+        for (name, value) in [
+            (
+                "surveillance_livekit_connection_attempts_total",
+                publication.counters.connection_attempts,
+            ),
+            (
+                "surveillance_livekit_connection_successes_total",
+                publication.counters.connection_successes,
+            ),
+            (
+                "surveillance_livekit_reconnects_total",
+                publication.counters.reconnects,
+            ),
+            (
+                "surveillance_livekit_access_units_total",
+                publication.counters.access_units,
+            ),
+            (
+                "surveillance_livekit_bytes_total",
+                publication.counters.bytes,
+            ),
+            (
+                "surveillance_livekit_keyframes_total",
+                publication.counters.keyframes,
+            ),
+            (
+                "surveillance_livekit_parameter_set_waits_total",
+                publication.counters.parameter_set_waits,
+            ),
+            (
+                "surveillance_livekit_stale_drops_total",
+                publication.counters.stale_drops,
+            ),
+            (
+                "surveillance_livekit_media_rejections_total",
+                publication.counters.media_rejections,
+            ),
+            (
+                "surveillance_livekit_send_failures_total",
+                publication.counters.send_failures,
+            ),
+            (
+                "surveillance_livekit_shutdown_failures_total",
+                publication.counters.shutdown_failures,
+            ),
+        ] {
+            metric(&mut output, name, camera, value);
+        }
     }
     output
+}
+
+const fn publication_state_value(state: surveillance_livekit::domain::PublicationState) -> u8 {
+    use surveillance_livekit::domain::PublicationState as S;
+    match state {
+        S::Disabled => 0,
+        S::Starting => 1,
+        S::Connecting => 2,
+        S::Publishing => 3,
+        S::Backoff => 4,
+        S::Degraded => 5,
+        S::Terminal => 6,
+        S::Stopping => 7,
+        S::Stopped => 8,
+    }
 }
 
 fn metric(output: &mut String, name: &str, camera: &str, value: impl std::fmt::Display) {
@@ -1271,6 +1422,7 @@ mod tests {
             "target/phase3-tests".into(),
             handle.health_registry(),
             handle.clone(),
+            None,
             None,
             None,
             None,

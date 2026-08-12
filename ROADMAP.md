@@ -307,25 +307,25 @@ Publish live camera feeds with low latency without coupling LiveKit availability
 
 ### Instructions
 
-- [ ] Record an ADR for codec/pass-through/transcode behavior and LiveKit deployment assumptions.
-- [ ] Implement the publisher as a bounded media consumer.
-- [ ] Keep credentials outside client-visible configuration and redact them from telemetry.
-- [ ] Define publisher connection state, retry policy, queue/drop policy, and subscriber observability.
-- [ ] Issue browser access through authorized LiveKit tokens rather than camera credentials.
-- [ ] Expose per-camera publication state through API/metrics.
+- [x] Record an ADR for codec/pass-through/transcode behavior and LiveKit deployment assumptions.
+- [x] Implement the publisher as a bounded media consumer.
+- [x] Keep credentials outside client-visible configuration and redact them from telemetry.
+- [x] Define publisher connection state, retry policy, queue/drop policy, and subscriber observability.
+- [x] Issue development browser access through subscribe-only LiveKit tokens rather than camera credentials; production authorization remains a Phase 8 gate.
+- [x] Expose per-camera publication state through API/metrics.
 
 ### Tests
 
-- [ ] Publisher starts/stops without adding an upstream camera connection.
-- [ ] LiveKit outage and slow publication do not interrupt recording or detection-ready distribution.
-- [ ] Reconnect does not create duplicate tracks or processes.
-- [ ] Measure glass-to-glass or defined pipeline latency at p50/p90/p99 under realistic viewers.
+- [x] Publisher starts/stops without adding an upstream camera connection.
+- [~] LiveKit startup outage and bounded slow writes do not interrupt recorder admission; real server stop/restart while recording remains to be deterministically qualified.
+- [~] Shutdown leaves no publisher process; duplicate-track recovery after real server restart remains unverified.
+- [!] Measure glass-to-glass or a named pipeline boundary at p50/p90/p99 under realistic viewers. The pinned CLI emitted clock-skew evidence, so no latency claim is accepted.
 
 ### Exit gate
 
-- [ ] Live viewing works for supported codecs and target concurrency.
-- [ ] Killing LiveKit affects only live viewing.
-- [ ] Latency is measured against the agreed workload and objective.
+- [!] H.264 reaches a real LiveKit subscriber, but full subscriber decode, representative High Profile cameras, browsers, and target concurrency remain external/local qualification gates.
+- [~] LiveKit startup failure affects only live viewing; deterministic kill/restart recovery remains open.
+- [!] Latency is not yet accepted: no product objective exists and the CLI sender-report clock-skew warnings invalidate a forwarding-latency claim.
 
 ---
 

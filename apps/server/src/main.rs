@@ -2,6 +2,7 @@ use std::{error::Error, sync::Arc};
 
 use surveillance_config::settings::OneCameraConfig;
 use surveillance_database::PostgresRecordingRepository;
+use surveillance_livekit::token::DevelopmentTokenService;
 use surveillance_server::{
     camera_supervisor::CameraSupervisor,
     health_http::serve_health,
@@ -43,6 +44,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let retention = load_retention_from_environment()?;
     let ffmpeg = load_ffmpeg_from_environment();
     let phase4_metrics = Phase4Metrics::default();
+    let viewer_tokens = config
+        .livekit
+        .as_ref()
+        .map(|livekit| {
+            DevelopmentTokenService::new(
+                livekit,
+                livekit.deployment_namespace.clone(),
+                std::time::Duration::from_secs(5 * 60),
+            )
+        })
+        .transpose()?;
     tracing::info!(
         camera_id = %config.camera_id,
         endpoint = %config.source.endpoint(),
@@ -139,6 +151,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         playback_assembler,
         metadata_observer,
         Some(phase4_metrics),
+        viewer_tokens,
         adapter_shutdown_rx,
     ));
 

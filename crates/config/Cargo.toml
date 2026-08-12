@@ -12,5 +12,6 @@ workspace = true
 surveillance-camera = { path = "../camera" }
 surveillance-common = { path = "../common" }
 surveillance-media = { path = "../media" }
+surveillance-livekit = { path = "../livekit" }
 surveillance-recorder = { path = "../recorder" }
 surveillance-storage = { path = "../storage" }

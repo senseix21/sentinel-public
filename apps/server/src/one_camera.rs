@@ -20,6 +20,7 @@ use surveillance_camera::{
     },
 };
 use surveillance_common::types::CameraId;
+use surveillance_livekit::owner::{PublicationHealth, PublicationSnapshot};
 use surveillance_media::{
     distribution::{MediaDistributor, MediaMetricsObserver, MediaSubscriber, QueueMetrics},
     packet::H264AccessUnit,
@@ -66,6 +67,7 @@ pub struct OneCameraHealthSnapshot {
     pub recorder_queue: QueueMetrics,
     pub live_queue: QueueMetrics,
     pub recorder: RecorderOperationalMetrics,
+    pub publication: PublicationSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -99,6 +101,7 @@ pub struct OneCameraHealth {
     connection: CameraHealthReader,
     media: MediaMetricsObserver<H264AccessUnit>,
     recorder: Arc<RecorderMetricState>,
+    publication: PublicationHealth,
 }
 
 impl OneCameraHealth {
@@ -113,6 +116,7 @@ impl OneCameraHealth {
                 completed_segments: self.recorder.completed.load(Ordering::Relaxed),
                 failed_segments: self.recorder.failed.load(Ordering::Relaxed),
             },
+            publication: self.publication.snapshot(),
         }
     }
 
@@ -133,6 +137,7 @@ impl OneCameraHealth {
 pub fn one_camera_health(
     camera_id: CameraId,
     distributor: &MediaDistributor<H264AccessUnit>,
+    publication: PublicationHealth,
 ) -> (
     CameraHealthPublisher,
     RecorderHealthPublisher,
@@ -147,6 +152,7 @@ pub fn one_camera_health(
             connection,
             media: distributor.metrics_observer(),
             recorder,
+            publication,
         },
     )
 }

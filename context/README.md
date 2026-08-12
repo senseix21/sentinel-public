@@ -4,14 +4,14 @@ This directory contains compact, dated handoff snapshots. Its purpose is to let 
 
 ## Latest snapshot
 
-**2026-08-12 10:16 +06:** [`context/2026-08-12-1016/`](2026-08-12-1016/)
+**2026-08-12 13:05 +06:** [`context/2026-08-12-1305/`](2026-08-12-1305/)
 
 Read in this order:
 
-1. [`next-actions.md`](2026-08-12-1016/next-actions.md) — current position and immediate work.
-2. [`repository-status.md`](2026-08-12-1016/repository-status.md) — verified repository facts and test results.
-3. [`architecture.md`](2026-08-12-1016/architecture.md) — current owned runtime boundary.
-4. [`decisions-and-open-questions.md`](2026-08-12-1016/decisions-and-open-questions.md) — decisions, evidence, and blockers.
+1. [`next-actions.md`](2026-08-12-1305/next-actions.md) — current position and immediate work.
+2. [`repository-status.md`](2026-08-12-1305/repository-status.md) — verified repository facts and test results.
+3. [`architecture.md`](2026-08-12-1305/architecture.md) — current owned runtime boundary.
+4. [`decisions-and-open-questions.md`](2026-08-12-1305/decisions-and-open-questions.md) — decisions, evidence, and blockers.
 
 Read root `AGENTS.md` for standing engineering rules and `ROADMAP.md` for phase gates. Read `analysis.md` when changing architecture, resolving an ambiguity, or validating that a summary has not lost important context.
 

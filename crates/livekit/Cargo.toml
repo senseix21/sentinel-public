@@ -8,3 +8,11 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[dependencies]
+livekit-api.workspace = true
+serde.workspace = true
+surveillance-common = { path = "../common" }
+surveillance-media = { path = "../media" }
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true

@@ -4,6 +4,10 @@ use std::{error::Error, fmt, sync::Arc, time::SystemTime};
 
 use surveillance_camera::supervisor::{JitterSource, SupervisorStopReason};
 use surveillance_config::settings::OneCameraConfig;
+use surveillance_livekit::{
+    adapter::CliPublicationAdapter,
+    owner::{LivePublicationOwner, PublicationHealth},
+};
 use surveillance_media::distribution::MediaDistributor;
 use surveillance_recorder::{
     clock::MediaWallClock, fmp4::Fmp4SegmentSink, runtime::RecordingLifecycleEvent,
@@ -70,11 +74,20 @@ impl CameraPipeline {
     ) -> Result<Self, CameraPipelineError> {
         let (distributor, subscriptions) =
             MediaDistributor::new(config.recorder_queue, config.live_queue);
-        drop(subscriptions.live);
+        let (publication_task, publication_health) = if let Some(livekit) = config.livekit.clone() {
+            let adapter = CliPublicationAdapter::new(livekit.clone());
+            let (owner, health) = LivePublicationOwner::new(livekit, adapter, subscriptions.live);
+            (Some(owner), health)
+        } else {
+            drop(subscriptions.live);
+            (None, PublicationHealth::disabled())
+        };
         let (health_publisher, recorder_health, health) =
-            one_camera_health(config.camera_id.clone(), &distributor);
+            one_camera_health(config.camera_id.clone(), &distributor, publication_health);
         let (shutdown, shutdown_rx) = watch::channel(false);
         let join = tokio::spawn(async move {
+            let mut publication =
+                publication_task.map(|owner| Box::pin(owner.run(shutdown_rx.clone())));
             let store = SegmentFileStore::new(config.layout.clone(), config.ffprobe.clone());
             let recorder = Fmp4SegmentSink::new(config.recorder);
             let clock = MediaWallClock::new(config.clock_drift);
@@ -102,6 +115,17 @@ impl CameraPipeline {
                 tokio::select! {
                     exit = &mut pipeline => break exit,
                     event = event_rx.recv() => handle_lifecycle_event(event, &recorder_health, metadata_writer.as_ref(), config.layout.root()),
+                    publication_exit = async {
+                        match publication.as_mut() {
+                            Some(publication) => Some(publication.await),
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if let Some(publication_exit) = publication_exit {
+                            tracing::warn!(reason=?publication_exit.reason, state=?publication_exit.snapshot.state, "optional LiveKit publication stopped; recording continues");
+                            publication = None;
+                        }
+                    }
                 }
             };
             while let Ok(event) = event_rx.try_recv() {
@@ -111,6 +135,10 @@ impl CameraPipeline {
                     metadata_writer.as_ref(),
                     config.layout.root(),
                 );
+            }
+            if let Some(publication) = publication {
+                let publication_exit = publication.await;
+                tracing::info!(reason=?publication_exit.reason, "LiveKit publication owner joined");
             }
             exit
         });

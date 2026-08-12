@@ -10,6 +10,7 @@ use surveillance_camera::{
     supervisor::{ReconnectPolicy, ReconnectPolicyError},
 };
 use surveillance_common::types::{CameraId, IdentifierError};
+use surveillance_livekit::config::{LiveKitConfig, LiveKitConfigError, LiveKitSettings};
 use surveillance_media::distribution::{QueueCapacity, QueueCapacityError};
 use surveillance_recorder::{
     clock::{ClockConfigError, ClockDriftTolerance},
@@ -54,6 +55,7 @@ pub struct OneCameraSettings {
     pub clock_drift_tolerance: Duration,
     pub lifecycle_event_items: usize,
     pub reconciliation_scan_entries: usize,
+    pub livekit: Option<LiveKitSettings>,
 }
 
 impl OneCameraSettings {
@@ -94,6 +96,7 @@ impl OneCameraSettings {
             clock_drift_tolerance: Duration::from_secs(5),
             lifecycle_event_items: 64,
             reconciliation_scan_entries: 100_000,
+            livekit: None,
         }
     }
 }
@@ -112,6 +115,7 @@ pub struct OneCameraConfig {
     pub lifecycle_event_items: NonZeroUsize,
     pub reconciliation_limit: ReconciliationLimit,
     pub bounded_memory_bytes: usize,
+    pub livekit: Option<LiveKitConfig>,
 }
 
 impl OneCameraConfig {
@@ -194,6 +198,11 @@ impl OneCameraConfig {
             .ok_or(OneCameraConfigError::ZeroLifecycleEventItems)?;
         let reconciliation_limit = ReconciliationLimit::new(settings.reconciliation_scan_entries)
             .map_err(OneCameraConfigError::Reconciliation)?;
+        let livekit = settings
+            .livekit
+            .map(|livekit| LiveKitConfig::validate(&camera_id, livekit))
+            .transpose()
+            .map_err(OneCameraConfigError::LiveKit)?;
         Ok(Self {
             camera_id,
             source,
@@ -207,6 +216,7 @@ impl OneCameraConfig {
             lifecycle_event_items,
             reconciliation_limit,
             bounded_memory_bytes,
+            livekit,
         })
     }
 }
@@ -225,6 +235,7 @@ pub enum OneCameraConfigError {
     RecordingRoot(RecordingLayoutError),
     Clock(ClockConfigError),
     Reconciliation(ReconciliationConfigError),
+    LiveKit(LiveKitConfigError),
     ZeroLifecycleEventItems,
     EmptyFfprobe,
     MemoryBoundOverflow,
@@ -275,6 +286,7 @@ mod tests {
             clock_drift_tolerance: Duration::from_secs(5),
             lifecycle_event_items: 64,
             reconciliation_scan_entries: 100_000,
+            livekit: None,
         }
     }
 

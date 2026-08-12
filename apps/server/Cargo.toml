@@ -15,6 +15,7 @@ surveillance-common = { path = "../../crates/common" }
 surveillance-config = { path = "../../crates/config" }
 surveillance-database = { path = "../../crates/database" }
 surveillance-media = { path = "../../crates/media" }
+surveillance-livekit = { path = "../../crates/livekit" }
 surveillance-recorder = { path = "../../crates/recorder" }
 surveillance-storage = { path = "../../crates/storage" }
 serde.workspace = true

@@ -244,6 +244,7 @@ curl -fsS "http://127.0.0.1:3000/live" | grep -q '^live$'
 curl -fsS "http://127.0.0.1:3000/ready" | grep -q '^ready$'
 curl -fsS "http://127.0.0.1:3000/metrics" | grep -q 'surveillance_camera_connected{camera_id="fixture-camera"} 1'
 
+
 for _ in {1..600}; do
     segment_count="$(find "${server_output}" -type f -name '*.mp4' ! -name '*.partial.mp4' | wc -l | tr -d ' ')"
     if (( segment_count >= 3 )); then
@@ -281,6 +282,11 @@ done < <(find "${server_output}" -type f -name '*.mp4' ! -name '*.partial.mp4' -
 
 crash_output="${fixture_root}/crash-output"
 mkdir -p "${crash_output}"
+# The crash/reconciliation regression path is intentionally a Phase 0 camera and
+# recorder test. Do not let an enclosing optional-consumer fixture alter its
+# terminal-camera timing or failure surface.
+unset SURVEILLANCE_LIVEKIT_URL SURVEILLANCE_LIVEKIT_API_KEY SURVEILLANCE_LIVEKIT_API_SECRET
+unset SURVEILLANCE_LIVEKIT_NAMESPACE SURVEILLANCE_LIVEKIT_CLI SURVEILLANCE_LIVEKIT_CLI_VERSION
 (
     cd "${repo_root}"
     export SURVEILLANCE_CAMERA_ID="crash-camera"
