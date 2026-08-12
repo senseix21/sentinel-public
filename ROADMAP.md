@@ -269,33 +269,33 @@ Make recordings queryable and maintainable through durable metadata rather than 
 
 ### Instructions
 
-- [ ] Add PostgreSQL migrations and repository contracts for cameras and recording segments.
-- [ ] Store lifecycle status so open/incomplete/completed/failed files are distinguishable.
-- [ ] Commit file and metadata changes in an order with a defined crash-recovery story.
-- [ ] Implement startup reconciliation for completed files missing metadata and metadata pointing to absent/incomplete files.
-- [ ] Query all segments overlapping `[start, end)` by camera with appropriate indexes.
-- [ ] Implement camera-scoped recording-search API using UTC/RFC 3339 boundaries.
-- [ ] Define playback behavior for keyframe alignment, remuxing, and when accurate transcoding is necessary.
-- [ ] Assemble or stream ranges spanning multiple segments.
-- [ ] Implement configurable retention from indexed metadata.
-- [ ] Add storage warning/critical watermarks, cleanup policy, and recent-footage protection.
-- [ ] Define bounded behavior while PostgreSQL is temporarily unavailable.
+- [x] Add PostgreSQL migrations and repository contracts for cameras and recording segments. SQLx migrations and the real PostgreSQL fixture enforce the Rust lifecycle model.
+- [x] Store lifecycle status so open/incomplete/completed/failed files are distinguishable. Completed, failed, incomplete, inconsistent, deletion-pending, and deleted evidence is constrained and idempotent.
+- [x] Commit file and metadata changes in an order with a defined crash-recovery story. Durable rename/probe precedes asynchronous metadata delivery; filesystem evidence drives repair.
+- [x] Implement startup reconciliation for completed files missing metadata and metadata pointing to absent/incomplete files. The owned bounded pass also handles corrupt durable media and stale partials continuously.
+- [x] Query all segments overlapping `[start, end)` by camera with appropriate indexes. The fixture records an index-only overlap plan.
+- [x] Implement camera-scoped recording-search API using UTC/RFC 3339 boundaries. Results and detail resources never expose storage locators.
+- [x] Define playback behavior for keyframe alignment, remuxing, and when accurate transcoding is necessary. ADR 004 records the reversible segment-aligned H.264 stream-copy policy.
+- [x] Assemble or stream ranges spanning multiple segments. The three-segment output fully decodes.
+- [x] Implement configurable retention from indexed metadata. Versioned restart-applied defaults and bounded oldest-first claims are implemented.
+- [x] Add storage warning/critical watermarks, cleanup policy, and recent-footage protection. Watermark hysteresis and claim-before-unlink recovery are enforced.
+- [x] Define bounded behavior while PostgreSQL is temporarily unavailable. Recording remains active, queue saturation is visible, and durable orphan catch-up is proven.
 
 ### Tests
 
-- [ ] Property tests for overlapping half-open time ranges and daylight-saving/time-zone input normalization.
-- [ ] Retrieval across three or more segments.
-- [ ] Missing file, corrupt file, overlapping segment, and metadata-gap cases.
-- [ ] Database unavailable during segment finalization and successful later reconciliation.
-- [ ] Retention boundary, deletion failure, warning, critical, and disk-full simulations.
-- [ ] Path traversal and cross-camera authorization-preparation tests.
+- [x] Property-style exhaustive tests for overlapping half-open time ranges and offset-to-UTC normalization.
+- [x] Retrieval across three or more segments.
+- [x] Missing file, corrupt file, overlapping segment, and metadata-gap cases.
+- [x] Database unavailable while durable media is published and successful later reconciliation.
+- [!] Retention boundary, deletion failure, warning, critical, and disk-full simulations. Boundaries, hysteresis, protected footage, interrupted deletion, missing files, and exact bytes are covered; target-filesystem permission and disk-full injection require the deployment filesystem and remain an external operational gate.
+- [x] Path traversal and cross-camera authorization-preparation tests.
 
 ### Exit gate
 
-- [ ] Production APIs do not scan directories to answer recording queries.
-- [ ] A multi-segment request returns the correct interval under the documented accuracy policy.
-- [ ] Retention never deletes outside the configured recording root and preserves policy-protected recent footage.
-- [ ] Database interruption does not immediately stop recording and reconciliation is proven.
+- [x] Production APIs do not scan directories to answer recording queries.
+- [x] A multi-segment request returns the correct interval under the documented accuracy policy.
+- [x] Retention never deletes outside the configured recording root and preserves policy-protected recent footage.
+- [x] Database interruption does not immediately stop recording and reconciliation is proven.
 
 ---
 

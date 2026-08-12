@@ -197,7 +197,7 @@ pub async fn run_one_camera<J: JitterSource>(
         runtime.lifecycle_events,
         child_shutdown_rx,
     );
-    let exit = coordinate(camera, recorder, shutdown, child_shutdown).await;
+    let exit = Box::pin(coordinate(camera, recorder, shutdown, child_shutdown)).await;
     tracing::info!(
         camera_id = %camera_id,
         reason = ?exit.reason,

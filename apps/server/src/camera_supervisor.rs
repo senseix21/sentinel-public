@@ -17,6 +17,7 @@ use tokio::{
 };
 
 use crate::{
+    metadata_writer::MetadataWriterHandle,
     one_camera::{OneCameraExit, OneCameraHealth, OneCameraHealthSnapshot, PipelineStopReason},
     pipeline::{classify_exit, ActionableFailure, CameraPipeline, CameraPipelineError},
 };
@@ -265,6 +266,7 @@ pub struct CameraSupervisor {
     shutting_down: bool,
     shutdown_reply: Option<Reply>,
     observation_interval: tokio::time::Interval,
+    metadata_writer: Option<MetadataWriterHandle>,
 }
 
 struct CameraEntry {
@@ -294,6 +296,16 @@ impl CameraSupervisor {
         maximum_cameras: NonZeroUsize,
         response_timeout: Duration,
     ) -> (Self, CameraSupervisorHandle) {
+        Self::with_metadata_writer(command_capacity, maximum_cameras, response_timeout, None)
+    }
+
+    #[must_use]
+    pub fn with_metadata_writer(
+        command_capacity: NonZeroUsize,
+        maximum_cameras: NonZeroUsize,
+        response_timeout: Duration,
+        metadata_writer: Option<MetadataWriterHandle>,
+    ) -> (Self, CameraSupervisorHandle) {
         let (tx, rx) = mpsc::channel(command_capacity.get());
         let registry = CameraHealthRegistry::new(maximum_cameras);
         (
@@ -305,6 +317,7 @@ impl CameraSupervisor {
                 shutting_down: false,
                 shutdown_reply: None,
                 observation_interval: tokio::time::interval(Duration::from_millis(25)),
+                metadata_writer,
             },
             CameraSupervisorHandle {
                 commands: tx,
@@ -399,10 +412,11 @@ impl CameraSupervisor {
                 self.registry
                     .update(&camera_id, PipelineState::Starting, None, None);
                 let config = Arc::clone(&entry.config);
+                let metadata_writer = self.metadata_writer.clone();
                 self.operations.spawn(async move {
                     OperationCompletion::Started {
                         camera_id,
-                        result: CameraPipeline::start(config),
+                        result: CameraPipeline::start(config, metadata_writer),
                     }
                 });
             }

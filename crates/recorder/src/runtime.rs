@@ -27,8 +27,16 @@ use crate::{
 /// Critical lifecycle fact delivered through a caller-owned bounded channel.
 #[derive(Debug)]
 pub enum RecordingLifecycleEvent {
-    Completed(CompletedSegment),
-    Failed(FailedSegment),
+    Completed {
+        camera_id: CameraId,
+        recording_id: RecordingId,
+        segment: CompletedSegment,
+    },
+    Failed {
+        camera_id: CameraId,
+        recording_id: RecordingId,
+        segment: FailedSegment,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -53,6 +61,8 @@ pub struct SegmentRecorderExit {
 }
 
 struct ActiveLifecycle {
+    camera_id: CameraId,
+    recording_id: RecordingId,
     segment: OpenSegment,
     paths: SegmentPaths,
     writer: ActiveSegmentFile,
@@ -175,7 +185,15 @@ pub async fn run_segment_recorder(
                         .await?;
                 } else {
                     let failed = lifecycle.segment.fail(SegmentFailure::Shutdown);
-                    publish_event(events, RecordingLifecycleEvent::Failed(failed)).await?;
+                    publish_event(
+                        events,
+                        RecordingLifecycleEvent::Failed {
+                            camera_id: lifecycle.camera_id,
+                            recording_id: lifecycle.recording_id,
+                            segment: failed,
+                        },
+                    )
+                    .await?;
                     counters.failed = counters.failed.saturating_add(1);
                 }
             }
@@ -203,7 +221,15 @@ async fn append_bytes(
             .ok_or(SegmentRecorderError::MissingLifecycle)?;
         tracing::error!(path = %lifecycle.paths.partial().display(), error = %error, "recording fragment append failed");
         let failed = lifecycle.segment.fail(SegmentFailure::Storage);
-        publish_event(events, RecordingLifecycleEvent::Failed(failed)).await?;
+        publish_event(
+            events,
+            RecordingLifecycleEvent::Failed {
+                camera_id: lifecycle.camera_id,
+                recording_id: lifecycle.recording_id,
+                segment: failed,
+            },
+        )
+        .await?;
         counters.failed = counters.failed.saturating_add(1);
         return Err(SegmentRecorderError::Storage(error));
     }
@@ -227,6 +253,8 @@ async fn open_lifecycle(
         .await
         .map_err(SegmentRecorderError::Storage)?;
     Ok(ActiveLifecycle {
+        camera_id: camera_id.clone(),
+        recording_id,
         segment: OpenSegment::new(
             paths.clone(),
             started_at,
@@ -271,7 +299,15 @@ async fn persist_and_publish(
         Err(error) => {
             let failed = finalizing.fail(SegmentFailure::Storage);
             tracing::error!(path = %lifecycle.paths.partial().display(), error = %error, "recording segment persistence failed");
-            publish_event(events, RecordingLifecycleEvent::Failed(failed)).await?;
+            publish_event(
+                events,
+                RecordingLifecycleEvent::Failed {
+                    camera_id: lifecycle.camera_id,
+                    recording_id: lifecycle.recording_id,
+                    segment: failed,
+                },
+            )
+            .await?;
             counters.failed = counters.failed.saturating_add(1);
             return Err(SegmentRecorderError::Storage(error));
         }
@@ -292,7 +328,15 @@ async fn persist_and_publish(
         height = stored.height(),
         "recording segment completed"
     );
-    publish_event(events, RecordingLifecycleEvent::Completed(completed)).await?;
+    publish_event(
+        events,
+        RecordingLifecycleEvent::Completed {
+            camera_id: lifecycle.camera_id,
+            recording_id: lifecycle.recording_id,
+            segment: completed,
+        },
+    )
+    .await?;
     counters.completed = counters.completed.saturating_add(1);
     Ok(())
 }

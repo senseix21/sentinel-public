@@ -14,6 +14,7 @@ use tokio::{
     task::JoinHandle,
 };
 
+use crate::metadata_writer::MetadataWriterHandle;
 use crate::one_camera::{
     one_camera_health, run_one_camera, OneCameraExit, OneCameraHealth, OneCameraRuntime,
     RecorderHealthPublisher,
@@ -63,7 +64,10 @@ impl CameraPipeline {
     ///
     /// Reserved for construction failures introduced by concrete media/storage
     /// boundaries; process-level reconciliation runs once before supervision.
-    pub fn start(config: Arc<OneCameraConfig>) -> Result<Self, CameraPipelineError> {
+    pub fn start(
+        config: Arc<OneCameraConfig>,
+        metadata_writer: Option<MetadataWriterHandle>,
+    ) -> Result<Self, CameraPipelineError> {
         let (distributor, subscriptions) =
             MediaDistributor::new(config.recorder_queue, config.live_queue);
         drop(subscriptions.live);
@@ -97,11 +101,16 @@ impl CameraPipeline {
             let exit = loop {
                 tokio::select! {
                     exit = &mut pipeline => break exit,
-                    event = event_rx.recv() => log_lifecycle_event(event, &recorder_health),
+                    event = event_rx.recv() => handle_lifecycle_event(event, &recorder_health, metadata_writer.as_ref(), config.layout.root()),
                 }
             };
             while let Ok(event) = event_rx.try_recv() {
-                log_lifecycle_event(Some(event), &recorder_health);
+                handle_lifecycle_event(
+                    Some(event),
+                    &recorder_health,
+                    metadata_writer.as_ref(),
+                    config.layout.root(),
+                );
             }
             exit
         });
@@ -183,17 +192,27 @@ pub fn classify_exit(exit: &OneCameraExit) -> Option<ActionableFailure> {
     }
 }
 
-fn log_lifecycle_event(event: Option<RecordingLifecycleEvent>, health: &RecorderHealthPublisher) {
-    match event {
-        Some(RecordingLifecycleEvent::Completed(segment)) => {
+fn handle_lifecycle_event(
+    event: Option<RecordingLifecycleEvent>,
+    health: &RecorderHealthPublisher,
+    metadata_writer: Option<&MetadataWriterHandle>,
+    recording_root: &std::path::Path,
+) {
+    match event.as_ref() {
+        Some(RecordingLifecycleEvent::Completed { segment, .. }) => {
             health.completed();
             tracing::info!(path = %segment.path().display(), "recording lifecycle event delivered");
         }
-        Some(RecordingLifecycleEvent::Failed(segment)) => {
+        Some(RecordingLifecycleEvent::Failed { segment, .. }) => {
             health.failed();
             tracing::error!(failure = ?segment.failure(), "recording lifecycle failure delivered");
         }
         None => tracing::debug!("recording lifecycle channel closed"),
+    }
+    if let (Some(event), Some(writer)) = (event, metadata_writer) {
+        if let Err(error) = writer.try_submit(event, recording_root) {
+            tracing::warn!(category = ?error, "recording metadata fact remains filesystem reconciliation evidence");
+        }
     }
 }
 

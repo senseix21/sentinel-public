@@ -91,10 +91,10 @@ async fn writes_three_probeable_and_decodable_thirty_second_segments() {
                     RtspReadOutcome::EndOfStream => panic!("fixture ended before three segments"),
                 },
                 event = event_rx.recv() => match event {
-                    Some(RecordingLifecycleEvent::Completed(segment)) => {
+                    Some(RecordingLifecycleEvent::Completed { segment, .. }) => {
                         paths.push(segment.path().to_path_buf());
                     }
-                    Some(RecordingLifecycleEvent::Failed(segment)) => {
+                    Some(RecordingLifecycleEvent::Failed { segment, .. }) => {
                         panic!("recording lifecycle failed: {:?}", segment.failure())
                     }
                     None => panic!("recording lifecycle channel closed"),

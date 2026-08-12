@@ -145,6 +145,42 @@ impl SegmentFileStore {
         self.finalize(active).await
     }
 
+    /// Probes an existing durable regular file beneath the owned root without
+    /// following a final-component symlink.
+    ///
+    /// # Errors
+    /// Returns a classified path, metadata, or media-probe failure.
+    pub async fn probe_durable(&self, path: PathBuf) -> Result<StoredSegment, SegmentStoreError> {
+        if !path.starts_with(self.layout.root()) {
+            return Err(SegmentStoreError::new(
+                SegmentStoreStage::ValidatePath,
+                SegmentStoreErrorKind::OutsideConfiguredRoot,
+            ));
+        }
+        let metadata = fs::symlink_metadata(&path)
+            .await
+            .map_err(|error| io_error(SegmentStoreStage::ValidatePath, error))?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(SegmentStoreError::new(
+                SegmentStoreStage::ValidatePath,
+                SegmentStoreErrorKind::NotRegularFile,
+            ));
+        }
+        let canonical_root = fs::canonicalize(self.layout.root())
+            .await
+            .map_err(|error| io_error(SegmentStoreStage::ValidatePath, error))?;
+        let canonical_path = fs::canonicalize(&path)
+            .await
+            .map_err(|error| io_error(SegmentStoreStage::ValidatePath, error))?;
+        if !canonical_path.starts_with(canonical_root) {
+            return Err(SegmentStoreError::new(
+                SegmentStoreStage::ValidatePath,
+                SegmentStoreErrorKind::OutsideConfiguredRoot,
+            ));
+        }
+        self.probe(path).await
+    }
+
     /// Exclusively creates an active partial beneath the configured root.
     ///
     /// # Errors
@@ -388,6 +424,7 @@ pub enum SegmentStoreErrorKind {
     SegmentTooLarge,
     DurableAlreadyExists,
     MissingParent,
+    NotRegularFile,
     UnsupportedCodec,
     InvalidProbeOutput,
     ProbeFailed(ExitStatus),

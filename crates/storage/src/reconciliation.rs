@@ -1,7 +1,13 @@
 //! Bounded startup discovery of recording files requiring reconciliation.
 
 use crate::filesystem::RecordingLayout;
-use std::{error::Error, fmt, path::PathBuf};
+use std::{
+    error::Error,
+    fmt,
+    path::{Path, PathBuf},
+    time::SystemTime,
+};
+use surveillance_common::types::{CameraId, RecordingId};
 use tokio::fs;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,6 +119,85 @@ fn candidate_path(candidate: &ReconciliationCandidate) -> &PathBuf {
         | ReconciliationCandidate::DurableUnindexed(path) => path,
     }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconciliationIdentity {
+    camera_id: CameraId,
+    recording_id: RecordingId,
+    started_at: SystemTime,
+}
+
+impl ReconciliationIdentity {
+    /// Parses only the deterministic recorder layout beneath the owned root.
+    ///
+    /// # Errors
+    /// Returns [`ReconciliationIdentityError`] for foreign or malformed paths.
+    pub fn parse(
+        layout: &RecordingLayout,
+        path: &Path,
+    ) -> Result<Self, ReconciliationIdentityError> {
+        let relative = path
+            .strip_prefix(layout.root())
+            .map_err(|_| ReconciliationIdentityError)?;
+        let components: Vec<_> = relative
+            .components()
+            .map(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .ok_or(ReconciliationIdentityError)
+            })
+            .collect::<Result<_, _>>()?;
+        let [camera, year, month, day, file] = components.as_slice() else {
+            return Err(ReconciliationIdentityError);
+        };
+        let camera_id = CameraId::new(*camera).map_err(|_| ReconciliationIdentityError)?;
+        let stem = file
+            .strip_suffix(".partial.mp4")
+            .or_else(|| file.strip_suffix(".mp4"))
+            .ok_or(ReconciliationIdentityError)?;
+        let (clock, recording) = stem.split_once("--").ok_or(ReconciliationIdentityError)?;
+        let mut clock = clock.split('-');
+        let (Some(hour), Some(minute), Some(second), None) =
+            (clock.next(), clock.next(), clock.next(), clock.next())
+        else {
+            return Err(ReconciliationIdentityError);
+        };
+        let timestamp = format!("{year}-{month}-{day}T{hour}:{minute}:{second}Z")
+            .parse::<jiff::Timestamp>()
+            .map_err(|_| ReconciliationIdentityError)?;
+        let recording_id = RecordingId::new(recording).map_err(|_| ReconciliationIdentityError)?;
+        Ok(Self {
+            camera_id,
+            recording_id,
+            started_at: SystemTime::from(timestamp),
+        })
+    }
+
+    #[must_use]
+    pub fn camera_id(&self) -> &CameraId {
+        &self.camera_id
+    }
+    #[must_use]
+    pub fn recording_id(&self) -> &RecordingId {
+        &self.recording_id
+    }
+    #[must_use]
+    pub const fn started_at(&self) -> SystemTime {
+        self.started_at
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReconciliationIdentityError;
+
+impl fmt::Display for ReconciliationIdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("recording path does not match the deterministic layout")
+    }
+}
+
+impl Error for ReconciliationIdentityError {}
 
 #[derive(Debug)]
 pub enum ReconciliationError {
