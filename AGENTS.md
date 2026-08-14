@@ -24,20 +24,74 @@ The existing `cam_rtsp` code is a prototype and reference implementation. It is 
 
 ## Current Repository Reality
 
-Assume the following until the code proves otherwise:
+Last verified 2026-08-14. Re-verify before relying on any specific claim; this
+section describes a moving tree.
 
-- The checked-in crate does not build because its dependencies inherit from a missing workspace root.
-- It accepts one stream URL and uses a fixed `default_stream` identity.
-- Recording, detection, and forwarding open independent connections to the same source.
-- Recording is H.264-specific, writes one continuous file, and ignores the configured recordings directory.
-- The GStreamer bus loop can stop draining after its first idle timeout.
-- Recording metadata and one-hour durations are fabricated rather than probed or indexed.
-- Clip selection scans the filesystem, selects only one file, and uses keyframe-imprecise stream-copy seeking.
-- Configuration endpoints and some response objects are placeholders.
-- Failure isolation, authentication, persistent configuration, metrics, database indexing, retention, and automated tests do not yet exist.
-- `StreamProcessor`, `FileRecorder`, and MediaMTX-related paths contain substantial dead or parallel implementations.
+### The workspace
 
-Verify the relevant fact before relying on it because the repository will evolve. Never present an uncompiled path as working.
+A real `[workspace]` root builds `apps/server`, `apps/worker`, and the `crates/*`
+members. `make check` passes: `cargo fmt --all --check`, `cargo clippy
+--workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace
+--all-features` (126 passed, 0 failed, 20 ignored), and `cargo build --workspace
+--release`. Ignored tests require FFmpeg/libx264, MediaMTX, PostgreSQL, or a
+LiveKit server; the corresponding fixtures live in `scripts/phaseN/`.
+
+Roadmap phases 0 through 6 are implemented. `ROADMAP.md` carries per-item status
+and is the authority; several exit-gate items remain `[!]` pending representative
+cameras, target hardware, or product decisions.
+
+Implemented today:
+
+- One ingestion owner per camera holding one authenticated Retina RTSP/TCP H.264
+  session, with an explicit lifecycle, epoch identity, and bounded reconnect
+  backoff. Recorder, LiveKit publisher, and detection attach to the bounded media
+  distributor and add no upstream connections.
+- Segmented fragmented-MP4 recording under camera/UTC paths, exclusively created
+  and atomically finalized, with metadata probed from the actual file. Partial
+  files survive forced exit as reconciliation evidence.
+- PostgreSQL `cameras` and `recording_segments` tables with indexed overlapping
+  time-range queries, startup and continuous reconciliation, retention from
+  indexed metadata, and storage watermarks with hysteresis.
+- A multi-camera supervisor with typed add/start/stop/remove operations,
+  per-camera health snapshots, and proven failure isolation across cameras and
+  between camera, recorder, LiveKit, and API tasks.
+- Loopback-only HTTP: `/live`, `/ready`, `/metrics` (Prometheus, bounded
+  cardinality), and camera-scoped `/api/cameras` resources covering health,
+  recording search and detail, lifecycle operations, and development-only
+  LiveKit viewer tokens.
+- Sampled detection as an independently degradable consumer: an owned FFmpeg
+  decode process, media-timestamp sampling, a freshness-preferring bounded queue,
+  and a bounded in-process event bus with per-class overflow policy.
+
+Not yet implemented, and not to be described as working:
+
+- `crates/api`, `crates/analytics`, `crates/rules`, and `apps/worker` are empty
+  stubs. The HTTP surface lives in `apps/server/src/health_http.rs`.
+- Detection has no production model. `DeterministicFakeInference` is the only
+  implementation of `PersonInference`; the pipeline is a wired seam behind a
+  fixture. No accuracy claim is supported.
+- There is no durable event log. ADR 002 defers persistence and replay to
+  explicit adapters and reconstructs lifecycle facts from indexed state.
+- No authentication or authorization exists. The API is loopback-only and
+  LiveKit viewer tokens are labeled development-only. Phases 7 and 8 have not
+  started, so persistent configuration APIs, ROI, rules, TLS, audit logging, and
+  packaging are absent.
+
+### The prototype
+
+The original `cam_rtsp` prototype survives in the repository root as `src/`,
+`examples/`, and `tests/`. It is outside the workspace, is not compiled, and is
+not shipped. Its known defects are why the migration exists: a single
+`default_stream` identity, independent connections per feature from the same
+source, one continuous recording file that ignores the configured directory, a
+GStreamer bus loop that can stop draining after its first idle timeout,
+fabricated metadata and one-hour durations, filesystem-scanning clip selection
+with keyframe-imprecise seeking, placeholder configuration endpoints, and
+substantial dead or parallel paths in `StreamProcessor`, `FileRecorder`, and the
+MediaMTX code.
+
+Read it for proven RTSP, GStreamer, FFmpeg, and H.265 mechanics. Do not treat any
+of its behavior as current, and never present an uncompiled path as working.
 
 ## Non-Negotiable Architecture
 
