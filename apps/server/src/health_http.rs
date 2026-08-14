@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use surveillance_camera::connection::ConnectionState;
 use surveillance_common::types::CameraId;
 use surveillance_config::{
+    cache::CacheState,
     change::{ChangeReport, ProposedChange, UpdateRejection},
     classification::{Secrecy, SettingId},
     resolution::SettingKey,
@@ -32,7 +33,7 @@ use crate::{
     metadata_writer::MetadataWriterHandle,
     phase4_metrics::Phase4Metrics,
     playback::PlaybackAssembler,
-    settings_service::SettingsService,
+    settings_service::{ConfigurationMetricsView, SettingsService},
 };
 
 /// Fallbacks used only when no settings service is present.
@@ -455,6 +456,11 @@ async fn route_with_recordings(
     let (path, query) = target
         .split_once('?')
         .map_or((target, ""), |(path, query)| (path, query));
+    // Gathered before dispatch so `/metrics` takes the configuration lock once.
+    let configuration_view = match (method, path, settings) {
+        ("GET", "/metrics", Some(service)) => Some(service.metrics_view().await),
+        _ => None,
+    };
     match (method, path) {
         ("GET", "/live") => response("200 OK", "text/plain; charset=utf-8", "live\n"),
         ("GET", "/ready") => {
@@ -469,6 +475,7 @@ async fn route_with_recordings(
                 metadata,
                 phase4,
                 Some(&supervisor.event_bus()),
+                configuration_view.as_ref(),
             ),
         ),
         ("GET", "/api/cameras") => json_response("200 OK", &camera_list(&registry.snapshots())),
@@ -1224,6 +1231,81 @@ async fn readiness_response(
     }
 }
 
+/// Emits the configuration metrics required by `docs/phase-7/contracts.md` §6.
+///
+/// Audit-write and notification outcomes are separate series on purpose: a
+/// change that is durably recorded but whose notification was dropped is
+/// correct behavior, and collapsing them would make it read as a failure.
+fn render_configuration_metrics(output: &mut String, view: &ConfigurationMetricsView) {
+    let _ = writeln!(
+        output,
+        "surveillance_configuration_generation {}",
+        view.generation
+    );
+    let _ = writeln!(
+        output,
+        "surveillance_configuration_freshness {}",
+        view.freshness.gauge()
+    );
+    let _ = writeln!(
+        output,
+        "surveillance_configuration_store_available {}",
+        u8::from(view.store_available)
+    );
+    let _ = writeln!(
+        output,
+        "surveillance_configuration_mutating_surface_enabled {}",
+        u8::from(view.mutating_surface_enabled)
+    );
+    let _ = writeln!(
+        output,
+        "surveillance_configuration_unreadable_rows {}",
+        view.unreadable_rows
+    );
+    if let Some(age) = view.last_success_age_seconds {
+        // Absent rather than zero when no load has ever succeeded: zero would
+        // read as "just loaded".
+        let _ = writeln!(
+            output,
+            "surveillance_configuration_last_success_age_seconds {age}"
+        );
+    }
+    for state in CacheState::ALL {
+        let _ = writeln!(
+            output,
+            "surveillance_configuration_cache_state{{state=\"{}\"}} {}",
+            state.as_str(),
+            u8::from(*state == view.cache)
+        );
+    }
+    for (origin, count) in &view.by_origin {
+        let _ = writeln!(
+            output,
+            "surveillance_configuration_origin{{origin=\"{}\"}} {count}",
+            origin.as_str()
+        );
+    }
+    for (boundary, count) in &view.pending_by_boundary {
+        let _ = writeln!(
+            output,
+            "surveillance_configuration_pending{{boundary=\"{}\"}} {count}",
+            boundary.as_str()
+        );
+    }
+    for (name, value) in [
+        ("applied_total", view.applied),
+        ("rejected_total", view.rejected),
+        ("audit_write_total", view.audit_written),
+        ("audit_write_failed_total", view.audit_failed),
+        ("notify_published_total", view.notify_published),
+        ("notify_dropped_total", view.notify_dropped),
+        ("cache_write_total", view.cache_writes),
+        ("cache_write_failed_total", view.cache_write_failures),
+    ] {
+        let _ = writeln!(output, "surveillance_configuration_{name} {value}");
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the flat exporter keeps bounded metric names and labels directly auditable"
@@ -1234,8 +1316,12 @@ fn render_metrics(
     metadata: Option<&MetadataWriterHandle>,
     phase4: Option<&Phase4Metrics>,
     event_bus: Option<&surveillance_events::bus::EventBus>,
+    configuration: Option<&ConfigurationMetricsView>,
 ) -> String {
     let mut output = String::with_capacity(snapshots.len().saturating_mul(1_024));
+    if let Some(configuration) = configuration {
+        render_configuration_metrics(&mut output, configuration);
+    }
     if let Some(event_bus) = event_bus {
         let events = event_bus.metrics();
         let _ = writeln!(
@@ -1957,6 +2043,66 @@ mod tests {
         let (bytes, timeout) = super::request_bounds(Some(&service)).await;
         assert_eq!(bytes, 4_096);
         assert_eq!(timeout, Duration::from_secs(11));
+    }
+
+    /// `docs/phase-7/contracts.md` §6. Without this the counters increment but
+    /// nothing observes them, and the contract document would be describing
+    /// metrics that are not exposed.
+    #[tokio::test]
+    async fn configuration_metrics_are_exposed_with_bounded_cardinality() {
+        let (supervisor, handle) = supervisor();
+        let task = tokio::spawn(supervisor.run());
+        let service = settings_service(MutatingSurface::Disabled);
+
+        let response = route_with_settings(
+            get("/metrics").as_bytes(),
+            std::path::Path::new("target/phase7-tests"),
+            &handle.health_registry(),
+            &handle,
+            &service,
+            Some(loopback()),
+        )
+        .await;
+
+        for series in [
+            "surveillance_configuration_generation",
+            "surveillance_configuration_freshness",
+            "surveillance_configuration_store_available",
+            "surveillance_configuration_mutating_surface_enabled",
+            "surveillance_configuration_cache_state{state=\"valid\"}",
+            "surveillance_configuration_origin{origin=\"default\"}",
+            "surveillance_configuration_pending{boundary=\"next_segment\"}",
+            "surveillance_configuration_audit_write_total",
+            "surveillance_configuration_audit_write_failed_total",
+            "surveillance_configuration_notify_published_total",
+            "surveillance_configuration_notify_dropped_total",
+            "surveillance_configuration_cache_write_failed_total",
+        ] {
+            assert!(response.contains(series), "missing {series}");
+        }
+
+        // Audit and notification outcomes must be separate series: a change
+        // that committed but whose notification dropped is correct behavior.
+        assert_ne!(
+            response.find("surveillance_configuration_audit_write_total"),
+            response.find("surveillance_configuration_notify_published_total")
+        );
+
+        // Bounded cardinality: no setting value, and no camera identifier, may
+        // appear as a label.
+        assert!(
+            !response.contains("top-secret-password"),
+            "metrics leaked a credential"
+        );
+        for line in response.lines() {
+            if line.starts_with("surveillance_configuration_") {
+                let labels = line.matches('{').count();
+                assert!(labels <= 1, "unbounded label structure: {line}");
+            }
+        }
+
+        let _ = handle.shutdown().await;
+        let _ = task.await;
     }
 
     #[tokio::test]
