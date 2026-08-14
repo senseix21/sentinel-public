@@ -12,3 +12,4 @@ pub use recordings::{
     DatabasePoolSnapshot, IndexedCompletedEvidence, PersistCompletedOutcome,
     PostgresRecordingRepository, RepositoryError, RepositoryErrorCategory, RetentionCandidate,
 };
+pub use settings::{audit_records, PostgresSettingsRepository};

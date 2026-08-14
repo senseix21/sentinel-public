@@ -5,8 +5,12 @@ use std::{fmt::Write as _, io, net::SocketAddr, path::PathBuf, sync::Arc, time::
 use serde::{Deserialize, Serialize};
 use surveillance_camera::connection::ConnectionState;
 use surveillance_common::types::CameraId;
-use surveillance_config::settings::{
-    CameraCredentialsSettings, OneCameraConfig, OneCameraSettings,
+use surveillance_config::{
+    change::{ChangeReport, ProposedChange, UpdateRejection},
+    classification::{Secrecy, SettingId},
+    resolution::SettingKey,
+    settings::{CameraCredentialsSettings, OneCameraConfig, OneCameraSettings},
+    value::SettingValue,
 };
 use surveillance_database::PostgresRecordingRepository;
 use surveillance_livekit::token::DevelopmentTokenService;
@@ -24,12 +28,44 @@ use crate::camera_supervisor::{
     SupervisorRequestError,
 };
 use crate::{
-    metadata_writer::MetadataWriterHandle, phase4_metrics::Phase4Metrics,
+    authorize::{authorize, Action, Denied, RequestContext},
+    metadata_writer::MetadataWriterHandle,
+    phase4_metrics::Phase4Metrics,
     playback::PlaybackAssembler,
+    settings_service::SettingsService,
 };
 
-const MAX_REQUEST_BYTES: usize = 16 * 1024;
-const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// Fallbacks used only when no settings service is present.
+///
+/// These equal the compiled defaults in `crates/config/src/defaults.rs`, which
+/// a test asserts, so removing the service changes configurability without
+/// changing behavior.
+const DEFAULT_MAX_REQUEST_BYTES: usize = 16 * 1024;
+const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Reads the request bounds for this request.
+///
+/// `api.max_request_bytes` and `api.io_timeout` are the two settings declared
+/// `Immediate`, so they are read per request rather than captured at startup.
+async fn request_bounds(settings: Option<&SettingsService>) -> (usize, Duration) {
+    let Some(service) = settings else {
+        return (DEFAULT_MAX_REQUEST_BYTES, DEFAULT_IO_TIMEOUT);
+    };
+    let bytes = match service
+        .effective_value(SettingId::ApiMaxRequestBytes, None)
+        .await
+    {
+        Some(SettingValue::Unsigned(value)) => {
+            usize::try_from(value).unwrap_or(DEFAULT_MAX_REQUEST_BYTES)
+        }
+        _ => DEFAULT_MAX_REQUEST_BYTES,
+    };
+    let timeout = match service.effective_value(SettingId::ApiIoTimeout, None).await {
+        Some(SettingValue::Duration(value)) => value,
+        _ => DEFAULT_IO_TIMEOUT,
+    };
+    (bytes, timeout)
+}
 
 /// Runs one bounded sequential loopback adapter until requested shutdown.
 ///
@@ -54,6 +90,7 @@ pub async fn serve_health(
     metadata: Option<MetadataWriterHandle>,
     phase4: Option<Phase4Metrics>,
     viewer_tokens: Option<DevelopmentTokenService>,
+    settings: Option<Arc<SettingsService>>,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     if !address.ip().is_loopback() {
@@ -73,7 +110,7 @@ pub async fn serve_health(
             }
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
-                if let Err(error) = Box::pin(handle_client(stream, &recording_root, &registry, &supervisor, recordings.as_ref(), playback.as_ref(), metadata.as_ref(), phase4.as_ref(), viewer_tokens.as_ref())).await {
+                if let Err(error) = Box::pin(handle_client(stream, &recording_root, &registry, &supervisor, recordings.as_ref(), playback.as_ref(), metadata.as_ref(), phase4.as_ref(), viewer_tokens.as_ref(), settings.as_deref(), Some(peer.ip()))).await {
                     tracing::debug!(%peer, %error, "API client request discarded");
                 }
             }
@@ -95,8 +132,11 @@ async fn handle_client(
     metadata: Option<&MetadataWriterHandle>,
     phase4: Option<&Phase4Metrics>,
     viewer_tokens: Option<&DevelopmentTokenService>,
+    settings: Option<&SettingsService>,
+    peer: Option<std::net::IpAddr>,
 ) -> io::Result<()> {
-    let request = read_request(&mut stream).await?;
+    let (max_request_bytes, io_timeout) = request_bounds(settings).await;
+    let request = read_request(&mut stream, max_request_bytes, io_timeout).await?;
     if let (Some(repository), Some(assembler), Some((camera_id, query))) =
         (recordings, playback, playback_target(&request))
     {
@@ -107,6 +147,7 @@ async fn handle_client(
             repository,
             assembler,
             phase4,
+            io_timeout,
         ))
         .await;
     }
@@ -119,9 +160,11 @@ async fn handle_client(
         metadata,
         phase4,
         viewer_tokens,
+        settings,
+        peer,
     )
     .await;
-    tokio::time::timeout(IO_TIMEOUT, stream.write_all(response.as_bytes()))
+    tokio::time::timeout(io_timeout, stream.write_all(response.as_bytes()))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "API response timed out"))??;
     Ok(())
@@ -157,6 +200,7 @@ async fn stream_playback(
     repository: &PostgresRecordingRepository,
     assembler: &PlaybackAssembler,
     metrics: Option<&Phase4Metrics>,
+    io_timeout: Duration,
 ) -> io::Result<()> {
     let parameters: std::collections::BTreeMap<_, _> =
         url::form_urlencoded::parse(query.as_bytes())
@@ -221,7 +265,7 @@ async fn stream_playback(
             stream.write_all(&buffer[..read]).await?;
             stream.write_all(b"\r\n").await
         };
-        if let Ok(result) = tokio::time::timeout(IO_TIMEOUT, write).await {
+        if let Ok(result) = tokio::time::timeout(io_timeout, write).await {
             result?;
         } else {
             playback.cancel().await;
@@ -263,19 +307,23 @@ fn parse_range(
     Some((start, end, range))
 }
 
-async fn read_request(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+async fn read_request(
+    stream: &mut TcpStream,
+    max_request_bytes: usize,
+    io_timeout: Duration,
+) -> io::Result<Vec<u8>> {
     let mut request = Vec::with_capacity(1_024);
     loop {
-        if request.len() == MAX_REQUEST_BYTES {
+        if request.len() >= max_request_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "API request exceeds configured bound",
             ));
         }
         let mut chunk = [0_u8; 1_024];
-        let remaining = MAX_REQUEST_BYTES - request.len();
+        let remaining = max_request_bytes.saturating_sub(request.len());
         let read =
-            tokio::time::timeout(IO_TIMEOUT, stream.read(&mut chunk[..remaining.min(1_024)]))
+            tokio::time::timeout(io_timeout, stream.read(&mut chunk[..remaining.min(1_024)]))
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "API request timed out"))??;
         if read == 0 {
@@ -290,7 +338,7 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
                 .ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "invalid request size")
                 })?;
-            if total > MAX_REQUEST_BYTES {
+            if total > max_request_bytes {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "API request body exceeds configured bound",
@@ -342,6 +390,33 @@ async fn route(
         None,
         None,
         None,
+        None,
+        None,
+    )
+    .await
+}
+
+/// Routes with a settings service and a stated peer, for the P7.6 tests.
+#[cfg(test)]
+async fn route_with_settings(
+    request: &[u8],
+    recording_root: &std::path::Path,
+    registry: &CameraHealthRegistry,
+    supervisor: &CameraSupervisorHandle,
+    settings: &SettingsService,
+    peer: Option<std::net::IpAddr>,
+) -> String {
+    route_with_recordings(
+        request,
+        recording_root,
+        registry,
+        supervisor,
+        None,
+        None,
+        None,
+        None,
+        Some(settings),
+        peer,
     )
     .await
 }
@@ -359,6 +434,8 @@ async fn route_with_recordings(
     metadata: Option<&MetadataWriterHandle>,
     phase4: Option<&Phase4Metrics>,
     viewer_tokens: Option<&DevelopmentTokenService>,
+    settings: Option<&SettingsService>,
+    peer: Option<std::net::IpAddr>,
 ) -> String {
     let Some(header_end) = find_header_end(request) else {
         return json_error("400 Bad Request", "invalid_request");
@@ -386,10 +463,19 @@ async fn route_with_recordings(
         ("GET", "/metrics") => response(
             "200 OK",
             "text/plain; version=0.0.4; charset=utf-8",
-            &render_metrics(&registry.snapshots(), recordings, metadata, phase4),
+            &render_metrics(
+                &registry.snapshots(),
+                recordings,
+                metadata,
+                phase4,
+                Some(&supervisor.event_bus()),
+            ),
         ),
         ("GET", "/api/cameras") => json_response("200 OK", &camera_list(&registry.snapshots())),
         ("POST", "/api/cameras") => add_camera(body, recording_root, supervisor).await,
+        (_, path) if path == "/api/settings" || path.starts_with("/api/settings/") => {
+            route_settings(method, path, body, settings, peer).await
+        }
         _ => {
             route_camera(
                 method,
@@ -404,6 +490,196 @@ async fn route_with_recordings(
             .await
         }
     }
+}
+
+/// Settings resources.
+///
+/// Reads are unauthenticated in Phase 7: the listener is loopback-only and
+/// observing effective configuration carries no write risk. Writes always route
+/// through [`authorize`], and when the mutating surface is disabled they answer
+/// `404`, matching an unknown path exactly — a disabled surface does not
+/// advertise itself.
+async fn route_settings(
+    method: &str,
+    path: &str,
+    body: &[u8],
+    settings: Option<&SettingsService>,
+    peer: Option<std::net::IpAddr>,
+) -> String {
+    let Some(service) = settings else {
+        return json_error("503 Service Unavailable", "settings_unavailable");
+    };
+    let key = path
+        .strip_prefix("/api/settings/")
+        .filter(|key| !key.is_empty());
+
+    match (method, key) {
+        ("GET", None) => settings_list(service).await,
+        ("GET", Some(key)) => match SettingId::from_key(key) {
+            Some(id) => settings_detail(service, id).await,
+            None => json_error("404 Not Found", "unknown_setting"),
+        },
+        ("PUT", None) => apply_settings_update(body, service, peer).await,
+        _ => json_error("405 Method Not Allowed", "method_not_allowed"),
+    }
+}
+
+/// The one mutating settings handler.
+///
+/// Takes [`Authorized`] by value, so it cannot run without the chokepoint
+/// having granted this specific action.
+async fn apply_settings_update(
+    body: &[u8],
+    service: &SettingsService,
+    peer: Option<std::net::IpAddr>,
+) -> String {
+    let context = RequestContext::new(peer, service.surface(), false);
+    let authorized = match authorize(&context, Action::UpdateGlobalSettings) {
+        Ok(authorized) => authorized,
+        // A disabled surface answers exactly as an unknown path does.
+        Err(Denied::SurfaceDisabled) => return json_error("404 Not Found", "not_found"),
+        Err(Denied::Unauthorized) => return json_error("403 Forbidden", "unauthorized"),
+        Err(Denied::ShuttingDown) => return json_error("503 Service Unavailable", "shutting_down"),
+    };
+
+    let Ok(text) = std::str::from_utf8(body) else {
+        return json_error("400 Bad Request", "invalid_request");
+    };
+    let changes = match parse_settings_body(text) {
+        Ok(changes) => changes,
+        Err(reason) => return json_error("400 Bad Request", reason),
+    };
+
+    match service.update(authorized, changes).await {
+        Ok(report) => json_response("200 OK", &settings_report(&report)),
+        Err(rejection) => settings_rejection(&rejection),
+    }
+}
+
+/// Parses `{"changes":{"<key>":"<value>"}}`.
+///
+/// Values arrive as strings for every kind so that one wire form covers
+/// durations, counts, and paths without the client having to know which is
+/// which. Parsing is still kind-directed on the server.
+fn parse_settings_body(text: &str) -> Result<Vec<ProposedChange>, &'static str> {
+    let document: serde_json::Value = match serde_json::from_str(text) {
+        Ok(document) => document,
+        Err(_) => return Err("invalid_body"),
+    };
+    let table = document
+        .get("changes")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("missing_changes")?;
+
+    let mut changes = Vec::with_capacity(table.len());
+    for (key, value) in table {
+        let raw = value.as_str().ok_or("value_must_be_a_string")?;
+        let (name, camera) = key
+            .split_once('@')
+            .map_or((key.as_str(), None), |(name, camera)| (name, Some(camera)));
+        let id = SettingId::from_key(name).ok_or("unknown_setting")?;
+        let parsed = SettingValue::parse(id, raw).map_err(|_| "invalid_value")?;
+        let setting_key = match camera {
+            Some(camera) => {
+                let camera = CameraId::new(camera).map_err(|_| "invalid_camera_id")?;
+                SettingKey::scoped(id, camera).map_err(|_| "not_camera_scoped")?
+            }
+            None => SettingKey::unscoped(id),
+        };
+        changes.push(ProposedChange {
+            key: setting_key,
+            value: parsed,
+        });
+    }
+    Ok(changes)
+}
+
+fn settings_rejection(rejection: &UpdateRejection) -> String {
+    let (status, code) = match rejection {
+        UpdateRejection::UnknownKey { .. } => ("400 Bad Request", "unknown_setting"),
+        UpdateRejection::NotOperational { .. } => ("400 Bad Request", "not_operational"),
+        UpdateRejection::Duplicate { .. } => ("400 Bad Request", "duplicate_setting"),
+        UpdateRejection::Malformed { .. } => ("400 Bad Request", "invalid_value"),
+        UpdateRejection::Scope { .. } => ("400 Bad Request", "invalid_scope"),
+        UpdateRejection::GroupInvariant { .. } => ("409 Conflict", "group_invariant"),
+        UpdateRejection::Unauthorized => ("403 Forbidden", "unauthorized"),
+        UpdateRejection::SurfaceDisabled => ("404 Not Found", "not_found"),
+        UpdateRejection::ShuttingDown => ("503 Service Unavailable", "shutting_down"),
+    };
+    // The detail names the offending setting, which is the point of the typed
+    // error. It is safe to render because a rejection carries an identity,
+    // never a value.
+    json_response(
+        status,
+        &serde_json::json!({ "error": code, "detail": rejection.to_string() }),
+    )
+}
+
+async fn settings_list(service: &SettingsService) -> String {
+    let snapshot = service.snapshot().await;
+    let mut entries = Vec::new();
+    for id in SettingId::ALL.iter().copied() {
+        if let Some((value, origin)) = service.effective(id, None).await {
+            entries.push(serde_json::json!({
+                "key": id.key(),
+                // `value` is already redacted for secrets: SettingValue::render
+                // is the only rendering, and it returns "***".
+                "value": value,
+                "origin": origin.as_str(),
+                "boundary": id.boundary().as_str(),
+                "class": if id.api_editable() { "operational" } else { "bootstrap" },
+                "secret": id.secrecy() == Secrecy::Secret,
+            }));
+        }
+    }
+    json_response(
+        "200 OK",
+        &serde_json::json!({
+            "generation": snapshot.generation,
+            "freshness": if snapshot.freshness.is_stale() { "stale" } else { "fresh" },
+            "cache": snapshot.cache.as_str(),
+            "settings": entries,
+        }),
+    )
+}
+
+/// Reports stored and effective values separately.
+///
+/// A setting whose stored and effective values differ is exactly the condition
+/// an operator needs surfaced, so the two are never collapsed into one number.
+async fn settings_detail(service: &SettingsService, id: SettingId) -> String {
+    let effective = service.effective(id, None).await;
+    let stored = service.stored(id, None).await;
+    json_response(
+        "200 OK",
+        &serde_json::json!({
+            "key": id.key(),
+            "effective": effective.as_ref().map(|(value, _)| value.clone()),
+            "origin": effective.as_ref().map(|(_, origin)| origin.as_str()),
+            "stored": stored,
+            "boundary": id.boundary().as_str(),
+            "editable": id.api_editable(),
+            "secret": id.secrecy() == Secrecy::Secret,
+        }),
+    )
+}
+
+fn settings_report(report: &ChangeReport) -> String {
+    let outcomes: Vec<serde_json::Value> = report
+        .outcomes
+        .iter()
+        .map(|(key, outcome)| {
+            serde_json::json!({
+                "key": key.id().key(),
+                "camera_id": key.camera().map(|camera| camera.as_str().to_owned()),
+                "outcome": outcome.as_str(),
+            })
+        })
+        .collect();
+    json_response(
+        "200 OK",
+        &serde_json::json!({ "generation": report.generation, "outcomes": outcomes }),
+    )
 }
 
 #[allow(
@@ -679,6 +955,12 @@ struct AddCameraRequest {
     password: Option<String>,
     width: u32,
     height: u32,
+    #[serde(default = "default_detection_enabled")]
+    detection_enabled: bool,
+}
+
+const fn default_detection_enabled() -> bool {
+    true
 }
 
 async fn add_camera(
@@ -694,7 +976,7 @@ async fn add_camera(
         (Some(username), Some(password)) => Some(CameraCredentialsSettings { username, password }),
         _ => return json_error("400 Bad Request", "incomplete_camera_credentials"),
     };
-    let settings = OneCameraSettings::h264_mvp(
+    let mut settings = OneCameraSettings::h264_mvp(
         request.camera_id,
         request.rtsp_endpoint,
         credentials,
@@ -702,6 +984,7 @@ async fn add_camera(
         request.height,
         recording_root.to_path_buf(),
     );
+    settings.detection_enabled = request.detection_enabled;
     let Ok(config) = OneCameraConfig::validate(settings) else {
         return json_error("400 Bad Request", "invalid_camera_configuration");
     };
@@ -761,6 +1044,13 @@ struct CameraResponse {
     live_queue_depth: Option<usize>,
     live_queue_capacity: Option<usize>,
     live_dropped: u64,
+    detection_enabled: bool,
+    detection_state: Option<String>,
+    detection_queue_depth: Option<usize>,
+    detection_queue_capacity: Option<usize>,
+    detection_dropped: u64,
+    detection_inferred: u64,
+    detections_published: u64,
     recorder_completed_segments: u64,
     recorder_failed_segments: u64,
     live_publication_enabled: bool,
@@ -772,6 +1062,10 @@ struct CameraResponse {
 }
 
 impl From<&CameraStatusSnapshot> for CameraResponse {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "flat credential-free API projection keeps bounded health fields explicit"
+    )]
     fn from(snapshot: &CameraStatusSnapshot) -> Self {
         let connection = snapshot.health.as_ref().map(|health| &health.connection);
         let counters =
@@ -816,6 +1110,36 @@ impl From<&CameraStatusSnapshot> for CameraResponse {
                 .health
                 .as_ref()
                 .map_or(0, |value| value.live_queue.dropped_oldest),
+            detection_enabled: snapshot.health.as_ref().is_some_and(|value| {
+                !matches!(
+                    value.detection.state,
+                    surveillance_detector::detector::DetectionState::Disabled
+                )
+            }),
+            detection_state: snapshot
+                .health
+                .as_ref()
+                .map(|value| format!("{:?}", value.detection.state)),
+            detection_queue_depth: snapshot
+                .health
+                .as_ref()
+                .map(|value| value.detection_queue.depth),
+            detection_queue_capacity: snapshot
+                .health
+                .as_ref()
+                .map(|value| value.detection_queue.capacity),
+            detection_dropped: snapshot
+                .health
+                .as_ref()
+                .map_or(0, |value| value.detection_queue.dropped_oldest),
+            detection_inferred: snapshot
+                .health
+                .as_ref()
+                .map_or(0, |value| value.detection.counters.inferred),
+            detections_published: snapshot
+                .health
+                .as_ref()
+                .map_or(0, |value| value.detection.counters.events_published),
             recorder_completed_segments: snapshot
                 .health
                 .as_ref()
@@ -909,8 +1233,77 @@ fn render_metrics(
     recordings: Option<&PostgresRecordingRepository>,
     metadata: Option<&MetadataWriterHandle>,
     phase4: Option<&Phase4Metrics>,
+    event_bus: Option<&surveillance_events::bus::EventBus>,
 ) -> String {
     let mut output = String::with_capacity(snapshots.len().saturating_mul(1_024));
+    if let Some(event_bus) = event_bus {
+        let events = event_bus.metrics();
+        let _ = writeln!(
+            output,
+            "surveillance_event_bus_subscribers {}",
+            events.subscribers
+        );
+        let _ = writeln!(
+            output,
+            "surveillance_event_publications_total {}",
+            events.publications
+        );
+        let _ = writeln!(
+            output,
+            "surveillance_event_deliveries_total {}",
+            events.outcomes.accepted
+        );
+        let _ = writeln!(
+            output,
+            "surveillance_event_rejected_full_total {}",
+            events.outcomes.rejected_full
+        );
+        let _ = writeln!(
+            output,
+            "surveillance_event_dropped_newest_total {}",
+            events.outcomes.dropped_newest
+        );
+        let _ = writeln!(
+            output,
+            "surveillance_event_replaced_oldest_total {}",
+            events.outcomes.replaced_oldest
+        );
+        let _ = writeln!(
+            output,
+            "surveillance_event_coalesced_total {}",
+            events.outcomes.coalesced
+        );
+        for (kind, value) in [
+            "camera_state_changed",
+            "recording_segment_completed",
+            "recording_segment_failed",
+            "storage_pressure_changed",
+            "person_detection_observed",
+            "detector_state_changed",
+        ]
+        .into_iter()
+        .zip(events.event_kinds)
+        {
+            let _ = writeln!(
+                output,
+                "surveillance_event_publications_by_kind_total{{kind=\"{kind}\"}} {value}"
+            );
+        }
+        for (class, value) in [
+            "critical_lifecycle",
+            "latest_state",
+            "telemetry",
+            "detection",
+        ]
+        .into_iter()
+        .zip(events.delivery_classes)
+        {
+            let _ = writeln!(
+                output,
+                "surveillance_event_publications_by_class_total{{class=\"{class}\"}} {value}"
+            );
+        }
+    }
     if let Some(repository) = recordings {
         let pool = repository.pool_snapshot();
         let _ = writeln!(output, "surveillance_database_pool_size {}", pool.size);
@@ -1139,6 +1532,131 @@ fn render_metrics(
         );
         queue_metrics(&mut output, camera, "recorder", snapshot.recorder_queue);
         queue_metrics(&mut output, camera, "live", snapshot.live_queue);
+        queue_metrics(&mut output, camera, "detection", snapshot.detection_queue);
+        let detection = snapshot.detection;
+        metric(
+            &mut output,
+            "surveillance_detector_enabled",
+            camera,
+            u8::from(!matches!(
+                detection.state,
+                surveillance_detector::detector::DetectionState::Disabled
+            )),
+        );
+        metric(
+            &mut output,
+            "surveillance_detector_state",
+            camera,
+            match detection.state {
+                surveillance_detector::detector::DetectionState::Disabled => 0_u8,
+                surveillance_detector::detector::DetectionState::Starting => 1,
+                surveillance_detector::detector::DetectionState::Running => 2,
+                surveillance_detector::detector::DetectionState::Degraded => 3,
+                surveillance_detector::detector::DetectionState::Terminal => 4,
+                surveillance_detector::detector::DetectionState::Stopping => 5,
+                surveillance_detector::detector::DetectionState::Stopped => 6,
+            },
+        );
+        for (name, value) in [
+            (
+                "surveillance_detector_encoded_considered_total",
+                detection.sampler.considered,
+            ),
+            (
+                "surveillance_detector_sampled_total",
+                detection.sampler.sampled,
+            ),
+            (
+                "surveillance_detector_skipped_by_rate_total",
+                detection.sampler.skipped_by_rate,
+            ),
+            (
+                "surveillance_detector_duplicate_timestamps_total",
+                detection.sampler.duplicate,
+            ),
+            (
+                "surveillance_detector_resets_total",
+                detection.sampler.resets,
+            ),
+            (
+                "surveillance_detector_decode_attempts_total",
+                detection.counters.decode_attempts,
+            ),
+            (
+                "surveillance_detector_decoded_total",
+                detection.counters.decoded,
+            ),
+            (
+                "surveillance_detector_decode_failures_total",
+                detection.counters.decode_failed,
+            ),
+            (
+                "surveillance_detector_inference_attempts_total",
+                detection.counters.inference_attempts,
+            ),
+            (
+                "surveillance_detector_inferred_total",
+                detection.counters.inferred,
+            ),
+            (
+                "surveillance_detector_detections_produced_total",
+                detection.counters.detections_produced,
+            ),
+            (
+                "surveillance_detector_inference_failures_total",
+                detection.counters.inference_failed,
+            ),
+            (
+                "surveillance_detector_events_published_total",
+                detection.counters.events_published,
+            ),
+            (
+                "surveillance_detector_event_delivery_losses_total",
+                detection.counters.event_delivery_losses,
+            ),
+            (
+                "surveillance_detector_decode_duration_micros_total",
+                detection.counters.decode_duration_micros,
+            ),
+            (
+                "surveillance_detector_inference_duration_micros_total",
+                detection.counters.inference_duration_micros,
+            ),
+            (
+                "surveillance_detector_end_to_event_duration_micros_total",
+                detection.counters.end_to_event_duration_micros,
+            ),
+            (
+                "surveillance_detector_end_to_event_latency_bucket_0_10ms_total",
+                detection.counters.latency_le_10ms,
+            ),
+            (
+                "surveillance_detector_end_to_event_latency_bucket_10_50ms_total",
+                detection.counters.latency_le_50ms,
+            ),
+            (
+                "surveillance_detector_end_to_event_latency_bucket_50_100ms_total",
+                detection.counters.latency_le_100ms,
+            ),
+            (
+                "surveillance_detector_end_to_event_latency_bucket_100_250ms_total",
+                detection.counters.latency_le_250ms,
+            ),
+            (
+                "surveillance_detector_end_to_event_latency_bucket_250_500ms_total",
+                detection.counters.latency_le_500ms,
+            ),
+            (
+                "surveillance_detector_end_to_event_latency_bucket_500_1000ms_total",
+                detection.counters.latency_le_1000ms,
+            ),
+            (
+                "surveillance_detector_end_to_event_latency_bucket_over_1000ms_total",
+                detection.counters.latency_over_1000ms,
+            ),
+        ] {
+            metric(&mut output, name, camera, value);
+        }
         let publication = snapshot.publication;
         metric(
             &mut output,
@@ -1322,12 +1840,379 @@ fn response(status: &str, content_type: &str, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_recording_cursor, encode_recording_cursor, parse_range, route, serve_health,
+        decode_recording_cursor, encode_recording_cursor, parse_range, route, route_with_settings,
+        serve_health,
     };
+    use crate::authorize::{authorize_call_count, MutatingSurface};
     use crate::camera_supervisor::{CameraSupervisor, PipelineState};
-    use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
-    use surveillance_config::settings::{OneCameraConfig, OneCameraSettings};
+    use crate::settings_service::SettingsService;
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        num::NonZeroUsize,
+        sync::Arc,
+        time::Duration,
+    };
+    use surveillance_config::{
+        cache::{Cache, StaleRetry},
+        classification::{Origin, SettingId},
+        defaults,
+        resolution::{Layer, SettingKey},
+        secret::Secret,
+        settings::{OneCameraConfig, OneCameraSettings},
+        value::SettingValue,
+    };
     use tokio::sync::watch;
+
+    fn loopback() -> IpAddr {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    }
+
+    /// A service with no store: enough to exercise routing, authorization, and
+    /// read rendering without a database.
+    fn settings_service(surface: MutatingSurface) -> SettingsService {
+        let mut environment = Layer::new(Origin::Environment);
+        // A secret supplied by the environment, so the read tests have
+        // something that must never be rendered.
+        environment
+            .insert(
+                SettingKey::unscoped(SettingId::CameraRtspPassword),
+                SettingValue::Secret(Secret::new("top-secret-password".to_owned())),
+            )
+            .unwrap_or_else(|error| panic!("test entry: {error}"));
+        // Pin one setting from the environment so the shadowing path is
+        // reachable in tests.
+        environment
+            .insert(
+                SettingKey::unscoped(SettingId::RetentionInterval),
+                SettingValue::Duration(Duration::from_secs(600)),
+            )
+            .unwrap_or_else(|error| panic!("test entry: {error}"));
+
+        let mut cache_path = std::env::temp_dir();
+        cache_path.push(format!("surveillance-api-cache-{}", std::process::id()));
+        SettingsService::new(
+            vec![defaults::layer()],
+            environment,
+            None,
+            Cache::new(cache_path),
+            Secret::new("test-salt".to_owned()),
+            None,
+            StaleRetry::new(Duration::from_secs(5), Duration::from_secs(30)),
+            surface,
+        )
+    }
+
+    fn get(path: &str) -> String {
+        format!("GET {path} HTTP/1.1\r\n\r\n")
+    }
+
+    fn put(path: &str, body: &str) -> String {
+        format!(
+            "PUT {path} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Exit gate 15: moving a value into configuration must change
+    /// configurability, not behavior.
+    #[tokio::test]
+    async fn moved_api_bounds_default_to_the_constants_they_replaced() {
+        let service = settings_service(MutatingSurface::Disabled);
+        let (bytes, timeout) = super::request_bounds(Some(&service)).await;
+        assert_eq!(bytes, super::DEFAULT_MAX_REQUEST_BYTES);
+        assert_eq!(timeout, super::DEFAULT_IO_TIMEOUT);
+        assert_eq!(bytes, 16 * 1024, "the previous MAX_REQUEST_BYTES");
+        assert_eq!(timeout, Duration::from_secs(5), "the previous IO_TIMEOUT");
+    }
+
+    /// `api.max_request_bytes` and `api.io_timeout` are the two settings
+    /// declared `Immediate`, so they must be read per request rather than
+    /// captured once.
+    #[tokio::test]
+    async fn immediate_api_bounds_are_read_from_configuration() {
+        let mut file = Layer::new(Origin::File);
+        file.insert(
+            SettingKey::unscoped(SettingId::ApiMaxRequestBytes),
+            SettingValue::Unsigned(4_096),
+        )
+        .unwrap_or_else(|error| panic!("test entry: {error}"));
+        file.insert(
+            SettingKey::unscoped(SettingId::ApiIoTimeout),
+            SettingValue::Duration(Duration::from_secs(11)),
+        )
+        .unwrap_or_else(|error| panic!("test entry: {error}"));
+
+        let mut cache_path = std::env::temp_dir();
+        cache_path.push(format!("surveillance-bounds-cache-{}", std::process::id()));
+        let service = SettingsService::new(
+            vec![defaults::layer(), file],
+            Layer::new(Origin::Environment),
+            None,
+            Cache::new(cache_path),
+            Secret::new(String::new()),
+            None,
+            StaleRetry::new(Duration::from_secs(5), Duration::from_secs(30)),
+            MutatingSurface::Disabled,
+        );
+        let (bytes, timeout) = super::request_bounds(Some(&service)).await;
+        assert_eq!(bytes, 4_096);
+        assert_eq!(timeout, Duration::from_secs(11));
+    }
+
+    #[tokio::test]
+    async fn settings_reads_never_render_a_secret() {
+        let (supervisor, handle) = supervisor();
+        let task = tokio::spawn(supervisor.run());
+        let service = settings_service(MutatingSurface::Enabled);
+
+        for path in ["/api/settings", "/api/settings/camera.rtsp.password"] {
+            let response = route_with_settings(
+                get(path).as_bytes(),
+                std::path::Path::new("target/phase7-tests"),
+                &handle.health_registry(),
+                &handle,
+                &service,
+                Some(loopback()),
+            )
+            .await;
+            assert!(
+                !response.contains("top-secret-password"),
+                "{path} leaked a credential: {response}"
+            );
+            assert!(response.contains("200 OK"), "{path} failed: {response}");
+        }
+
+        let _ = handle.shutdown().await;
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_disabled_mutating_surface_answers_404_and_writes_nothing() {
+        let (supervisor, handle) = supervisor();
+        let task = tokio::spawn(supervisor.run());
+        let service = settings_service(MutatingSurface::Disabled);
+
+        let response = route_with_settings(
+            put(
+                "/api/settings",
+                r#"{"changes":{"retention.batch_files":"25"}}"#,
+            )
+            .as_bytes(),
+            std::path::Path::new("target/phase7-tests"),
+            &handle.health_registry(),
+            &handle,
+            &service,
+            Some(loopback()),
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 404"),
+            "a disabled surface must not advertise itself: {response}"
+        );
+        assert!(
+            !response.contains("unauthorized"),
+            "404 must be indistinguishable from an unknown path: {response}"
+        );
+
+        // Reads stay available: observing configuration carries no write risk.
+        let read = route_with_settings(
+            get("/api/settings").as_bytes(),
+            std::path::Path::new("target/phase7-tests"),
+            &handle.health_registry(),
+            &handle,
+            &service,
+            Some(loopback()),
+        )
+        .await;
+        assert!(read.starts_with("HTTP/1.1 200"), "reads stay available");
+
+        let _ = handle.shutdown().await;
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_non_loopback_caller_is_refused() {
+        let (supervisor, handle) = supervisor();
+        let task = tokio::spawn(supervisor.run());
+        let service = settings_service(MutatingSurface::Enabled);
+
+        let response = route_with_settings(
+            put(
+                "/api/settings",
+                r#"{"changes":{"retention.batch_files":"25"}}"#,
+            )
+            .as_bytes(),
+            std::path::Path::new("target/phase7-tests"),
+            &handle.health_registry(),
+            &handle,
+            &service,
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))),
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 403"),
+            "a remote caller must be refused: {response}"
+        );
+
+        let _ = handle.shutdown().await;
+        let _ = task.await;
+    }
+
+    /// Failure-matrix item 12: proven by test, not by inspection.
+    ///
+    /// The type system already makes it impossible for a handler to *skip*
+    /// `authorize` — [`Authorized`] has no public constructor. This proves the
+    /// mutating route actually *runs* it.
+    #[tokio::test]
+    async fn every_mutating_settings_request_reaches_the_chokepoint() {
+        let (supervisor, handle) = supervisor();
+        let task = tokio::spawn(supervisor.run());
+        let service = settings_service(MutatingSurface::Disabled);
+
+        let before = authorize_call_count();
+        for body in [
+            r#"{"changes":{"retention.batch_files":"25"}}"#,
+            r#"{"changes":{}}"#,
+            "not json at all",
+        ] {
+            let _ = route_with_settings(
+                put("/api/settings", body).as_bytes(),
+                std::path::Path::new("target/phase7-tests"),
+                &handle.health_registry(),
+                &handle,
+                &service,
+                Some(loopback()),
+            )
+            .await;
+        }
+        assert!(
+            authorize_call_count() >= before + 3,
+            "every mutating request must reach the chokepoint, including malformed ones"
+        );
+
+        // A read does not go through the mutating path. Counting calls would
+        // race with other tests sharing the process-wide counter, so this
+        // asserts the observable consequence instead: with the surface
+        // disabled, anything routed through `authorize` answers 404, and this
+        // read does not.
+        let read = route_with_settings(
+            get("/api/settings").as_bytes(),
+            std::path::Path::new("target/phase7-tests"),
+            &handle.health_registry(),
+            &handle,
+            &service,
+            Some(loopback()),
+        )
+        .await;
+        assert!(
+            read.starts_with("HTTP/1.1 200"),
+            "a read must not be gated by the mutating surface: {read}"
+        );
+
+        let _ = handle.shutdown().await;
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_setting_detail_reports_stored_and_effective_separately() {
+        let (supervisor, handle) = supervisor();
+        let task = tokio::spawn(supervisor.run());
+        let service = settings_service(MutatingSurface::Enabled);
+
+        let response = route_with_settings(
+            get("/api/settings/retention.interval").as_bytes(),
+            std::path::Path::new("target/phase7-tests"),
+            &handle.health_registry(),
+            &handle,
+            &service,
+            Some(loopback()),
+        )
+        .await;
+        // The environment pins this setting, so effective is the environment
+        // value and stored is null.
+        assert!(response.contains("\"effective\":\"10m\""), "{response}");
+        assert!(
+            response.contains("\"origin\":\"environment\""),
+            "{response}"
+        );
+        assert!(response.contains("\"stored\":null"), "{response}");
+
+        let _ = handle.shutdown().await;
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn an_unknown_setting_key_is_404_not_500() {
+        let (supervisor, handle) = supervisor();
+        let task = tokio::spawn(supervisor.run());
+        let service = settings_service(MutatingSurface::Enabled);
+
+        let response = route_with_settings(
+            get("/api/settings/retention.max_agee").as_bytes(),
+            std::path::Path::new("target/phase7-tests"),
+            &handle.health_registry(),
+            &handle,
+            &service,
+            Some(loopback()),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+
+        let _ = handle.shutdown().await;
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_bootstrap_setting_is_refused_through_the_api() {
+        let (supervisor, handle) = supervisor();
+        let task = tokio::spawn(supervisor.run());
+        let service = settings_service(MutatingSurface::Enabled);
+
+        let response = route_with_settings(
+            put(
+                "/api/settings",
+                r#"{"changes":{"server.health_bind":"0.0.0.0:80"}}"#,
+            )
+            .as_bytes(),
+            std::path::Path::new("target/phase7-tests"),
+            &handle.health_registry(),
+            &handle,
+            &service,
+            Some(loopback()),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(response.contains("not_operational"), "{response}");
+
+        let _ = handle.shutdown().await;
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn a_group_invariant_breach_is_409_and_names_the_group() {
+        let (supervisor, handle) = supervisor();
+        let task = tokio::spawn(supervisor.run());
+        let service = settings_service(MutatingSurface::Enabled);
+
+        let response = route_with_settings(
+            put(
+                "/api/settings",
+                r#"{"changes":{"storage.watermark_warning":"99"}}"#,
+            )
+            .as_bytes(),
+            std::path::Path::new("target/phase7-tests"),
+            &handle.health_registry(),
+            &handle,
+            &service,
+            Some(loopback()),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+        assert!(response.contains("storage_watermarks"), "{response}");
+
+        let _ = handle.shutdown().await;
+        let _ = task.await;
+    }
 
     #[test]
     fn recording_range_normalizes_offsets_and_cursor_round_trips() {
@@ -1445,6 +2330,7 @@ mod tests {
             "target/phase3-tests".into(),
             handle.health_registry(),
             handle.clone(),
+            None,
             None,
             None,
             None,

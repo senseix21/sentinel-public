@@ -6,7 +6,15 @@ use std::{
 };
 
 use crate::phase4_metrics::Phase4Metrics;
+use std::sync::Arc;
 use surveillance_database::{PostgresRecordingRepository, RetentionCandidate};
+use surveillance_events::{
+    bus::EventBus,
+    event::{
+        DeliveryClass, DomainEvent, EventId, EventPayload, OccurredAtUnixMicros,
+        StoragePressure as EventStoragePressure,
+    },
+};
 use surveillance_storage::retention::{RetentionPolicy, SafeRecordingDelete, StoragePressure};
 use tokio::{process::Command, sync::watch};
 
@@ -30,6 +38,7 @@ pub struct RetentionOwner {
     pressure: StoragePressure,
     interval: Duration,
     metrics: Phase4Metrics,
+    event_bus: Option<EventBus>,
 }
 
 impl RetentionOwner {
@@ -49,12 +58,19 @@ impl RetentionOwner {
             pressure: StoragePressure::Normal,
             interval,
             metrics: Phase4Metrics::default(),
+            event_bus: None,
         }
     }
 
     #[must_use]
     pub fn with_metrics(mut self, metrics: Phase4Metrics) -> Self {
         self.metrics = metrics;
+        self
+    }
+
+    #[must_use]
+    pub fn with_event_bus(mut self, event_bus: EventBus) -> Self {
+        self.event_bus = Some(event_bus);
         self
     }
 
@@ -86,10 +102,14 @@ impl RetentionOwner {
     pub async fn run_pass(&mut self, now: SystemTime) -> Result<RetentionPass, &'static str> {
         let capacity = observe_capacity(&self.root).await?;
         let used_percent = capacity.used_percent();
+        let previous_pressure = self.pressure;
         self.pressure = self
             .policy
             .watermarks()
             .classify(self.pressure, used_percent);
+        if self.pressure != previous_pressure {
+            self.publish_pressure_transition(now);
+        }
         let mut pass = RetentionPass {
             pressure: self.pressure,
             total_bytes: capacity.total_bytes,
@@ -128,6 +148,47 @@ impl RetentionOwner {
             self.delete_candidate(candidate, &mut pass).await;
         }
         Ok(pass)
+    }
+
+    fn publish_pressure_transition(&self, occurred: SystemTime) {
+        let Some(bus) = self.event_bus.as_ref() else {
+            return;
+        };
+        let pressure = match self.pressure {
+            StoragePressure::Normal => EventStoragePressure::Recovered,
+            StoragePressure::Warning => EventStoragePressure::Warning,
+            StoragePressure::Critical | StoragePressure::Emergency => {
+                EventStoragePressure::Critical
+            }
+        };
+        let Some(occurred_at) = occurred
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_micros()).ok())
+            .and_then(|value| OccurredAtUnixMicros::new(value).ok())
+        else {
+            return;
+        };
+        let Ok(event_id) = EventId::new(format!(
+            "storage-{}-{}",
+            occurred_at.get(),
+            self.pressure as u8
+        )) else {
+            return;
+        };
+        let Ok(event) = DomainEvent::new(
+            event_id,
+            occurred_at,
+            None,
+            DeliveryClass::CriticalLifecycle,
+            EventPayload::StoragePressureChanged { pressure },
+        ) else {
+            return;
+        };
+        let report = bus.publish(Arc::new(event));
+        if report.rejected_full > 0 {
+            tracing::warn!(rejected=report.rejected_full, "critical storage-pressure event admission failed; current pressure remains in metrics/readiness");
+        }
     }
 
     async fn delete_candidate(&self, candidate: RetentionCandidate, pass: &mut RetentionPass) {

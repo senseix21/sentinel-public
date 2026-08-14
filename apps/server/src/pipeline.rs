@@ -1,14 +1,36 @@
 //! Owned, restartable construction boundary for one camera-to-recorder pipeline.
 
-use std::{error::Error, fmt, sync::Arc, time::SystemTime};
+use std::{
+    collections::hash_map::DefaultHasher,
+    error::Error,
+    fmt,
+    hash::{Hash, Hasher},
+    sync::Arc,
+    time::SystemTime,
+};
 
+use surveillance_camera::connection::{ConnectionState, StopReason};
 use surveillance_camera::supervisor::{JitterSource, SupervisorStopReason};
 use surveillance_config::settings::OneCameraConfig;
+use surveillance_detector::{
+    decoder::{FfmpegDecoderConfig, FfmpegH264Decoder},
+    detector::{DetectionHealth, DetectionOwner},
+    inference::DeterministicFakeInference,
+    sampler::TimestampSampler,
+};
+use surveillance_events::{
+    bus::EventBus,
+    event::{
+        CameraState, DeliveryClass, DomainEvent, EventId, EventPayload, FailureCategory,
+        OccurredAtUnixMicros,
+    },
+};
 use surveillance_livekit::{
     adapter::CliPublicationAdapter,
     owner::{LivePublicationOwner, PublicationHealth},
 };
 use surveillance_media::distribution::MediaDistributor;
+use surveillance_media::frame::FrameLimits;
 use surveillance_recorder::{
     clock::MediaWallClock, fmp4::Fmp4SegmentSink, runtime::RecordingLifecycleEvent,
 };
@@ -38,6 +60,7 @@ pub enum ActionableFailure {
 #[derive(Debug)]
 pub enum CameraPipelineError {
     Reconciliation,
+    DetectionConfiguration,
     JoinCancelled,
     JoinPanicked,
 }
@@ -46,6 +69,7 @@ impl fmt::Display for CameraPipelineError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Reconciliation => "camera recording reconciliation discovery failed",
+            Self::DetectionConfiguration => "camera detection configuration is invalid",
             Self::JoinCancelled => "camera pipeline task was cancelled",
             Self::JoinPanicked => "camera pipeline task panicked",
         })
@@ -68,12 +92,55 @@ impl CameraPipeline {
     ///
     /// Reserved for construction failures introduced by concrete media/storage
     /// boundaries; process-level reconciliation runs once before supervision.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one construction boundary keeps child ownership explicit"
+    )]
     pub fn start(
         config: Arc<OneCameraConfig>,
         metadata_writer: Option<MetadataWriterHandle>,
+        event_bus: EventBus,
     ) -> Result<Self, CameraPipelineError> {
-        let (distributor, subscriptions) =
-            MediaDistributor::new(config.recorder_queue, config.live_queue);
+        let lifecycle_bus = event_bus.clone();
+        let (distributor, subscriptions) = MediaDistributor::new_with_detection(
+            config.recorder_queue,
+            config.live_queue,
+            config.detection_queue,
+        );
+        let (detection, detection_health) = if config.detection_enabled {
+            let limits = FrameLimits::new(
+                config.recorder.width(),
+                config.recorder.height(),
+                config.decoded_frame_max_bytes,
+            )
+            .map_err(|_| CameraPipelineError::DetectionConfiguration)?;
+            let sampler =
+                TimestampSampler::new(config.detection_sample_rate, config.detection_max_gap)
+                    .map_err(|_| CameraPipelineError::DetectionConfiguration)?;
+            let inference = DeterministicFakeInference::new()
+                .map_err(|_| CameraPipelineError::DetectionConfiguration)?;
+            let decoder = FfmpegH264Decoder::start(FfmpegDecoderConfig {
+                executable: config.detection_decoder.clone(),
+                width: config.recorder.width(),
+                height: config.recorder.height(),
+                frame_limits: limits,
+                response_timeout: config.detection_decode_timeout,
+                max_access_unit_bytes: config.max_access_unit_bytes,
+            })
+            .map_err(|_| CameraPipelineError::DetectionConfiguration)?;
+            let (owner, health) = DetectionOwner::start_observed(
+                config.camera_id.clone(),
+                subscriptions.detection,
+                sampler,
+                decoder,
+                inference,
+                event_bus,
+            );
+            (Some(owner), health)
+        } else {
+            drop(subscriptions.detection);
+            (None, DetectionHealth::disabled())
+        };
         let (publication_task, publication_health) = if let Some(livekit) = config.livekit.clone() {
             let adapter = CliPublicationAdapter::new(livekit.clone());
             let (owner, health) = LivePublicationOwner::new(livekit, adapter, subscriptions.live);
@@ -82,10 +149,16 @@ impl CameraPipeline {
             drop(subscriptions.live);
             (None, PublicationHealth::disabled())
         };
-        let (health_publisher, recorder_health, health) =
-            one_camera_health(config.camera_id.clone(), &distributor, publication_health);
+        let (health_publisher, recorder_health, health) = one_camera_health(
+            config.camera_id.clone(),
+            &distributor,
+            publication_health,
+            detection_health,
+        );
         let (shutdown, shutdown_rx) = watch::channel(false);
+        let mut camera_event_health = health.clone();
         let join = tokio::spawn(async move {
+            let mut camera_event_sequence = 0_u64;
             let mut publication =
                 publication_task.map(|owner| Box::pin(owner.run(shutdown_rx.clone())));
             let store = SegmentFileStore::new(config.layout.clone(), config.ffprobe.clone());
@@ -114,7 +187,13 @@ impl CameraPipeline {
             let exit = loop {
                 tokio::select! {
                     exit = &mut pipeline => break exit,
-                    event = event_rx.recv() => handle_lifecycle_event(event, &recorder_health, metadata_writer.as_ref(), config.layout.root()),
+                    changed = camera_event_health.connection_changed() => {
+                        if let Ok(snapshot) = changed {
+                            camera_event_sequence = camera_event_sequence.saturating_add(1);
+                            publish_camera_state(&snapshot.connection, camera_event_sequence, &lifecycle_bus);
+                        }
+                    }
+                    event = event_rx.recv() => handle_lifecycle_event(event, &recorder_health, metadata_writer.as_ref(), config.layout.root(), &lifecycle_bus),
                     publication_exit = async {
                         match publication.as_mut() {
                             Some(publication) => Some(publication.await),
@@ -134,11 +213,20 @@ impl CameraPipeline {
                     &recorder_health,
                     metadata_writer.as_ref(),
                     config.layout.root(),
+                    &lifecycle_bus,
                 );
             }
             if let Some(publication) = publication {
                 let publication_exit = publication.await;
                 tracing::info!(reason=?publication_exit.reason, "LiveKit publication owner joined");
+            }
+            if let Some(detection) = detection {
+                match detection.stop_and_join().await {
+                    Ok(exit) => tracing::info!(reason=?exit.reason, "detection owner joined"),
+                    Err(_) => {
+                        tracing::warn!("detection owner join failed; recording exit preserved");
+                    }
+                }
             }
             exit
         });
@@ -197,6 +285,48 @@ impl CameraPipeline {
     }
 }
 
+fn publish_camera_state(
+    snapshot: &surveillance_camera::connection::ConnectionSnapshot,
+    sequence: u64,
+    bus: &EventBus,
+) {
+    let state = match snapshot.state() {
+        ConnectionState::Disconnected => CameraState::Disconnected,
+        ConnectionState::Connecting { .. } => CameraState::Connecting,
+        ConnectionState::Connected { .. } => CameraState::Connected,
+        ConnectionState::Reconnecting { .. } => CameraState::Reconnecting,
+        ConnectionState::Stopped {
+            reason: StopReason::Terminal(_) | StopReason::LifecycleExhausted(_),
+        } => CameraState::Terminal,
+        ConnectionState::Stopped {
+            reason: StopReason::Requested,
+        } => CameraState::Stopped,
+    };
+    let Some(occurred_at) = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_micros()).ok())
+        .and_then(|value| OccurredAtUnixMicros::new(value).ok())
+    else {
+        return;
+    };
+    let mut camera_hash = DefaultHasher::new();
+    snapshot.camera_id().hash(&mut camera_hash);
+    let Ok(event_id) = EventId::new(format!("cam-{:016x}-{sequence}", camera_hash.finish())) else {
+        return;
+    };
+    let Ok(event) = DomainEvent::new(
+        event_id,
+        occurred_at,
+        Some(snapshot.camera_id().clone()),
+        DeliveryClass::LatestState,
+        EventPayload::CameraStateChanged { state },
+    ) else {
+        return;
+    };
+    let _ = bus.publish(Arc::new(event));
+}
+
 impl Drop for CameraPipeline {
     fn drop(&mut self) {
         self.shutdown.send_replace(true);
@@ -225,6 +355,7 @@ fn handle_lifecycle_event(
     health: &RecorderHealthPublisher,
     metadata_writer: Option<&MetadataWriterHandle>,
     recording_root: &std::path::Path,
+    event_bus: &EventBus,
 ) {
     match event.as_ref() {
         Some(RecordingLifecycleEvent::Completed { segment, .. }) => {
@@ -237,10 +368,83 @@ fn handle_lifecycle_event(
         }
         None => tracing::debug!("recording lifecycle channel closed"),
     }
+    if let Some(event) = event.as_ref() {
+        publish_recording_domain_event(event, event_bus);
+    }
     if let (Some(event), Some(writer)) = (event, metadata_writer) {
         if let Err(error) = writer.try_submit(event, recording_root) {
             tracing::warn!(category = ?error, "recording metadata fact remains filesystem reconciliation evidence");
         }
+    }
+}
+
+fn publish_recording_domain_event(event: &RecordingLifecycleEvent, bus: &EventBus) {
+    let (camera_id, recording_id, occurred, payload) = match event {
+        RecordingLifecycleEvent::Completed {
+            camera_id,
+            recording_id,
+            segment,
+        } => (
+            camera_id,
+            recording_id,
+            segment.ended_at(),
+            EventPayload::RecordingSegmentCompleted {
+                recording_id: recording_id.clone(),
+                size_bytes: segment.size_bytes(),
+            },
+        ),
+        RecordingLifecycleEvent::Failed {
+            camera_id,
+            recording_id,
+            segment,
+        } => {
+            let Ok(category) =
+                FailureCategory::new(format!("{:?}", segment.failure()).to_ascii_lowercase())
+            else {
+                return;
+            };
+            (
+                camera_id,
+                recording_id,
+                segment.ended_at().unwrap_or_else(SystemTime::now),
+                EventPayload::RecordingSegmentFailed {
+                    recording_id: recording_id.clone(),
+                    failure_category: category,
+                },
+            )
+        }
+    };
+    let Some(micros) = occurred
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_micros()).ok())
+        .and_then(|value| OccurredAtUnixMicros::new(value).ok())
+    else {
+        return;
+    };
+    let suffix = if matches!(payload, EventPayload::RecordingSegmentCompleted { .. }) {
+        "completed"
+    } else {
+        "failed"
+    };
+    let mut recording_hash = DefaultHasher::new();
+    recording_id.hash(&mut recording_hash);
+    let Ok(event_id) = EventId::new(format!("rec-{:016x}-{suffix}", recording_hash.finish()))
+    else {
+        return;
+    };
+    let Ok(domain_event) = DomainEvent::new(
+        event_id,
+        micros,
+        Some(camera_id.clone()),
+        DeliveryClass::CriticalLifecycle,
+        payload,
+    ) else {
+        return;
+    };
+    let report = bus.publish(Arc::new(domain_event));
+    if report.rejected_full > 0 {
+        tracing::warn!(rejected=report.rejected_full, "critical recording event admission failed; indexed/filesystem reconciliation remains authoritative");
     }
 }
 

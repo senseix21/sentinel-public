@@ -151,6 +151,7 @@ impl Error for H264NalError {}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct H264AccessUnit {
     timestamp: MediaTimestamp,
+    connection_epoch: u64,
     nal_units: Arc<[H264NalUnit]>,
     keyframe: bool,
 }
@@ -159,6 +160,24 @@ impl H264AccessUnit {
     #[must_use]
     pub const fn timestamp(&self) -> MediaTimestamp {
         self.timestamp
+    }
+
+    /// Returns zero until the camera lifecycle owner stamps this unit.
+    #[must_use]
+    pub const fn connection_epoch(&self) -> u64 {
+        self.connection_epoch
+    }
+
+    /// Stamps the access unit at the camera-owned distribution boundary.
+    ///
+    /// # Errors
+    /// Returns an error for epoch zero.
+    pub fn with_connection_epoch(mut self, epoch: u64) -> Result<Self, AccessUnitError> {
+        if epoch == 0 {
+            return Err(AccessUnitError::ZeroConnectionEpoch);
+        }
+        self.connection_epoch = epoch;
+        Ok(self)
     }
 
     #[must_use]
@@ -244,6 +263,7 @@ impl H264AccessUnitAssembler {
 
         Ok(Some(H264AccessUnit {
             timestamp,
+            connection_epoch: 0,
             nal_units: nal_units.into(),
             keyframe,
         }))
@@ -271,6 +291,7 @@ pub enum AccessUnitError {
         received: MediaTimestamp,
     },
     MissingVclNal,
+    ZeroConnectionEpoch,
 }
 
 impl fmt::Display for AccessUnitError {
@@ -282,6 +303,9 @@ impl fmt::Display for AccessUnitError {
             ),
             Self::MissingVclNal => {
                 formatter.write_str("completed H.264 access unit contains no VCL NAL")
+            }
+            Self::ZeroConnectionEpoch => {
+                formatter.write_str("H.264 access unit connection epoch must be nonzero")
             }
         }
     }

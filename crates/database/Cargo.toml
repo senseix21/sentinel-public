@@ -12,6 +12,7 @@ workspace = true
 chrono.workspace = true
 sqlx.workspace = true
 surveillance-common = { path = "../common" }
+surveillance-config = { path = "../config" }
 surveillance-storage = { path = "../storage" }
 tracing.workspace = true
 

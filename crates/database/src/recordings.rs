@@ -13,7 +13,9 @@ use surveillance_storage::recordings::RecordingSearch;
 
 use crate::DatabaseConfig;
 
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+/// Forward migrations, owned by this crate and shared by every repository in
+/// it so that one connection applies one ordered sequence.
+pub(crate) static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
 #[derive(Clone)]
 pub struct PostgresRecordingRepository {
@@ -732,7 +734,7 @@ impl RepositoryError {
         )
     }
 
-    fn from_sqlx(error: sqlx::Error) -> Self {
+    pub(crate) fn from_sqlx(error: sqlx::Error) -> Self {
         let category = match &error {
             sqlx::Error::PoolTimedOut => RepositoryErrorCategory::PoolTimedOut,
             sqlx::Error::PoolClosed | sqlx::Error::Io(_) | sqlx::Error::Tls(_) => {
@@ -757,7 +759,7 @@ impl RepositoryError {
         }
     }
 
-    fn migration(error: sqlx::migrate::MigrateError) -> Self {
+    pub(crate) fn migration(error: sqlx::migrate::MigrateError) -> Self {
         Self {
             category: RepositoryErrorCategory::Migration,
             source: Some(Box::new(error)),
@@ -770,7 +772,7 @@ impl RepositoryError {
             source: None,
         }
     }
-    const fn invariant() -> Self {
+    pub(crate) const fn invariant() -> Self {
         Self {
             category: RepositoryErrorCategory::Invariant,
             source: None,

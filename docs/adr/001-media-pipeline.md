@@ -66,6 +66,27 @@ A local LiveKit spike also established that a compatible H.264 Annex-B stream ca
 
 Exact capacities remain configuration derived from measured item sizes and latency budgets.
 
+### Phase 6 detection topology
+
+The distributor has a third independent freshness queue for detection; its
+saturation evicts only its oldest encoded access unit and cannot reject recorder
+admission. Sampling uses connection epoch plus source media timestamp. H.264 is
+inter-frame coded, so a production decoder generally must consume from a
+random-access point through dependent pictures. The initial owned decode adapter
+therefore waits for an IDR with parameter sets after start/reset and maintains
+one continuous decoder per enabled camera. The timestamp sampler decides which
+decoded observations proceed to inference; this decodes more than the ideal
+pre-decode design but does not create invalid random-access assumptions.
+
+The decoder boundary is reversible. If a selected decoder proves it can cheaply
+and correctly decode sparse GOP-contained samples, sampling may move before
+decode after a benchmark and focused recovery tests. Detection-disabled cameras
+drop their detection subscription and create no decoder/model task.
+
+The Phase 6 local adapter contract uses bounded RGB24 frames and deterministic
+fake inference. A production decoder/model choice remains gated by target OS,
+CPU/GPU/accelerator, licensing, model accuracy, and representative streams.
+
 The first SDK-neutral distributor implementation now makes the recorder and live
 queues independent. Publication is nonblocking: recorder saturation preserves
 its backlog and returns `Full`, while live saturation replaces only its oldest

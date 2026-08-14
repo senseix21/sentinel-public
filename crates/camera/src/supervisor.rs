@@ -314,7 +314,16 @@ pub async fn run_h264_camera_observed<J: JitterSource>(
 
             let retry_failure = match outcome {
                 Ok(RtspReadOutcome::AccessUnit(received)) => {
-                    let report = distributor.publish(Arc::clone(&received.access_unit));
+                    let access_unit = match Arc::try_unwrap(received.access_unit) {
+                        Ok(unit) => unit,
+                        Err(unit) => (*unit).clone(),
+                    };
+                    let Ok(access_unit) =
+                        access_unit.with_connection_epoch(connected.epoch().get())
+                    else {
+                        continue;
+                    };
+                    let report = distributor.publish(Arc::new(access_unit));
                     counters.access_units = counters.access_units.saturating_add(1);
                     health.access_unit();
                     if report.live == PublishOutcome::ReplacedOldest {

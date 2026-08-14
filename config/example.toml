@@ -1,14 +1,94 @@
-# Deployment reference only. Never place real credentials or tokens here.
-# Required current environment variables:
-# SURVEILLANCE_CAMERA_ID=camera-01
-# SURVEILLANCE_RTSP_URL=rtsp://127.0.0.1:8554/camera-01
-# SURVEILLANCE_VIDEO_WIDTH=1920
-# SURVEILLANCE_VIDEO_HEIGHT=1080
-# SURVEILLANCE_RECORDING_ROOT=./recordings
-# SURVEILLANCE_HEALTH_BIND=127.0.0.1:3000
-# SURVEILLANCE_MAXIMUM_CAMERAS=256
-# SURVEILLANCE_COMMAND_QUEUE_ITEMS=64
-# SURVEILLANCE_COMMAND_TIMEOUT_SECONDS=10
+# Deployment reference. Never place real credentials or tokens in this file.
 #
-# Authentication, when required, is injected separately through both
-# SURVEILLANCE_RTSP_USERNAME and SURVEILLANCE_RTSP_PASSWORD.
+# This is a working example of the file layer, which sits above the compiled
+# defaults and below persisted settings and the environment:
+#
+#   compiled defaults < this file < persisted settings < environment
+#
+# Copy it, edit it, and point the server at it. Keys are the durable setting
+# identities — the same strings the settings API, metrics, and audit rows use.
+# Unknown keys are rejected, so a typo fails at startup rather than silently
+# doing nothing.
+#
+# Durations always carry a unit: ms, s, m, h, d.
+
+# --- Secrets are NOT configured here -----------------------------------------
+# Credentials come from the environment only. ADR 003 leaves the production
+# secret store open, so Phase 7 neither persists nor accepts credentials through
+# the API. Supply these out of band:
+#
+#   SURVEILLANCE_DATABASE_URL
+#   SURVEILLANCE_RTSP_USERNAME       (with SURVEILLANCE_RTSP_PASSWORD)
+#   SURVEILLANCE_RTSP_PASSWORD
+#   SURVEILLANCE_LIVEKIT_API_KEY
+#   SURVEILLANCE_LIVEKIT_API_SECRET
+#
+# The fingerprint salt is also a secret, and has no default on purpose: a shared
+# default would make audit fingerprints comparable across deployments.
+#
+#   SURVEILLANCE_AUDIT_FINGERPRINT_SALT
+
+[server]
+health_bind = "127.0.0.1:3000"
+
+[storage]
+recording_root = "/srv/surveillance/recordings"
+watermark_warning = 75
+watermark_critical = 88
+watermark_emergency = 95
+watermark_hysteresis = 3
+
+[api]
+# Leave false unless this deployment is meant to be reconfigured over HTTP.
+# There is no authentication yet; the listener is loopback-only.
+mutating_surface_enabled = false
+# The two settings that are read per request rather than captured at startup.
+max_request_bytes = 16384
+io_timeout = "5s"
+# The accept loop handles connections serially. That is a property of the
+# implementation, not a configurable limit, so there is no concurrency setting.
+
+[retention]
+# A ten-camera unit keeping two weeks of footage. Raise max_age only after
+# confirming the disk can hold it — retention deletes from indexed metadata,
+# and storage watermarks are the backstop, not the plan.
+max_age = "14d"
+protected_recent = "2h"
+interval = "1m"
+
+# --- Per-camera templates ----------------------------------------------------
+# Applied to every camera that does not override them.
+
+[camera.recording]
+segment_duration = "30s"
+
+[camera.detection]
+enabled = true
+sample_fps = 5
+
+# --- Per-camera overrides ----------------------------------------------------
+# A camera's own value beats the template above. Within one layer, specific
+# beats general; across layers, the higher layer wins outright.
+
+[cameras."lobby-01".rtsp]
+endpoint = "rtsp://10.0.0.11:554/Streaming/Channels/101"
+
+[cameras."lobby-01".video]
+width = 1920
+height = 1080
+
+[cameras."lobby-01".detection]
+decoded_frame_max_bytes = 6220800
+
+[cameras."dock-02".rtsp]
+endpoint = "rtsp://10.0.0.12:554/Streaming/Channels/101"
+
+[cameras."dock-02".video]
+width = 2560
+height = 1440
+
+[cameras."dock-02".detection]
+# A busier view sampled harder. Raising this raises decode cost, which is
+# measured, not assumed.
+sample_fps = 10
+decoded_frame_max_bytes = 11059200

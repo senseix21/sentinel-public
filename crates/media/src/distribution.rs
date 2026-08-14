@@ -73,6 +73,8 @@ pub struct PublishReport {
     pub recorder: PublishOutcome,
     /// Live-view-queue outcome.
     pub live: PublishOutcome,
+    /// Detection-queue outcome. A closed outcome means detection is disabled.
+    pub detection: PublishOutcome,
 }
 
 /// The result of a nonblocking receive attempt.
@@ -115,12 +117,15 @@ pub struct MediaSubscriptions<T> {
     pub recorder: MediaSubscriber<T>,
     /// Freshness-oriented live-view subscription.
     pub live: MediaSubscriber<T>,
+    /// Freshness-oriented detection subscription.
+    pub detection: MediaSubscriber<T>,
 }
 
 /// Publishes immutable media to independently bounded consumer queues.
 pub struct MediaDistributor<T> {
     recorder: QueueSender<T>,
     live: QueueSender<T>,
+    detection: QueueSender<T>,
 }
 
 /// Read-only queue telemetry which neither retains media outside the queues nor
@@ -128,6 +133,7 @@ pub struct MediaDistributor<T> {
 pub struct MediaMetricsObserver<T> {
     recorder: Arc<Mutex<QueueState<T>>>,
     live: Arc<Mutex<QueueState<T>>>,
+    detection: Arc<Mutex<QueueState<T>>>,
 }
 
 impl<T> Clone for MediaMetricsObserver<T> {
@@ -135,6 +141,7 @@ impl<T> Clone for MediaMetricsObserver<T> {
         Self {
             recorder: Arc::clone(&self.recorder),
             live: Arc::clone(&self.live),
+            detection: Arc::clone(&self.detection),
         }
     }
 }
@@ -149,6 +156,11 @@ impl<T> MediaMetricsObserver<T> {
     pub fn live(&self) -> QueueMetrics {
         QueueState::metrics(&lock_recover(&self.live))
     }
+
+    #[must_use]
+    pub fn detection(&self) -> QueueMetrics {
+        QueueState::metrics(&lock_recover(&self.detection))
+    }
 }
 
 impl<T> MediaDistributor<T> {
@@ -158,15 +170,33 @@ impl<T> MediaDistributor<T> {
         recorder_capacity: QueueCapacity,
         live_capacity: QueueCapacity,
     ) -> (Self, MediaSubscriptions<T>) {
+        let detection_capacity = QueueCapacity(1);
+        Self::new_with_detection(recorder_capacity, live_capacity, detection_capacity)
+    }
+
+    /// Creates a distributor with an independent freshness-oriented detection queue.
+    #[must_use]
+    pub fn new_with_detection(
+        recorder_capacity: QueueCapacity,
+        live_capacity: QueueCapacity,
+        detection_capacity: QueueCapacity,
+    ) -> (Self, MediaSubscriptions<T>) {
         let (recorder, recorder_subscription, recorder_signal) =
             QueueSender::new(recorder_capacity);
         let (live, live_subscription, live_signal) = QueueSender::new(live_capacity);
+        let (detection, detection_subscription, detection_signal) =
+            QueueSender::new(detection_capacity);
 
         (
-            Self { recorder, live },
+            Self {
+                recorder,
+                live,
+                detection,
+            },
             MediaSubscriptions {
                 recorder: MediaSubscriber::new(recorder_subscription, recorder_signal),
                 live: MediaSubscriber::new(live_subscription, live_signal),
+                detection: MediaSubscriber::new(detection_subscription, detection_signal),
             },
         )
     }
@@ -178,9 +208,14 @@ impl<T> MediaDistributor<T> {
     /// and returns [`PublishOutcome::ReplacedOldest`].
     pub fn publish(&self, item: Arc<T>) -> PublishReport {
         let recorder = self.recorder.send_preserving_backlog(Arc::clone(&item));
-        let live = self.live.send_latest(item);
+        let live = self.live.send_latest(Arc::clone(&item));
+        let detection = self.detection.send_latest(item);
 
-        PublishReport { recorder, live }
+        PublishReport {
+            recorder,
+            live,
+            detection,
+        }
     }
 
     /// Creates a non-owning, read-only view of queue telemetry.
@@ -189,6 +224,7 @@ impl<T> MediaDistributor<T> {
         MediaMetricsObserver {
             recorder: Arc::clone(&self.recorder.queue),
             live: Arc::clone(&self.live.queue),
+            detection: Arc::clone(&self.detection.queue),
         }
     }
 
@@ -203,12 +239,19 @@ impl<T> MediaDistributor<T> {
     pub fn live_metrics(&self) -> QueueMetrics {
         self.live.metrics()
     }
+
+    /// Returns detection-queue metrics.
+    #[must_use]
+    pub fn detection_metrics(&self) -> QueueMetrics {
+        self.detection.metrics()
+    }
 }
 
 impl<T> Drop for MediaDistributor<T> {
     fn drop(&mut self) {
         self.recorder.close_producer();
         self.live.close_producer();
+        self.detection.close_producer();
     }
 }
 
@@ -451,6 +494,22 @@ mod tests {
         assert_eq!(live.accepted, 5);
         assert_eq!(live.received, 2);
         assert_eq!(live.dropped_oldest, 3);
+    }
+
+    #[test]
+    fn stalled_detection_consumer_keeps_newest_without_affecting_recorder() {
+        let (distributor, subscriptions) =
+            MediaDistributor::new_with_detection(capacity(1), capacity(1), capacity(2));
+        drop(subscriptions.live);
+        for value in 1..=5 {
+            let report = distributor.publish(Arc::new(value));
+            assert_eq!(report.recorder, PublishOutcome::Accepted);
+            assert_eq!(receive_value(&subscriptions.recorder), value);
+        }
+        assert_eq!(receive_value(&subscriptions.detection), 4);
+        assert_eq!(receive_value(&subscriptions.detection), 5);
+        assert_eq!(distributor.detection_metrics().dropped_oldest, 3);
+        assert_eq!(distributor.recorder_metrics().rejected_full, 0);
     }
 
     #[test]

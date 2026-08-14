@@ -337,30 +337,30 @@ Add sampled human detection as an independently degradable media consumer and pu
 
 ### Instructions
 
-- [ ] Decode frames once for detection consumers; do not alter the recorder's encoded path.
-- [ ] Implement configurable sampling based on media timestamps, not executor timing alone.
-- [ ] Favor fresh frames under overload; expose dropped/skipped counts and consumer lag.
-- [ ] Define normalized bounding-box, confidence, model-version, camera, and timestamp types.
-- [ ] Implement a bounded in-process event bus with explicit ordering scope, delivery guarantees, overflow behavior, subscription lifetime, and shutdown.
-- [ ] Separate immutable past-tense events from commands.
-- [ ] Publish camera, recording, storage, and detection lifecycle events without transporting media payloads.
-- [ ] Persist externally relevant event versions where required.
+- [x] Decode frames once for detection consumers; do not alter the recorder's encoded path.
+- [x] Implement configurable sampling based on media timestamps, not executor timing alone.
+- [x] Favor fresh frames under overload; expose dropped/skipped counts and consumer lag.
+- [x] Define normalized bounding-box, confidence, model-version, camera, and timestamp types.
+- [x] Implement a bounded in-process event bus with explicit ordering scope, delivery guarantees, overflow behavior, subscription lifetime, and shutdown.
+- [x] Separate immutable past-tense events from commands.
+- [x] Publish camera, recording, storage, and detection lifecycle events without transporting media payloads.
+- [x] Persist externally relevant event versions where required.
 
 ### Tests
 
-- [ ] Sampling accuracy for variable FPS and timestamp discontinuities.
-- [ ] Detector saturation test proving bounded memory and preference for recent frames.
-- [ ] Detector crash/unavailability while recording and live viewing continue.
-- [ ] Event ordering and overflow tests for each event class.
-- [ ] Subscriber crash/unsubscribe and graceful shutdown tests.
-- [ ] Accuracy evaluation on an agreed labeled dataset, separated from systems throughput benchmarks.
+- [x] Sampling accuracy for variable FPS and timestamp discontinuities.
+- [x] Detector saturation test proving bounded memory and preference for recent frames.
+- [x] Detector crash/unavailability while recording and live viewing continue.
+- [x] Event ordering and overflow tests for each event class.
+- [x] Subscriber crash/unsubscribe and graceful shutdown tests.
+- [!] Accuracy evaluation on an agreed labeled dataset, separated from systems throughput benchmarks. Production model/dataset/criteria remain external product gates; deterministic systems workload evidence is recorded separately.
 
 ### Exit gate
 
-- [ ] Structured person detections are camera- and timestamp-scoped.
-- [ ] Slow detection cannot grow memory without bound or stop recording.
-- [ ] No packet/frame appears on the domain event bus.
-- [ ] Event semantics are documented well enough to evaluate a future external-broker adapter honestly.
+- [x] Structured person detections are camera- and timestamp-scoped.
+- [x] Slow detection cannot grow memory without bound or stop recording.
+- [x] No packet/frame appears on the domain event bus.
+- [x] Event semantics are documented well enough to evaluate a future external-broker adapter honestly.
 
 ---
 
@@ -372,30 +372,30 @@ Make operational behavior safely configurable and add derived business behavior 
 
 ### Instructions
 
-- [ ] Implement precedence among defaults, configuration files, persisted settings, environment secrets, and API changes.
-- [ ] Validate settings through domain types and report whether each change applies immediately, at a safe boundary, or after restart.
-- [ ] Apply related changes transactionally; reject partial invalid configuration.
-- [ ] Add authenticated settings APIs with secret-safe read behavior and audit events.
-- [ ] Define ROI polygon coordinate system, validation, versioning, and camera association.
-- [ ] Implement rules as event consumers with typed conditions and actions.
-- [ ] Keep alert/dashboard/webhook policy out of detection code.
-- [ ] Implement only the confirmed heatmap/occupancy semantics.
-- [ ] Add tracking only if the confirmed analytics require identity over time.
+- [x] Implement precedence among defaults, configuration files, persisted settings, environment secrets, and API changes. `defaults < file < persisted < environment`; an API change writes the persisted layer, and a change the environment shadows reports `PersistedButShadowed` rather than a bare success. `crates/config/src/resolution.rs`, `environment.rs`, `file.rs`.
+- [x] Validate settings through domain types and report whether each change applies immediately, at a safe boundary, or after restart. 79 settings classified by a table macro that cannot compile with an axis missing; boundaries reflect what each owner actually does, so only the two settings the HTTP adapter re-reads are `Immediate`. `crates/config/src/classification.rs`, `change.rs`.
+- [x] Apply related changes transactionally; reject partial invalid configuration. Coupled groups re-validate through the same constructors the pipeline uses, so a batch cannot be accepted here and rejected at pipeline start. No coercion. `crates/config/src/change.rs`, `assemble.rs`.
+- [~] Settings APIs with secret-safe reads and audit records exist behind a single `authorize` chokepoint, with the mutating surface default-off. **Not authenticated**: Phase 8 owns the identity model, and `authorize` grants on loopback until then. Secrets are neither persisted nor API-editable while ADR 003's secret store is open. `apps/server/src/authorize.rs`, `settings_service.rs`, `health_http.rs`.
+- [!] Blocked on confirmed coordinate semantics. `crates/database/src/rois.rs` remains a stub; no invented coordinate system.
+- [!] Blocked: the mechanism is implementable, the conditions are not known. Building it against invented conditions produces a rules engine nobody asked for.
+- [!] Blocked with the rules item. No alert, dashboard, or webhook policy exists anywhere, which trivially satisfies the constraint but does not demonstrate it.
+- [!] Blocked: the meaning of a heatmap — density, occupancy, or movement — is unconfirmed.
+- [!] Blocked on the analytics decision above.
 
 ### Tests
 
-- [ ] Configuration round-trip, precedence, invalid update, restart persistence, and rollback tests.
-- [ ] Concurrent configuration read/update and safe application-boundary tests.
-- [ ] Property tests for ROI polygons and normalized coordinates.
-- [ ] Rule matching, non-matching, duplicate event, action failure, and replay/idempotency tests.
-- [ ] Analytics correctness against fixed event fixtures.
+- [x] Round-trip, precedence, invalid-update, restart-persistence, and rollback all covered. Restart persistence and audit rollback run against a real database in `scripts/phase7/config-fixture.sh`.
+- [!] Application-boundary reporting is tested; **concurrent update behavior is not**. The transaction boundary and generation sequence make the design defensible, but ADR 008 forbids inferring transactional safety from code structure. Needs two concurrent writers against one database.
+- [!] Blocked with ROI.
+- [!] Blocked with rules.
+- [!] Blocked with analytics.
 
 ### Exit gate
 
-- [ ] No expected-to-change operational value is hardcoded in core pipeline logic.
-- [ ] Invalid configuration cannot become active.
-- [ ] ROI/rule/analytics behavior matches confirmed product semantics.
-- [ ] Action failure does not corrupt event production or media processing.
+- [x] Eleven hardcoded values moved into the configuration domain, including `StorageWatermarks::new(80, 90, 97, 2)`. The environment-only retention loader was deleted rather than left as dead API, and its test was ported, not removed. See `docs/phase-7/local-evidence-2026-08-15.md`.
+- [x] Rejection is whole-batch and names the offending setting or group; there is no coercion path. The schema refuses credential keys and malformed audit rows independently of the application.
+- [!] Cannot close while the product gates above are open. Not reported as closed.
+- [~] Configuration-change notification failure is proven not to roll back a committed change, and audit and notify outcomes are counted separately. Rule *actions* do not exist, so the gate's subject is only partly present.
 
 ---
 
