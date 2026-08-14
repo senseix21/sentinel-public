@@ -11,6 +11,7 @@ use std::{
 
 use surveillance_common::types::CameraId;
 use surveillance_config::settings::OneCameraConfig;
+use surveillance_events::bus::EventBus;
 use tokio::{
     sync::{mpsc, oneshot},
     task::JoinSet,
@@ -190,12 +191,18 @@ pub struct CameraSupervisorHandle {
     commands: mpsc::Sender<Command>,
     response_timeout: Duration,
     registry: CameraHealthRegistry,
+    event_bus: EventBus,
 }
 
 impl CameraSupervisorHandle {
     #[must_use]
     pub fn health_registry(&self) -> CameraHealthRegistry {
         self.registry.clone()
+    }
+
+    #[must_use]
+    pub fn event_bus(&self) -> EventBus {
+        self.event_bus.clone()
     }
 
     /// Adds one validated stopped configuration.
@@ -267,6 +274,7 @@ pub struct CameraSupervisor {
     shutdown_reply: Option<Reply>,
     observation_interval: tokio::time::Interval,
     metadata_writer: Option<MetadataWriterHandle>,
+    event_bus: EventBus,
 }
 
 struct CameraEntry {
@@ -306,6 +314,23 @@ impl CameraSupervisor {
         response_timeout: Duration,
         metadata_writer: Option<MetadataWriterHandle>,
     ) -> (Self, CameraSupervisorHandle) {
+        Self::with_event_bus(
+            command_capacity,
+            maximum_cameras,
+            response_timeout,
+            metadata_writer,
+            EventBus::new(),
+        )
+    }
+
+    #[must_use]
+    pub fn with_event_bus(
+        command_capacity: NonZeroUsize,
+        maximum_cameras: NonZeroUsize,
+        response_timeout: Duration,
+        metadata_writer: Option<MetadataWriterHandle>,
+        event_bus: EventBus,
+    ) -> (Self, CameraSupervisorHandle) {
         let (tx, rx) = mpsc::channel(command_capacity.get());
         let registry = CameraHealthRegistry::new(maximum_cameras);
         (
@@ -318,11 +343,13 @@ impl CameraSupervisor {
                 shutdown_reply: None,
                 observation_interval: tokio::time::interval(Duration::from_millis(25)),
                 metadata_writer,
+                event_bus: event_bus.clone(),
             },
             CameraSupervisorHandle {
                 commands: tx,
                 response_timeout,
                 registry,
+                event_bus,
             },
         )
     }
@@ -413,10 +440,11 @@ impl CameraSupervisor {
                     .update(&camera_id, PipelineState::Starting, None, None);
                 let config = Arc::clone(&entry.config);
                 let metadata_writer = self.metadata_writer.clone();
+                let event_bus = self.event_bus.clone();
                 self.operations.spawn(async move {
                     OperationCompletion::Started {
                         camera_id,
-                        result: CameraPipeline::start(config, metadata_writer),
+                        result: CameraPipeline::start(config, metadata_writer, event_bus),
                     }
                 });
             }

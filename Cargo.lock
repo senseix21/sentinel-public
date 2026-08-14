@@ -2572,6 +2572,9 @@ dependencies = [
 [[package]]
 name = "surveillance-common"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "surveillance-config"
@@ -2579,6 +2582,7 @@ version = "0.1.0"
 dependencies = [
  "surveillance-camera",
  "surveillance-common",
+ "surveillance-detector",
  "surveillance-livekit",
  "surveillance-media",
  "surveillance-recorder",
@@ -2600,10 +2604,22 @@ dependencies = [
 [[package]]
 name = "surveillance-detector"
 version = "0.1.0"
+dependencies = [
+ "surveillance-common",
+ "surveillance-events",
+ "surveillance-media",
+ "tokio",
+]
 
 [[package]]
 name = "surveillance-events"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "surveillance-common",
+ "tokio",
+]
 
 [[package]]
 name = "surveillance-livekit"
@@ -2622,6 +2638,7 @@ dependencies = [
 name = "surveillance-media"
 version = "0.1.0"
 dependencies = [
+ "surveillance-common",
  "tokio",
 ]
 
@@ -2654,6 +2671,8 @@ dependencies = [
  "surveillance-common",
  "surveillance-config",
  "surveillance-database",
+ "surveillance-detector",
+ "surveillance-events",
  "surveillance-livekit",
  "surveillance-media",
  "surveillance-recorder",

@@ -41,6 +41,10 @@ const LIVEKIT_API_SECRET: &str = "SURVEILLANCE_LIVEKIT_API_SECRET";
 const LIVEKIT_NAMESPACE: &str = "SURVEILLANCE_LIVEKIT_NAMESPACE";
 const LIVEKIT_CLI: &str = "SURVEILLANCE_LIVEKIT_CLI";
 const LIVEKIT_CLI_VERSION: &str = "SURVEILLANCE_LIVEKIT_CLI_VERSION";
+const DETECTION_ENABLED: &str = "SURVEILLANCE_DETECTION_ENABLED";
+const DETECTION_QUEUE_ITEMS: &str = "SURVEILLANCE_DETECTION_QUEUE_ITEMS";
+const DETECTION_SAMPLE_FPS: &str = "SURVEILLANCE_DETECTION_SAMPLE_FPS";
+const DETECTION_MAX_GAP_MS: &str = "SURVEILLANCE_DETECTION_MAX_GAP_MS";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SupervisionSettings {
@@ -230,6 +234,22 @@ fn load_with(
         height,
         recording_root,
     );
+    settings.detection_enabled = match lookup(DETECTION_ENABLED).as_deref() {
+        None | Some("true" | "1") => true,
+        Some("false" | "0") => false,
+        Some(_) => return Err(EnvironmentConfigError::InvalidBoolean(DETECTION_ENABLED)),
+    };
+    settings.detection_queue_items =
+        positive_usize_override(&lookup, DETECTION_QUEUE_ITEMS, 2)?.get();
+    settings.detection_sample_fps =
+        u16::try_from(positive_usize_override(&lookup, DETECTION_SAMPLE_FPS, 5)?.get())
+            .map_err(|_| EnvironmentConfigError::InvalidPositiveInteger(DETECTION_SAMPLE_FPS))?;
+    settings.detection_max_gap = Duration::from_millis(
+        u64::try_from(positive_usize_override(&lookup, DETECTION_MAX_GAP_MS, 2_000)?.get())
+            .unwrap_or(u64::MAX),
+    );
+    settings.detection_decoder =
+        lookup(FFMPEG).map_or_else(|| PathBuf::from("ffmpeg"), PathBuf::from);
     settings.livekit = match (
         lookup(LIVEKIT_URL),
         lookup(LIVEKIT_API_KEY),
@@ -278,6 +298,7 @@ fn parse_u32(value: &str, key: &'static str) -> Result<u32, EnvironmentConfigErr
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EnvironmentConfigError {
     Missing(&'static str),
+    InvalidBoolean(&'static str),
     InvalidPositiveInteger(&'static str),
     IncompleteCredentials,
     IncompleteLiveKitCredentials,
@@ -297,6 +318,12 @@ impl fmt::Display for EnvironmentConfigError {
                 write!(
                     formatter,
                     "environment variable {key} must be a positive integer"
+                )
+            }
+            Self::InvalidBoolean(key) => {
+                write!(
+                    formatter,
+                    "environment variable {key} must be true, false, 1, or 0"
                 )
             }
             Self::IncompleteCredentials => formatter
@@ -355,6 +382,24 @@ mod tests {
             load_with(|key| values.get(key).map(|value| (*value).to_owned())).err(),
             Some(EnvironmentConfigError::IncompleteCredentials)
         );
+    }
+
+    #[test]
+    fn detection_defaults_and_restart_applied_overrides_are_explicit() {
+        let base = HashMap::from([
+            ("SURVEILLANCE_CAMERA_ID", "camera-01"),
+            ("SURVEILLANCE_RTSP_URL", "rtsp://127.0.0.1/camera"),
+            ("SURVEILLANCE_VIDEO_WIDTH", "640"),
+            ("SURVEILLANCE_VIDEO_HEIGHT", "360"),
+            ("SURVEILLANCE_DETECTION_ENABLED", "false"),
+            ("SURVEILLANCE_DETECTION_QUEUE_ITEMS", "3"),
+            ("SURVEILLANCE_DETECTION_SAMPLE_FPS", "7"),
+        ]);
+        let settings = load_with(|key| base.get(key).map(|value| (*value).to_owned()))
+            .unwrap_or_else(|error| panic!("settings: {error}"));
+        assert!(!settings.detection_enabled);
+        assert_eq!(settings.detection_queue_items, 3);
+        assert_eq!(settings.detection_sample_fps, 7);
     }
 
     #[test]

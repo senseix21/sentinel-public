@@ -20,6 +20,7 @@ use surveillance_camera::{
     },
 };
 use surveillance_common::types::CameraId;
+use surveillance_detector::detector::{DetectionHealth, DetectionHealthSnapshot};
 use surveillance_livekit::owner::{PublicationHealth, PublicationSnapshot};
 use surveillance_media::{
     distribution::{MediaDistributor, MediaMetricsObserver, MediaSubscriber, QueueMetrics},
@@ -44,6 +45,7 @@ pub struct CameraOutcome {
     pub counters: SupervisorCounters,
     pub recorder_queue: QueueMetrics,
     pub live_queue: QueueMetrics,
+    pub detection_queue: QueueMetrics,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,8 +68,10 @@ pub struct OneCameraHealthSnapshot {
     pub camera: CameraOperationalMetrics,
     pub recorder_queue: QueueMetrics,
     pub live_queue: QueueMetrics,
+    pub detection_queue: QueueMetrics,
     pub recorder: RecorderOperationalMetrics,
     pub publication: PublicationSnapshot,
+    pub detection: DetectionHealthSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -102,6 +106,7 @@ pub struct OneCameraHealth {
     media: MediaMetricsObserver<H264AccessUnit>,
     recorder: Arc<RecorderMetricState>,
     publication: PublicationHealth,
+    detection: DetectionHealth,
 }
 
 impl OneCameraHealth {
@@ -112,11 +117,13 @@ impl OneCameraHealth {
             camera: self.connection.operational_metrics(),
             recorder_queue: self.media.recorder(),
             live_queue: self.media.live(),
+            detection_queue: self.media.detection(),
             recorder: RecorderOperationalMetrics {
                 completed_segments: self.recorder.completed.load(Ordering::Relaxed),
                 failed_segments: self.recorder.failed.load(Ordering::Relaxed),
             },
             publication: self.publication.snapshot(),
+            detection: self.detection.snapshot(),
         }
     }
 
@@ -138,6 +145,7 @@ pub fn one_camera_health(
     camera_id: CameraId,
     distributor: &MediaDistributor<H264AccessUnit>,
     publication: PublicationHealth,
+    detection: DetectionHealth,
 ) -> (
     CameraHealthPublisher,
     RecorderHealthPublisher,
@@ -153,6 +161,7 @@ pub fn one_camera_health(
             media: distributor.metrics_observer(),
             recorder,
             publication,
+            detection,
         },
     )
 }
@@ -283,6 +292,7 @@ fn release_distributor(exit: SupervisorExit) -> CameraOutcome {
     } = exit;
     let recorder_queue = distributor.recorder_metrics();
     let live_queue = distributor.live_metrics();
+    let detection_queue = distributor.detection_metrics();
     drop(distributor);
     CameraOutcome {
         reason,
@@ -290,6 +300,7 @@ fn release_distributor(exit: SupervisorExit) -> CameraOutcome {
         counters,
         recorder_queue,
         live_queue,
+        detection_queue,
     }
 }
 

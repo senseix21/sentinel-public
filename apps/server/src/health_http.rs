@@ -386,7 +386,13 @@ async fn route_with_recordings(
         ("GET", "/metrics") => response(
             "200 OK",
             "text/plain; version=0.0.4; charset=utf-8",
-            &render_metrics(&registry.snapshots(), recordings, metadata, phase4),
+            &render_metrics(
+                &registry.snapshots(),
+                recordings,
+                metadata,
+                phase4,
+                Some(&supervisor.event_bus()),
+            ),
         ),
         ("GET", "/api/cameras") => json_response("200 OK", &camera_list(&registry.snapshots())),
         ("POST", "/api/cameras") => add_camera(body, recording_root, supervisor).await,
@@ -679,6 +685,12 @@ struct AddCameraRequest {
     password: Option<String>,
     width: u32,
     height: u32,
+    #[serde(default = "default_detection_enabled")]
+    detection_enabled: bool,
+}
+
+const fn default_detection_enabled() -> bool {
+    true
 }
 
 async fn add_camera(
@@ -694,7 +706,7 @@ async fn add_camera(
         (Some(username), Some(password)) => Some(CameraCredentialsSettings { username, password }),
         _ => return json_error("400 Bad Request", "incomplete_camera_credentials"),
     };
-    let settings = OneCameraSettings::h264_mvp(
+    let mut settings = OneCameraSettings::h264_mvp(
         request.camera_id,
         request.rtsp_endpoint,
         credentials,
@@ -702,6 +714,7 @@ async fn add_camera(
         request.height,
         recording_root.to_path_buf(),
     );
+    settings.detection_enabled = request.detection_enabled;
     let Ok(config) = OneCameraConfig::validate(settings) else {
         return json_error("400 Bad Request", "invalid_camera_configuration");
     };
@@ -761,6 +774,13 @@ struct CameraResponse {
     live_queue_depth: Option<usize>,
     live_queue_capacity: Option<usize>,
     live_dropped: u64,
+    detection_enabled: bool,
+    detection_state: Option<String>,
+    detection_queue_depth: Option<usize>,
+    detection_queue_capacity: Option<usize>,
+    detection_dropped: u64,
+    detection_inferred: u64,
+    detections_published: u64,
     recorder_completed_segments: u64,
     recorder_failed_segments: u64,
     live_publication_enabled: bool,
@@ -772,6 +792,10 @@ struct CameraResponse {
 }
 
 impl From<&CameraStatusSnapshot> for CameraResponse {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "flat credential-free API projection keeps bounded health fields explicit"
+    )]
     fn from(snapshot: &CameraStatusSnapshot) -> Self {
         let connection = snapshot.health.as_ref().map(|health| &health.connection);
         let counters =
@@ -816,6 +840,36 @@ impl From<&CameraStatusSnapshot> for CameraResponse {
                 .health
                 .as_ref()
                 .map_or(0, |value| value.live_queue.dropped_oldest),
+            detection_enabled: snapshot.health.as_ref().is_some_and(|value| {
+                !matches!(
+                    value.detection.state,
+                    surveillance_detector::detector::DetectionState::Disabled
+                )
+            }),
+            detection_state: snapshot
+                .health
+                .as_ref()
+                .map(|value| format!("{:?}", value.detection.state)),
+            detection_queue_depth: snapshot
+                .health
+                .as_ref()
+                .map(|value| value.detection_queue.depth),
+            detection_queue_capacity: snapshot
+                .health
+                .as_ref()
+                .map(|value| value.detection_queue.capacity),
+            detection_dropped: snapshot
+                .health
+                .as_ref()
+                .map_or(0, |value| value.detection_queue.dropped_oldest),
+            detection_inferred: snapshot
+                .health
+                .as_ref()
+                .map_or(0, |value| value.detection.counters.inferred),
+            detections_published: snapshot
+                .health
+                .as_ref()
+                .map_or(0, |value| value.detection.counters.events_published),
             recorder_completed_segments: snapshot
                 .health
                 .as_ref()
@@ -909,8 +963,77 @@ fn render_metrics(
     recordings: Option<&PostgresRecordingRepository>,
     metadata: Option<&MetadataWriterHandle>,
     phase4: Option<&Phase4Metrics>,
+    event_bus: Option<&surveillance_events::bus::EventBus>,
 ) -> String {
     let mut output = String::with_capacity(snapshots.len().saturating_mul(1_024));
+    if let Some(event_bus) = event_bus {
+        let events = event_bus.metrics();
+        let _ = writeln!(
+            output,
+            "surveillance_event_bus_subscribers {}",
+            events.subscribers
+        );
+        let _ = writeln!(
+            output,
+            "surveillance_event_publications_total {}",
+            events.publications
+        );
+        let _ = writeln!(
+            output,
+            "surveillance_event_deliveries_total {}",
+            events.outcomes.accepted
+        );
+        let _ = writeln!(
+            output,
+            "surveillance_event_rejected_full_total {}",
+            events.outcomes.rejected_full
+        );
+        let _ = writeln!(
+            output,
+            "surveillance_event_dropped_newest_total {}",
+            events.outcomes.dropped_newest
+        );
+        let _ = writeln!(
+            output,
+            "surveillance_event_replaced_oldest_total {}",
+            events.outcomes.replaced_oldest
+        );
+        let _ = writeln!(
+            output,
+            "surveillance_event_coalesced_total {}",
+            events.outcomes.coalesced
+        );
+        for (kind, value) in [
+            "camera_state_changed",
+            "recording_segment_completed",
+            "recording_segment_failed",
+            "storage_pressure_changed",
+            "person_detection_observed",
+            "detector_state_changed",
+        ]
+        .into_iter()
+        .zip(events.event_kinds)
+        {
+            let _ = writeln!(
+                output,
+                "surveillance_event_publications_by_kind_total{{kind=\"{kind}\"}} {value}"
+            );
+        }
+        for (class, value) in [
+            "critical_lifecycle",
+            "latest_state",
+            "telemetry",
+            "detection",
+        ]
+        .into_iter()
+        .zip(events.delivery_classes)
+        {
+            let _ = writeln!(
+                output,
+                "surveillance_event_publications_by_class_total{{class=\"{class}\"}} {value}"
+            );
+        }
+    }
     if let Some(repository) = recordings {
         let pool = repository.pool_snapshot();
         let _ = writeln!(output, "surveillance_database_pool_size {}", pool.size);
@@ -1139,6 +1262,131 @@ fn render_metrics(
         );
         queue_metrics(&mut output, camera, "recorder", snapshot.recorder_queue);
         queue_metrics(&mut output, camera, "live", snapshot.live_queue);
+        queue_metrics(&mut output, camera, "detection", snapshot.detection_queue);
+        let detection = snapshot.detection;
+        metric(
+            &mut output,
+            "surveillance_detector_enabled",
+            camera,
+            u8::from(!matches!(
+                detection.state,
+                surveillance_detector::detector::DetectionState::Disabled
+            )),
+        );
+        metric(
+            &mut output,
+            "surveillance_detector_state",
+            camera,
+            match detection.state {
+                surveillance_detector::detector::DetectionState::Disabled => 0_u8,
+                surveillance_detector::detector::DetectionState::Starting => 1,
+                surveillance_detector::detector::DetectionState::Running => 2,
+                surveillance_detector::detector::DetectionState::Degraded => 3,
+                surveillance_detector::detector::DetectionState::Terminal => 4,
+                surveillance_detector::detector::DetectionState::Stopping => 5,
+                surveillance_detector::detector::DetectionState::Stopped => 6,
+            },
+        );
+        for (name, value) in [
+            (
+                "surveillance_detector_encoded_considered_total",
+                detection.sampler.considered,
+            ),
+            (
+                "surveillance_detector_sampled_total",
+                detection.sampler.sampled,
+            ),
+            (
+                "surveillance_detector_skipped_by_rate_total",
+                detection.sampler.skipped_by_rate,
+            ),
+            (
+                "surveillance_detector_duplicate_timestamps_total",
+                detection.sampler.duplicate,
+            ),
+            (
+                "surveillance_detector_resets_total",
+                detection.sampler.resets,
+            ),
+            (
+                "surveillance_detector_decode_attempts_total",
+                detection.counters.decode_attempts,
+            ),
+            (
+                "surveillance_detector_decoded_total",
+                detection.counters.decoded,
+            ),
+            (
+                "surveillance_detector_decode_failures_total",
+                detection.counters.decode_failed,
+            ),
+            (
+                "surveillance_detector_inference_attempts_total",
+                detection.counters.inference_attempts,
+            ),
+            (
+                "surveillance_detector_inferred_total",
+                detection.counters.inferred,
+            ),
+            (
+                "surveillance_detector_detections_produced_total",
+                detection.counters.detections_produced,
+            ),
+            (
+                "surveillance_detector_inference_failures_total",
+                detection.counters.inference_failed,
+            ),
+            (
+                "surveillance_detector_events_published_total",
+                detection.counters.events_published,
+            ),
+            (
+                "surveillance_detector_event_delivery_losses_total",
+                detection.counters.event_delivery_losses,
+            ),
+            (
+                "surveillance_detector_decode_duration_micros_total",
+                detection.counters.decode_duration_micros,
+            ),
+            (
+                "surveillance_detector_inference_duration_micros_total",
+                detection.counters.inference_duration_micros,
+            ),
+            (
+                "surveillance_detector_end_to_event_duration_micros_total",
+                detection.counters.end_to_event_duration_micros,
+            ),
+            (
+                "surveillance_detector_end_to_event_latency_bucket_0_10ms_total",
+                detection.counters.latency_le_10ms,
+            ),
+            (
+                "surveillance_detector_end_to_event_latency_bucket_10_50ms_total",
+                detection.counters.latency_le_50ms,
+            ),
+            (
+                "surveillance_detector_end_to_event_latency_bucket_50_100ms_total",
+                detection.counters.latency_le_100ms,
+            ),
+            (
+                "surveillance_detector_end_to_event_latency_bucket_100_250ms_total",
+                detection.counters.latency_le_250ms,
+            ),
+            (
+                "surveillance_detector_end_to_event_latency_bucket_250_500ms_total",
+                detection.counters.latency_le_500ms,
+            ),
+            (
+                "surveillance_detector_end_to_event_latency_bucket_500_1000ms_total",
+                detection.counters.latency_le_1000ms,
+            ),
+            (
+                "surveillance_detector_end_to_event_latency_bucket_over_1000ms_total",
+                detection.counters.latency_over_1000ms,
+            ),
+        ] {
+            metric(&mut output, name, camera, value);
+        }
         let publication = snapshot.publication;
         metric(
             &mut output,

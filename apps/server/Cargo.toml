@@ -14,6 +14,8 @@ surveillance-camera = { path = "../../crates/camera" }
 surveillance-common = { path = "../../crates/common" }
 surveillance-config = { path = "../../crates/config" }
 surveillance-database = { path = "../../crates/database" }
+surveillance-detector = { path = "../../crates/detector" }
+surveillance-events = { path = "../../crates/events" }
 surveillance-media = { path = "../../crates/media" }
 surveillance-livekit = { path = "../../crates/livekit" }
 surveillance-recorder = { path = "../../crates/recorder" }

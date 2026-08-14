@@ -32,6 +32,14 @@ Secret material is referenced/injected separately rather than serialized into or
 
 ## Open details
 
+Phase 6 detection settings (`enabled`, encoded queue items, sample FPS, maximum
+timestamp gap, decoded-frame byte bound, decoder executable, and decode timeout)
+are transactionally validated with the camera pipeline memory budget and apply
+on pipeline start/restart. They never mutate an active decoder or queue in place.
+The reversible defaults are enabled, two encoded access units, 5 FPS, a two-
+second discontinuity gap, exact configured RGB24 frame bytes, `ffmpeg`, and a
+two-second response bound. Environment overrides are restart-applied.
+
 - Production secret store and rotation mechanism.
 - Persistence transaction boundary and optimistic concurrency/versioning.
 - Which settings are operator-editable through the first API.
@@ -40,4 +48,3 @@ Secret material is referenced/injected separately rather than serialized into or
 ## Reversal criteria
 
 Split configuration into a remote control-plane service only when multi-node coordination is a confirmed deployment requirement.
-

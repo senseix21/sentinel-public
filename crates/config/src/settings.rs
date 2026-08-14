@@ -10,6 +10,7 @@ use surveillance_camera::{
     supervisor::{ReconnectPolicy, ReconnectPolicyError},
 };
 use surveillance_common::types::{CameraId, IdentifierError};
+use surveillance_detector::sampler::{SampleRateHz, SamplerError};
 use surveillance_livekit::config::{LiveKitConfig, LiveKitConfigError, LiveKitSettings};
 use surveillance_media::distribution::{QueueCapacity, QueueCapacityError};
 use surveillance_recorder::{
@@ -42,6 +43,13 @@ pub struct OneCameraSettings {
     pub reconnect_stable_session_reset: Duration,
     pub recorder_queue_items: usize,
     pub live_queue_items: usize,
+    pub detection_enabled: bool,
+    pub detection_queue_items: usize,
+    pub detection_sample_fps: u16,
+    pub detection_max_gap: Duration,
+    pub decoded_frame_max_bytes: usize,
+    pub detection_decoder: PathBuf,
+    pub detection_decode_timeout: Duration,
     pub width: u32,
     pub height: u32,
     pub segment_duration: Duration,
@@ -83,6 +91,13 @@ impl OneCameraSettings {
             reconnect_stable_session_reset: Duration::from_secs(30),
             recorder_queue_items: 32,
             live_queue_items: 4,
+            detection_enabled: true,
+            detection_queue_items: 2,
+            detection_sample_fps: 5,
+            detection_max_gap: Duration::from_secs(2),
+            decoded_frame_max_bytes: width as usize * height as usize * 3,
+            detection_decoder: PathBuf::from("ffmpeg"),
+            detection_decode_timeout: Duration::from_secs(2),
             width,
             height,
             segment_duration: Duration::from_secs(30),
@@ -90,7 +105,7 @@ impl OneCameraSettings {
             max_segment_bytes: 32 * 1024 * 1024,
             max_fragment_bytes: 8 * 1024 * 1024,
             max_segment_samples: 1_000,
-            max_pipeline_memory_bytes: 108 * 1024 * 1024,
+            max_pipeline_memory_bytes: 128 * 1024 * 1024,
             recording_root,
             ffprobe: PathBuf::from("ffprobe"),
             clock_drift_tolerance: Duration::from_secs(5),
@@ -108,6 +123,14 @@ pub struct OneCameraConfig {
     pub reconnect: ReconnectPolicy,
     pub recorder_queue: QueueCapacity,
     pub live_queue: QueueCapacity,
+    pub detection_enabled: bool,
+    pub detection_queue: QueueCapacity,
+    pub detection_sample_rate: SampleRateHz,
+    pub detection_max_gap: Duration,
+    pub decoded_frame_max_bytes: usize,
+    pub detection_decoder: PathBuf,
+    pub detection_decode_timeout: Duration,
+    pub max_access_unit_bytes: usize,
     pub recorder: Fmp4SinkConfig,
     pub layout: RecordingLayout,
     pub ffprobe: PathBuf,
@@ -125,6 +148,10 @@ impl OneCameraConfig {
     ///
     /// Returns the first typed invariant violation. The input is consumed and
     /// no partially validated configuration is returned.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one transaction validates all coupled pipeline resource bounds before activation"
+    )]
     pub fn validate(settings: OneCameraSettings) -> Result<Self, OneCameraConfigError> {
         let camera_id =
             CameraId::new(settings.camera_id).map_err(OneCameraConfigError::CameraId)?;
@@ -155,6 +182,27 @@ impl OneCameraConfig {
             .map_err(OneCameraConfigError::RecorderQueue)?;
         let live_queue = QueueCapacity::new(settings.live_queue_items)
             .map_err(OneCameraConfigError::LiveQueue)?;
+        let detection_queue = QueueCapacity::new(settings.detection_queue_items)
+            .map_err(OneCameraConfigError::DetectionQueue)?;
+        let detection_sample_rate = SampleRateHz::new(settings.detection_sample_fps)
+            .map_err(OneCameraConfigError::DetectionSampleRate)?;
+        if settings.detection_max_gap.is_zero() {
+            return Err(OneCameraConfigError::ZeroDetectionMaximumGap);
+        }
+        if settings.detection_decoder.as_os_str().is_empty() {
+            return Err(OneCameraConfigError::EmptyDetectionDecoder);
+        }
+        if settings.detection_decode_timeout.is_zero() {
+            return Err(OneCameraConfigError::ZeroDetectionDecodeTimeout);
+        }
+        let required_decoded_bytes = usize::try_from(settings.width)
+            .ok()
+            .and_then(|width| width.checked_mul(settings.height as usize))
+            .and_then(|pixels| pixels.checked_mul(3))
+            .ok_or(OneCameraConfigError::MemoryBoundOverflow)?;
+        if settings.decoded_frame_max_bytes < required_decoded_bytes {
+            return Err(OneCameraConfigError::DecodedFrameBudgetTooSmall);
+        }
         let duration = SegmentDuration::new(settings.segment_duration)
             .map_err(OneCameraConfigError::Recorder)?;
         let recorder = Fmp4SinkConfig::new_with_fragment_bounds(
@@ -170,6 +218,13 @@ impl OneCameraConfig {
         let queue_items = settings
             .recorder_queue_items
             .checked_add(settings.live_queue_items)
+            .and_then(|items| {
+                items.checked_add(if settings.detection_enabled {
+                    settings.detection_queue_items
+                } else {
+                    0
+                })
+            })
             .ok_or(OneCameraConfigError::MemoryBoundOverflow)?;
         let queue_bytes = queue_items
             .checked_mul(settings.max_access_unit_bytes)
@@ -180,6 +235,13 @@ impl OneCameraConfig {
             .ok_or(OneCameraConfigError::MemoryBoundOverflow)?;
         let bounded_memory_bytes = queue_bytes
             .checked_add(fragment_buffers)
+            .and_then(|bytes| {
+                bytes.checked_add(if settings.detection_enabled {
+                    settings.decoded_frame_max_bytes.checked_mul(2)?
+                } else {
+                    0
+                })
+            })
             .ok_or(OneCameraConfigError::MemoryBoundOverflow)?;
         if bounded_memory_bytes > settings.max_pipeline_memory_bytes {
             return Err(OneCameraConfigError::MemoryBudgetExceeded {
@@ -209,6 +271,14 @@ impl OneCameraConfig {
             reconnect,
             recorder_queue,
             live_queue,
+            detection_enabled: settings.detection_enabled,
+            detection_queue,
+            detection_sample_rate,
+            detection_max_gap: settings.detection_max_gap,
+            decoded_frame_max_bytes: settings.decoded_frame_max_bytes,
+            detection_decoder: settings.detection_decoder,
+            detection_decode_timeout: settings.detection_decode_timeout,
+            max_access_unit_bytes: settings.max_access_unit_bytes,
             recorder,
             layout,
             ffprobe: settings.ffprobe,
@@ -231,6 +301,12 @@ pub enum OneCameraConfigError {
     Reconnect(ReconnectPolicyError),
     RecorderQueue(QueueCapacityError),
     LiveQueue(QueueCapacityError),
+    DetectionQueue(QueueCapacityError),
+    DetectionSampleRate(SamplerError),
+    ZeroDetectionMaximumGap,
+    DecodedFrameBudgetTooSmall,
+    EmptyDetectionDecoder,
+    ZeroDetectionDecodeTimeout,
     Recorder(Fmp4ConfigError),
     RecordingRoot(RecordingLayoutError),
     Clock(ClockConfigError),
@@ -273,6 +349,13 @@ mod tests {
             reconnect_stable_session_reset: Duration::from_secs(30),
             recorder_queue_items: 32,
             live_queue_items: 4,
+            detection_enabled: true,
+            detection_queue_items: 2,
+            detection_sample_fps: 5,
+            detection_max_gap: Duration::from_secs(2),
+            decoded_frame_max_bytes: 2560 * 1440 * 3,
+            detection_decoder: PathBuf::from("ffmpeg"),
+            detection_decode_timeout: Duration::from_secs(2),
             width: 2560,
             height: 1440,
             segment_duration: Duration::from_secs(30),
@@ -280,7 +363,7 @@ mod tests {
             max_segment_bytes: 32 * 1024 * 1024,
             max_fragment_bytes: 8 * 1024 * 1024,
             max_segment_samples: 1_000,
-            max_pipeline_memory_bytes: 108 * 1024 * 1024,
+            max_pipeline_memory_bytes: 128 * 1024 * 1024,
             recording_root: PathBuf::from("recordings"),
             ffprobe: PathBuf::from("ffprobe"),
             clock_drift_tolerance: Duration::from_secs(5),
@@ -294,7 +377,7 @@ mod tests {
     fn validates_complete_configuration_and_calculates_memory_bound() {
         let config = OneCameraConfig::validate(valid())
             .unwrap_or_else(|error| panic!("valid configuration: {error}"));
-        assert_eq!(config.bounded_memory_bytes, 88 * 1024 * 1024);
+        assert_eq!(config.bounded_memory_bytes, 118_587_392);
         assert_eq!(config.recorder_queue.get(), 32);
         assert_eq!(config.live_queue.get(), 4);
     }
@@ -306,7 +389,7 @@ mod tests {
         assert!(matches!(
             OneCameraConfig::validate(settings),
             Err(OneCameraConfigError::MemoryBudgetExceeded {
-                required: 92_274_688,
+                required: 118_587_392,
                 configured: 83_886_080,
             })
         ));

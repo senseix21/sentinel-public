@@ -2,6 +2,7 @@ use std::{error::Error, sync::Arc};
 
 use surveillance_config::settings::OneCameraConfig;
 use surveillance_database::PostgresRecordingRepository;
+use surveillance_events::bus::EventBus;
 use surveillance_livekit::token::DevelopmentTokenService;
 use surveillance_server::{
     camera_supervisor::CameraSupervisor,
@@ -44,6 +45,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let retention = load_retention_from_environment()?;
     let ffmpeg = load_ffmpeg_from_environment();
     let phase4_metrics = Phase4Metrics::default();
+    let event_bus = EventBus::new();
     let viewer_tokens = config
         .livekit
         .as_ref()
@@ -94,7 +96,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             retention.policy,
             retention.interval,
         )
-        .with_metrics(phase4_metrics.clone());
+        .with_metrics(phase4_metrics.clone())
+        .with_event_bus(event_bus.clone());
         let (retention_shutdown, retention_shutdown_rx) = watch::channel(false);
         let retention_task = tokio::spawn(retention_task_owner.run(retention_shutdown_rx));
         retention_owner = Some((retention_shutdown, retention_task));
@@ -129,11 +132,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
     let metadata_observer = metadata_handle.clone();
 
-    let (supervisor, handle) = CameraSupervisor::with_metadata_writer(
+    let (supervisor, handle) = CameraSupervisor::with_event_bus(
         supervision.command_queue_items,
         supervision.maximum_cameras,
         supervision.command_timeout,
         metadata_handle,
+        event_bus,
     );
     let supervisor_task = tokio::spawn(supervisor.run());
     handle.add(Arc::clone(&config)).await?;

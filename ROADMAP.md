@@ -337,30 +337,30 @@ Add sampled human detection as an independently degradable media consumer and pu
 
 ### Instructions
 
-- [ ] Decode frames once for detection consumers; do not alter the recorder's encoded path.
-- [ ] Implement configurable sampling based on media timestamps, not executor timing alone.
-- [ ] Favor fresh frames under overload; expose dropped/skipped counts and consumer lag.
-- [ ] Define normalized bounding-box, confidence, model-version, camera, and timestamp types.
-- [ ] Implement a bounded in-process event bus with explicit ordering scope, delivery guarantees, overflow behavior, subscription lifetime, and shutdown.
-- [ ] Separate immutable past-tense events from commands.
-- [ ] Publish camera, recording, storage, and detection lifecycle events without transporting media payloads.
-- [ ] Persist externally relevant event versions where required.
+- [x] Decode frames once for detection consumers; do not alter the recorder's encoded path.
+- [x] Implement configurable sampling based on media timestamps, not executor timing alone.
+- [x] Favor fresh frames under overload; expose dropped/skipped counts and consumer lag.
+- [x] Define normalized bounding-box, confidence, model-version, camera, and timestamp types.
+- [x] Implement a bounded in-process event bus with explicit ordering scope, delivery guarantees, overflow behavior, subscription lifetime, and shutdown.
+- [x] Separate immutable past-tense events from commands.
+- [x] Publish camera, recording, storage, and detection lifecycle events without transporting media payloads.
+- [x] Persist externally relevant event versions where required.
 
 ### Tests
 
-- [ ] Sampling accuracy for variable FPS and timestamp discontinuities.
-- [ ] Detector saturation test proving bounded memory and preference for recent frames.
-- [ ] Detector crash/unavailability while recording and live viewing continue.
-- [ ] Event ordering and overflow tests for each event class.
-- [ ] Subscriber crash/unsubscribe and graceful shutdown tests.
-- [ ] Accuracy evaluation on an agreed labeled dataset, separated from systems throughput benchmarks.
+- [x] Sampling accuracy for variable FPS and timestamp discontinuities.
+- [x] Detector saturation test proving bounded memory and preference for recent frames.
+- [x] Detector crash/unavailability while recording and live viewing continue.
+- [x] Event ordering and overflow tests for each event class.
+- [x] Subscriber crash/unsubscribe and graceful shutdown tests.
+- [!] Accuracy evaluation on an agreed labeled dataset, separated from systems throughput benchmarks. Production model/dataset/criteria remain external product gates; deterministic systems workload evidence is recorded separately.
 
 ### Exit gate
 
-- [ ] Structured person detections are camera- and timestamp-scoped.
-- [ ] Slow detection cannot grow memory without bound or stop recording.
-- [ ] No packet/frame appears on the domain event bus.
-- [ ] Event semantics are documented well enough to evaluate a future external-broker adapter honestly.
+- [x] Structured person detections are camera- and timestamp-scoped.
+- [x] Slow detection cannot grow memory without bound or stop recording.
+- [x] No packet/frame appears on the domain event bus.
+- [x] Event semantics are documented well enough to evaluate a future external-broker adapter honestly.
 
 ---
 

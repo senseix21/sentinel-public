@@ -50,6 +50,16 @@ pub struct Fmp4SinkConfig {
 }
 
 impl Fmp4SinkConfig {
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        self.dimensions.width()
+    }
+
+    #[must_use]
+    pub const fn height(&self) -> u32 {
+        self.dimensions.height()
+    }
+
     /// Creates a bounded sink configuration.
     ///
     /// # Errors

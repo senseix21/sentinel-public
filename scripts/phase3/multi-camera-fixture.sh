@@ -107,6 +107,9 @@ done
     export SURVEILLANCE_VIDEO_HEIGHT="360"
     export SURVEILLANCE_RECORDING_ROOT="${fixture_root}/recordings"
     export SURVEILLANCE_HEALTH_BIND="127.0.0.1:3300"
+    # This Phase 3 regression deliberately accelerates ten streams and measures
+    # camera/recorder isolation. Phase 6 owns a separate real-time decode gate.
+    export SURVEILLANCE_DETECTION_ENABLED="false"
     export RUST_LOG="info"
     exec "${repo_root}/target/debug/surveillance-server" >"${fixture_root}/server.log" 2>&1
 ) &
@@ -122,7 +125,7 @@ for index in {2..10}; do
     camera="camera-$(printf '%02d' "${index}")"
     curl -fsS -X POST "http://127.0.0.1:3300/api/cameras" \
         -H 'Content-Type: application/json' \
-        --data-binary "{\"camera_id\":\"${camera}\",\"rtsp_endpoint\":\"rtsp://127.0.0.1:28554/phase3-camera-${index}\",\"username\":\"fixture-reader\",\"password\":\"fixture-reader-pass\",\"width\":640,\"height\":360}" \
+        --data-binary "{\"camera_id\":\"${camera}\",\"rtsp_endpoint\":\"rtsp://127.0.0.1:28554/phase3-camera-${index}\",\"username\":\"fixture-reader\",\"password\":\"fixture-reader-pass\",\"width\":640,\"height\":360,\"detection_enabled\":false}" \
         >/dev/null
     curl -fsS -X POST "http://127.0.0.1:3300/api/cameras/${camera}/start" >/dev/null
 done
@@ -194,7 +197,7 @@ for failure_case in credentials dimensions; do
     fi
     curl -fsS -X POST "http://127.0.0.1:3300/api/cameras" \
         -H 'Content-Type: application/json' \
-        --data-binary "{\"camera_id\":\"${failure_id}\",\"rtsp_endpoint\":\"rtsp://127.0.0.1:28554/phase3-camera-9\",\"username\":\"fixture-reader\",\"password\":\"${password}\",\"width\":${width},\"height\":360}" \
+        --data-binary "{\"camera_id\":\"${failure_id}\",\"rtsp_endpoint\":\"rtsp://127.0.0.1:28554/phase3-camera-9\",\"username\":\"fixture-reader\",\"password\":\"${password}\",\"width\":${width},\"height\":360,\"detection_enabled\":false}" \
         >/dev/null
     curl -fsS -X POST "http://127.0.0.1:3300/api/cameras/${failure_id}/start" >/dev/null
     for _ in {1..100}; do
