@@ -9,6 +9,9 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+serde = { workspace = true }
+sha2 = { workspace = true }
+toml = { workspace = true }
 surveillance-camera = { path = "../camera" }
 surveillance-common = { path = "../common" }
 surveillance-detector = { path = "../detector" }

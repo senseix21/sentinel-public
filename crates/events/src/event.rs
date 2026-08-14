@@ -6,6 +6,12 @@ use surveillance_common::types::{CameraId, RecordingId};
 
 pub const CURRENT_SCHEMA_VERSION: u16 = 1;
 pub const MAX_DETECTIONS_PER_EVENT: usize = 64;
+/// Bounds a configuration-change payload.
+///
+/// The bus is bounded, so an unbounded payload would be a way around that
+/// bound. A batch larger than this is still committed and audited; only the
+/// notification is refused, because the audit table is the record.
+pub const MAX_CHANGED_SETTINGS_PER_EVENT: usize = 256;
 
 macro_rules! validated_text {
     ($name:ident, $label:literal, $max:expr) => {
@@ -54,6 +60,8 @@ validated_text!(EventId, "event ID", 64);
 validated_text!(ModelName, "model name", 64);
 validated_text!(ModelVersion, "model version", 64);
 validated_text!(FailureCategory, "failure category", 64);
+validated_text!(SettingKeyName, "setting key", 128);
+validated_text!(ChangeOutcomeName, "change outcome", 32);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(try_from = "u16", into = "u16")]
@@ -251,6 +259,54 @@ impl From<DetectionSet> for Vec<PersonDetection> {
     }
 }
 
+/// One setting touched by a configuration change.
+///
+/// Carries the setting's identity and what happened to it, never its value.
+/// A consumer that needs the new value reads it back through the settings API.
+/// Keeping values off the bus is structural rather than a redaction step each
+/// publication site has to remember.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChangedSetting {
+    pub key: SettingKeyName,
+    pub camera_id: Option<CameraId>,
+    pub outcome: ChangeOutcomeName,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(try_from = "Vec<ChangedSetting>", into = "Vec<ChangedSetting>")]
+pub struct ChangedSettingSet(Vec<ChangedSetting>);
+
+impl ChangedSettingSet {
+    /// # Errors
+    /// Returns an error when the bounded change count is exceeded. The bus is
+    /// bounded, so an unbounded payload would be a way around that bound.
+    pub fn new(values: Vec<ChangedSetting>) -> Result<Self, EventValidationError> {
+        if values.len() > MAX_CHANGED_SETTINGS_PER_EVENT {
+            Err(EventValidationError::TooManyChangedSettings)
+        } else {
+            Ok(Self(values))
+        }
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[ChangedSetting] {
+        &self.0
+    }
+}
+
+impl TryFrom<Vec<ChangedSetting>> for ChangedSettingSet {
+    type Error = EventValidationError;
+    fn try_from(values: Vec<ChangedSetting>) -> Result<Self, Self::Error> {
+        Self::new(values)
+    }
+}
+
+impl From<ChangedSettingSet> for Vec<ChangedSetting> {
+    fn from(values: ChangedSettingSet) -> Self {
+        values.0
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CameraState {
@@ -307,6 +363,16 @@ pub enum EventPayload {
         state: DetectorState,
         failure_category: Option<FailureCategory>,
     },
+    /// Published after the settings transaction commits.
+    ///
+    /// This is a notification, not the record: the bus provides no durability
+    /// (ADR 002), and the audit table is where the change is remembered. A
+    /// dropped notification means a consumer is briefly behind, not that the
+    /// change was lost.
+    ConfigurationChanged {
+        generation: u64,
+        changed: ChangedSettingSet,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -326,6 +392,7 @@ pub enum EventKind {
     StoragePressureChanged,
     PersonDetectionObserved,
     DetectorStateChanged,
+    ConfigurationChanged,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -384,6 +451,21 @@ impl DomainEvent {
                 return Err(EventValidationError::WrongDeliveryClass);
             }
         }
+        if let EventPayload::ConfigurationChanged { .. } = &payload {
+            // Configuration is state, not a stream of independently meaningful
+            // facts: a consumer that missed generation 7 and receives 8 is
+            // correct, because 8 supersedes 7. `CriticalLifecycle` would be
+            // wrong — it would imply the bus is where the change is remembered,
+            // and ADR 002 says it provides no durability.
+            if delivery_class != DeliveryClass::LatestState {
+                return Err(EventValidationError::WrongDeliveryClass);
+            }
+            // A batch may span cameras, so the event is deployment-scoped and
+            // carries per-setting camera identity inside the payload instead.
+            if camera_id.is_some() {
+                return Err(EventValidationError::ConfigurationWithCamera);
+            }
+        }
         Ok(Self {
             event_id,
             schema_version: SchemaVersion::current(),
@@ -399,6 +481,7 @@ impl DomainEvent {
             EventPayload::CameraStateChanged { .. } => "camera",
             EventPayload::DetectorStateChanged { .. } => "detector",
             EventPayload::StoragePressureChanged { .. } => "storage",
+            EventPayload::ConfigurationChanged { .. } => "configuration",
             _ => return None,
         };
         Some((self.camera_id.as_ref(), kind))
@@ -412,6 +495,7 @@ impl DomainEvent {
             EventPayload::StoragePressureChanged { .. } => EventKind::StoragePressureChanged,
             EventPayload::PersonDetectionObserved { .. } => EventKind::PersonDetectionObserved,
             EventPayload::DetectorStateChanged { .. } => EventKind::DetectorStateChanged,
+            EventPayload::ConfigurationChanged { .. } => EventKind::ConfigurationChanged,
         }
     }
 }
@@ -425,7 +509,9 @@ pub enum EventValidationError {
     InvalidConfidence,
     InvalidGeometry,
     TooManyDetections,
+    TooManyChangedSettings,
     DetectionWithoutCamera,
+    ConfigurationWithCamera,
     WrongDeliveryClass,
 }
 impl fmt::Display for EventValidationError {
@@ -438,9 +524,10 @@ impl Error for EventValidationError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        Confidence, DeliveryClass, DetectionSet, DomainEvent, EventId, EventPayload,
-        EventValidationError, ModelName, ModelVersion, NormalizedBoundingBox, OccurredAtUnixMicros,
-        PersonDetection, SourceMediaTime, MAX_DETECTIONS_PER_EVENT,
+        ChangeOutcomeName, ChangedSetting, ChangedSettingSet, Confidence, DeliveryClass,
+        DetectionSet, DomainEvent, EventId, EventKind, EventPayload, EventValidationError,
+        ModelName, ModelVersion, NormalizedBoundingBox, OccurredAtUnixMicros, PersonDetection,
+        SettingKeyName, SourceMediaTime, MAX_CHANGED_SETTINGS_PER_EVENT, MAX_DETECTIONS_PER_EVENT,
     };
     use std::num::NonZeroU64;
     use surveillance_common::types::CameraId;
@@ -509,6 +596,109 @@ mod tests {
     #[test]
     fn external_json_cannot_bypass_detection_scope_or_delivery_class() {
         let json = r#"{"event_id":"event-001","schema_version":1,"occurred_at":1700000000000000,"camera_id":null,"delivery_class":"telemetry","payload":{"kind":"person_detection_observed","media_time":{"epoch":1,"ticks":1,"timebase_hz":90000},"model":"fixture","model_version":"1.0","detections":[]}}"#;
+        assert!(serde_json::from_str::<DomainEvent>(json).is_err());
+    }
+
+    fn changed(key: &str, outcome: &str) -> ChangedSetting {
+        ChangedSetting {
+            key: SettingKeyName::new(key).unwrap_or_else(|error| panic!("valid key: {error:?}")),
+            camera_id: None,
+            outcome: ChangeOutcomeName::new(outcome)
+                .unwrap_or_else(|error| panic!("valid outcome: {error:?}")),
+        }
+    }
+
+    fn configuration_event(
+        delivery_class: DeliveryClass,
+        camera_id: Option<CameraId>,
+        changed: Vec<ChangedSetting>,
+    ) -> Result<DomainEvent, EventValidationError> {
+        DomainEvent::new(
+            EventId::new("event-config-001").unwrap_or_else(|error| panic!("id: {error:?}")),
+            OccurredAtUnixMicros::new(1_700_000_000_000_000)
+                .unwrap_or_else(|error| panic!("timestamp: {error:?}")),
+            camera_id,
+            delivery_class,
+            EventPayload::ConfigurationChanged {
+                generation: 7,
+                changed: ChangedSettingSet::new(changed)
+                    .unwrap_or_else(|error| panic!("set: {error:?}")),
+            },
+        )
+    }
+
+    #[test]
+    fn a_configuration_change_is_latest_state() {
+        let event = configuration_event(
+            DeliveryClass::LatestState,
+            None,
+            vec![changed("retention.max_age", "applied")],
+        )
+        .unwrap_or_else(|error| panic!("valid configuration event: {error:?}"));
+        assert_eq!(event.kind(), EventKind::ConfigurationChanged);
+        assert_eq!(event.state_key(), Some((None, "configuration")));
+    }
+
+    #[test]
+    fn a_configuration_change_rejects_other_delivery_classes() {
+        // CriticalLifecycle would imply the bus is where the change is
+        // remembered. It is not; the audit table is.
+        for class in [
+            DeliveryClass::CriticalLifecycle,
+            DeliveryClass::Telemetry,
+            DeliveryClass::Detection,
+        ] {
+            assert_eq!(
+                configuration_event(class, None, vec![changed("retention.max_age", "applied")]),
+                Err(EventValidationError::WrongDeliveryClass)
+            );
+        }
+    }
+
+    #[test]
+    fn a_configuration_change_is_deployment_scoped() {
+        let camera = CameraId::new("camera-01").unwrap_or_else(|error| panic!("camera: {error}"));
+        assert_eq!(
+            configuration_event(
+                DeliveryClass::LatestState,
+                Some(camera),
+                vec![changed("camera.detection.sample_fps", "applied")],
+            ),
+            Err(EventValidationError::ConfigurationWithCamera)
+        );
+    }
+
+    #[test]
+    fn a_configuration_payload_is_bounded() {
+        let oversized = (0..=MAX_CHANGED_SETTINGS_PER_EVENT)
+            .map(|_| changed("retention.max_age", "applied"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ChangedSettingSet::new(oversized).err(),
+            Some(EventValidationError::TooManyChangedSettings),
+            "an unbounded payload would be a way around the bus bound"
+        );
+    }
+
+    #[test]
+    fn a_configuration_event_carries_no_values() {
+        let event = configuration_event(
+            DeliveryClass::LatestState,
+            None,
+            vec![changed("camera.rtsp.password", "applied")],
+        )
+        .unwrap_or_else(|error| panic!("valid configuration event: {error:?}"));
+        let rendered = serde_json::to_string(&event).unwrap_or_default();
+        assert!(rendered.contains("camera.rtsp.password"));
+        assert!(
+            !rendered.contains("value"),
+            "the payload must carry keys and outcomes only: {rendered}"
+        );
+    }
+
+    #[test]
+    fn external_json_cannot_smuggle_a_configuration_event_onto_another_class() {
+        let json = r#"{"event_id":"event-002","schema_version":1,"occurred_at":1700000000000000,"camera_id":null,"delivery_class":"critical_lifecycle","payload":{"kind":"configuration_changed","generation":7,"changed":[]}}"#;
         assert!(serde_json::from_str::<DomainEvent>(json).is_err());
     }
 }

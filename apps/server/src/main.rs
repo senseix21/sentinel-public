@@ -1,10 +1,16 @@
-use std::{error::Error, sync::Arc};
+use std::{error::Error, path::PathBuf, sync::Arc};
+
+use surveillance_config::{
+    cache::Cache, cache::StaleRetry, classification::SettingId, secret::Secret,
+};
+use surveillance_database::PostgresSettingsRepository;
 
 use surveillance_config::settings::OneCameraConfig;
 use surveillance_database::PostgresRecordingRepository;
 use surveillance_events::bus::EventBus;
 use surveillance_livekit::token::DevelopmentTokenService;
 use surveillance_server::{
+    authorize::MutatingSurface,
     camera_supervisor::CameraSupervisor,
     health_http::serve_health,
     metadata_writer::MetadataWriter,
@@ -13,10 +19,12 @@ use surveillance_server::{
     reconciliation_owner::ReconciliationOwner,
     retention_owner::RetentionOwner,
     runtime_config::{
-        load_database_from_environment, load_ffmpeg_from_environment, load_from_environment,
-        load_health_bind_from_environment, load_retention_from_environment,
+        bootstrap_count, bootstrap_duration, bootstrap_flag, bootstrap_path, bootstrap_secret,
+        load_configuration_layers, load_database_from_environment, load_ffmpeg_from_environment,
+        load_from_environment, load_health_bind_from_environment, load_retention,
         load_supervision_from_environment,
     },
+    settings_service::SettingsService,
 };
 use surveillance_storage::{
     reconciliation::discover_reconciliation_candidates, retention::SafeRecordingDelete,
@@ -38,11 +46,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_target(false)
         .try_init()?;
 
+    let configuration = load_configuration_layers()?;
     let config = Arc::new(OneCameraConfig::validate(load_from_environment()?)?);
     let health_bind = load_health_bind_from_environment()?;
     let supervision = load_supervision_from_environment()?;
     let database = load_database_from_environment()?;
-    let retention = load_retention_from_environment()?;
+    let retention = load_retention(&configuration.bootstrap)?;
     let ffmpeg = load_ffmpeg_from_environment();
     let phase4_metrics = Phase4Metrics::default();
     let event_bus = EventBus::new();
@@ -53,7 +62,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             DevelopmentTokenService::new(
                 livekit,
                 livekit.deployment_namespace.clone(),
-                std::time::Duration::from_secs(5 * 60),
+                bootstrap_duration(&configuration.bootstrap, SettingId::LiveKitViewerTokenTtl)
+                    .unwrap_or(std::time::Duration::from_secs(5 * 60)),
             )
         })
         .transpose()?;
@@ -75,9 +85,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             config.layout.clone(),
             SegmentFileStore::new(config.layout.clone(), config.ffprobe.clone()),
             config.reconciliation_limit,
-            256,
-            std::time::Duration::from_secs(120),
-            std::time::Duration::from_secs(30),
+            bootstrap_count(
+                &configuration.bootstrap,
+                SettingId::ReconciliationQueueItems,
+                256,
+            ),
+            bootstrap_duration(&configuration.bootstrap, SettingId::ReconciliationInterval)
+                .unwrap_or(std::time::Duration::from_secs(120)),
+            bootstrap_duration(&configuration.bootstrap, SettingId::ReconciliationBackoff)
+                .unwrap_or(std::time::Duration::from_secs(30)),
         )
         .with_metrics(phase4_metrics.clone());
         if let Err(category) = reconciliation.run_pass().await {
@@ -103,9 +119,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         retention_owner = Some((retention_shutdown, retention_task));
         let (writer, writer_handle) = MetadataWriter::new(
             repository.clone(),
-            std::num::NonZeroUsize::new(256).unwrap_or(std::num::NonZeroUsize::MIN),
-            std::time::Duration::from_millis(250),
-            std::time::Duration::from_secs(30),
+            std::num::NonZeroUsize::new(bootstrap_count(
+                &configuration.bootstrap,
+                SettingId::MetadataQueueItems,
+                256,
+            ))
+            .unwrap_or(std::num::NonZeroUsize::MIN),
+            bootstrap_duration(&configuration.bootstrap, SettingId::MetadataFlushInterval)
+                .unwrap_or(std::time::Duration::from_millis(250)),
+            bootstrap_duration(&configuration.bootstrap, SettingId::MetadataRetryBackoff)
+                .unwrap_or(std::time::Duration::from_secs(30)),
         );
         let (shutdown, shutdown_rx) = watch::channel(false);
         let task = tokio::spawn(writer.run(shutdown_rx));
@@ -114,7 +137,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         playback_assembler = Some(PlaybackAssembler::new(
             config.layout.root().to_path_buf(),
             ffmpeg,
-            std::time::Duration::from_secs(5),
+            bootstrap_duration(&configuration.bootstrap, SettingId::PlaybackProbeTimeout)
+                .unwrap_or(std::time::Duration::from_secs(5)),
         ));
         Some(writer_handle)
     } else {
@@ -146,6 +170,49 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let (adapter_shutdown, adapter_shutdown_rx) = watch::channel(false);
     let registry = handle.health_registry();
     let recording_root = config.layout.root().to_path_buf();
+
+    // Persistent configuration. The settings store is optional: without it the
+    // server runs on bootstrap layers and refuses changes, rather than
+    // accepting changes it cannot make durable.
+    let settings_repository = load_database_from_environment()?
+        .as_ref()
+        .map(PostgresSettingsRepository::connect_lazy);
+    let settings_service = Arc::new(SettingsService::new(
+        configuration.base,
+        configuration.environment,
+        settings_repository,
+        Cache::new(
+            bootstrap_path(&configuration.bootstrap, SettingId::ConfigCachePath)
+                .unwrap_or_else(|| PathBuf::from("config/last-known-good.toml")),
+        ),
+        // The salt only matters for secret audit rows, which cannot occur while
+        // secrets are not persistable. It is read here so that enabling secret
+        // persistence later does not need a second wiring change.
+        bootstrap_secret(&configuration.bootstrap, SettingId::AuditFingerprintSalt)
+            .unwrap_or_else(|| Secret::new(String::new())),
+        Some(handle.event_bus()),
+        StaleRetry::new(
+            bootstrap_duration(
+                &configuration.bootstrap,
+                SettingId::ConfigStaleRetryInterval,
+            )
+            .unwrap_or(std::time::Duration::from_secs(5)),
+            bootstrap_duration(&configuration.bootstrap, SettingId::ConfigStaleRetryBudget)
+                .unwrap_or(std::time::Duration::from_secs(300)),
+        ),
+        MutatingSurface::from_enabled(bootstrap_flag(
+            &configuration.bootstrap,
+            SettingId::ApiMutatingSurfaceEnabled,
+        )),
+    ));
+    let freshness = settings_service.load().await;
+    if freshness.is_stale() {
+        tracing::warn!(
+            "configuration loaded from the last-known-good cache; the settings store was \
+             unavailable. Recording is unaffected and readiness reports degradation."
+        );
+    }
+    let settings_service = Some(settings_service);
     let mut adapter_task = tokio::spawn(serve_health(
         health_bind,
         recording_root,
@@ -156,6 +223,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         metadata_observer,
         Some(phase4_metrics),
         viewer_tokens,
+        settings_service,
         adapter_shutdown_rx,
     ));
 

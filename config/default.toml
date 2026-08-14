@@ -1,34 +1,132 @@
-# Reference values for the H.264 MVP constructor. The current Phase 3 server
-# loads required deployment values and secrets from the environment; this file
-# is documentation until the persistent configuration phase adds a TOML loader.
+# Versioned defaults. This file is a real configuration layer, not documentation:
+# `surveillance_config::file::parse` loads it, and a test asserts it resolves to
+# exactly the compiled defaults in `crates/config/src/defaults.rs`. Editing one
+# without the other fails that test.
+#
+# Precedence: compiled defaults < this file < persisted settings < environment.
+#
+# Keys are the durable setting identities. The same strings appear in the
+# settings API, in metric labels, and in audit rows.
+#
+# Durations always carry a unit: ms, s, m, h, d. A bare number is rejected.
+#
+# Settings with no safe default are absent on purpose and must be supplied by a
+# higher layer: database.url, audit.fingerprint_salt, every credential, each
+# camera's endpoint and dimensions, and the LiveKit deployment identity.
 
-[camera]
-connect_timeout_seconds = 5
-max_access_unit_bytes = 2097152
-max_nals_per_access_unit = 128
-reconnect_initial_milliseconds = 250
-reconnect_maximum_seconds = 30
-reconnect_jitter_basis_points = 2000
-teardown_timeout_seconds = 2
-reconnect_stable_session_reset_seconds = 30
+[server]
+health_bind = "127.0.0.1:3000"
+
+[storage]
+recording_root = "recordings"
+# Strictly increasing, below 100, with hysteresis smaller than the first gap.
+# Validated as a group: a single-key change that breaks the ordering is rejected.
+watermark_warning = 80
+watermark_critical = 90
+watermark_emergency = 97
+watermark_hysteresis = 2
+
+[database]
+max_connections = 8
+acquire_timeout = "5s"
 
 [supervision]
 maximum_cameras = 256
 command_queue_items = 64
-command_response_timeout_seconds = 10
-api_max_request_bytes = 16384
-api_io_timeout_seconds = 5
-api_concurrent_requests = 1
+command_timeout = "10s"
 
-[recording]
-segment_duration_seconds = 30
-fragment_duration_seconds = 1
-recorder_queue_items = 32
-live_queue_items = 4
+[api]
+# ADR 008: a deployment must opt in to being reconfigured over HTTP. While this
+# is false the mutating endpoints return 404, not 403 — a disabled surface does
+# not advertise itself.
+mutating_surface_enabled = false
+max_request_bytes = 16384
+io_timeout = "5s"
+# The accept loop handles connections serially. That is a property of the
+# implementation, not a configurable limit, so it is documented here rather than
+# promoted to a setting that implies a limiter which does not exist.
+
+[config]
+cache_path = "config/last-known-good.toml"
+# Retry budget outlasts typical service start ordering, because the dominant
+# cause of a stale cache is a local PostgreSQL that is not accepting connections
+# yet. The server comes up regardless; it does not wait for the store.
+stale_retry_interval = "5s"
+stale_retry_budget = "5m"
+
+[retention]
+max_age = "30d"
+protected_recent = "1h"
+batch_files = 100
+batch_bytes = 10737418240
+interval = "1m"
+
+[reconciliation]
+queue_items = 256
+interval = "2m"
+backoff = "30s"
+
+[metadata]
+queue_items = 256
+flush_interval = "250ms"
+retry_backoff = "30s"
+
+[playback]
+ffmpeg = "ffmpeg"
+probe_timeout = "5s"
+
+[livekit]
+viewer_token_ttl = "5m"
+
+# --- Per-camera templates ----------------------------------------------------
+# These apply to every camera. Override one camera under [cameras."<id>".*].
+
+[camera.rtsp]
+connect_timeout = "5s"
+max_access_unit_bytes = 2097152
+max_nals_per_access_unit = 128
+
+[camera.reconnect]
+initial = "250ms"
+maximum = "30s"
+jitter_basis_points = 2000
+teardown_timeout = "2s"
+stable_session_reset = "30s"
+
+[camera.queue]
+recorder_items = 32
+live_items = 4
+lifecycle_event_items = 64
+
+[camera.recording]
+segment_duration = "30s"
+fragment_duration = "1s"
 max_segment_bytes = 33554432
 max_fragment_bytes = 8388608
 max_segment_samples = 1000
-max_pipeline_memory_bytes = 113246208
-clock_drift_tolerance_seconds = 5
-lifecycle_event_items = 64
+clock_drift_tolerance = "5s"
+ffprobe = "ffprobe"
 reconciliation_scan_entries = 100000
+
+[camera.memory]
+max_pipeline_bytes = 134217728
+
+[camera.detection]
+enabled = true
+queue_items = 2
+sample_fps = 5
+max_gap = "2s"
+decoder = "ffmpeg"
+decode_timeout = "2s"
+
+[camera.livekit]
+cli_path = "lk"
+cli_version = "2.4.14"
+queue_items = 8
+max_lag = "2s"
+max_access_unit_bytes = 2097152
+ipc_write_timeout = "2s"
+shutdown_timeout = "5s"
+reconnect_initial = "250ms"
+reconnect_maximum = "30s"
+reconnect_stable_reset = "30s"

@@ -4,15 +4,21 @@ use std::{
     error::Error,
     fmt,
     net::SocketAddr,
-    num::{NonZeroU32, NonZeroU64, NonZeroUsize},
+    num::{NonZeroU32, NonZeroUsize},
     path::PathBuf,
     time::Duration,
 };
 
-use surveillance_config::settings::{CameraCredentialsSettings, OneCameraSettings};
+use surveillance_config::{
+    classification::{Origin, SettingId},
+    defaults, environment, file,
+    resolution::{Layer, ResolvedSettings},
+    settings::{CameraCredentialsSettings, OneCameraSettings},
+    value::SettingValue,
+};
 use surveillance_database::DatabaseConfig;
 use surveillance_livekit::config::LiveKitSettings;
-use surveillance_storage::retention::{RetentionPolicy, StorageWatermarks};
+use surveillance_storage::retention::RetentionPolicy;
 
 const CAMERA_ID: &str = "SURVEILLANCE_CAMERA_ID";
 const RTSP_URL: &str = "SURVEILLANCE_RTSP_URL";
@@ -29,11 +35,9 @@ const COMMAND_TIMEOUT_SECONDS: &str = "SURVEILLANCE_COMMAND_TIMEOUT_SECONDS";
 const DATABASE_URL: &str = "SURVEILLANCE_DATABASE_URL";
 const DATABASE_MAX_CONNECTIONS: &str = "SURVEILLANCE_DATABASE_MAX_CONNECTIONS";
 const DATABASE_ACQUIRE_TIMEOUT_SECONDS: &str = "SURVEILLANCE_DATABASE_ACQUIRE_TIMEOUT_SECONDS";
-const RETENTION_DAYS: &str = "SURVEILLANCE_RETENTION_DAYS";
-const RETENTION_PROTECTED_HOURS: &str = "SURVEILLANCE_RETENTION_PROTECTED_HOURS";
-const RETENTION_BATCH_FILES: &str = "SURVEILLANCE_RETENTION_BATCH_FILES";
-const RETENTION_BATCH_BYTES: &str = "SURVEILLANCE_RETENTION_BATCH_BYTES";
-const RETENTION_INTERVAL_SECONDS: &str = "SURVEILLANCE_RETENTION_INTERVAL_SECONDS";
+// The SURVEILLANCE_RETENTION_* variables are no longer read here: they reach
+// retention through the alias table in `surveillance_config::environment`,
+// which is what let the hardcoded watermarks be removed.
 const FFMPEG: &str = "SURVEILLANCE_FFMPEG";
 const LIVEKIT_URL: &str = "SURVEILLANCE_LIVEKIT_URL";
 const LIVEKIT_API_KEY: &str = "SURVEILLANCE_LIVEKIT_API_KEY";
@@ -45,6 +49,140 @@ const DETECTION_ENABLED: &str = "SURVEILLANCE_DETECTION_ENABLED";
 const DETECTION_QUEUE_ITEMS: &str = "SURVEILLANCE_DETECTION_QUEUE_ITEMS";
 const DETECTION_SAMPLE_FPS: &str = "SURVEILLANCE_DETECTION_SAMPLE_FPS";
 const DETECTION_MAX_GAP_MS: &str = "SURVEILLANCE_DETECTION_MAX_GAP_MS";
+const CONFIG_FILE: &str = "SURVEILLANCE_CONFIG_FILE";
+
+/// The bootstrap layers: compiled defaults, an optional file, and the
+/// environment.
+///
+/// The persisted layer is absent here on purpose. It loads after bootstrap,
+/// because reaching the settings store requires values from these layers.
+pub struct ConfigurationLayers {
+    /// Defaults and file, in precedence order.
+    pub base: Vec<Layer>,
+    /// Highest precedence, and the only source of secrets.
+    pub environment: Layer,
+    /// Bootstrap values resolved from `base` plus `environment`.
+    pub bootstrap: ResolvedSettings,
+}
+
+/// Builds the bootstrap layers.
+///
+/// The configuration file is optional and its path comes from
+/// `SURVEILLANCE_CONFIG_FILE`. A file that is named but unreadable, or that
+/// contains an unknown key, fails startup rather than being skipped: a
+/// configuration file that silently does nothing is the failure this avoids.
+///
+/// # Errors
+/// Returns a typed error naming the offending file or variable.
+pub fn load_configuration_layers() -> Result<ConfigurationLayers, EnvironmentConfigError> {
+    let mut base = vec![defaults::layer()];
+    if let Some(path) = std::env::var(CONFIG_FILE)
+        .ok()
+        .filter(|path| !path.is_empty())
+    {
+        let layer = file::load(Origin::File, std::path::Path::new(&path))
+            .map_err(|error| EnvironmentConfigError::InvalidConfigurationFile(error.to_string()))?;
+        base.push(layer);
+    }
+    let environment = environment::layer()
+        .map_err(|error| EnvironmentConfigError::InvalidEnvironment(error.to_string()))?;
+
+    let mut layers = base.clone();
+    layers.push(environment.clone());
+    let bootstrap = ResolvedSettings::resolve(layers);
+
+    Ok(ConfigurationLayers {
+        base,
+        environment,
+        bootstrap,
+    })
+}
+
+/// Reads a bootstrap boolean, defaulting to `false` when absent.
+#[must_use]
+pub fn bootstrap_flag(resolved: &ResolvedSettings, id: SettingId) -> bool {
+    matches!(
+        resolved
+            .effective(id, None)
+            .map(|value| value.value().clone()),
+        Some(SettingValue::Boolean(true))
+    )
+}
+
+/// Builds retention settings from the resolved configuration.
+///
+/// Replaces the environment-only path that hardcoded
+/// `StorageWatermarks::new(80, 90, 97, 2)`. The four thresholds and the
+/// retention policy now come from the configuration domain, and the legacy
+/// `SURVEILLANCE_RETENTION_*` variables still reach them through the alias
+/// table, so an existing deployment is unaffected.
+///
+/// # Errors
+/// Returns [`EnvironmentConfigError::InvalidRetentionConfiguration`] when the
+/// resolved values are not a legal policy.
+pub fn load_retention(
+    resolved: &ResolvedSettings,
+) -> Result<RetentionSettings, EnvironmentConfigError> {
+    let policy = surveillance_config::assemble::retention_policy(resolved)
+        .map_err(|_| EnvironmentConfigError::InvalidRetentionConfiguration)?;
+    let interval = bootstrap_duration(resolved, SettingId::RetentionInterval)
+        .ok_or(EnvironmentConfigError::InvalidRetentionConfiguration)?;
+    Ok(RetentionSettings { policy, interval })
+}
+
+/// Reads a bootstrap count, falling back when absent or out of range.
+#[must_use]
+pub fn bootstrap_count(resolved: &ResolvedSettings, id: SettingId, fallback: usize) -> usize {
+    match resolved
+        .effective(id, None)
+        .map(|value| value.value().clone())
+    {
+        Some(SettingValue::Unsigned(value)) => usize::try_from(value).unwrap_or(fallback),
+        _ => fallback,
+    }
+}
+
+/// Reads a bootstrap percentage, falling back when absent or out of range.
+#[must_use]
+pub fn bootstrap_percent(resolved: &ResolvedSettings, id: SettingId, fallback: u8) -> u8 {
+    match resolved
+        .effective(id, None)
+        .map(|value| value.value().clone())
+    {
+        Some(SettingValue::Unsigned(value)) => u8::try_from(value).unwrap_or(fallback),
+        _ => fallback,
+    }
+}
+
+/// Reads a bootstrap path.
+#[must_use]
+pub fn bootstrap_path(resolved: &ResolvedSettings, id: SettingId) -> Option<PathBuf> {
+    match resolved.effective(id, None)?.value() {
+        SettingValue::Path(path) => Some(path.clone()),
+        _ => None,
+    }
+}
+
+/// Reads a bootstrap duration.
+#[must_use]
+pub fn bootstrap_duration(resolved: &ResolvedSettings, id: SettingId) -> Option<Duration> {
+    match resolved.effective(id, None)?.value() {
+        SettingValue::Duration(value) => Some(*value),
+        _ => None,
+    }
+}
+
+/// Reads a bootstrap secret without rendering it.
+#[must_use]
+pub fn bootstrap_secret(
+    resolved: &ResolvedSettings,
+    id: SettingId,
+) -> Option<surveillance_config::secret::Secret<String>> {
+    match resolved.effective(id, None)?.value() {
+        SettingValue::Secret(value) => Some(value.clone()),
+        _ => None,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SupervisionSettings {
@@ -57,51 +195,6 @@ pub struct SupervisionSettings {
 pub struct RetentionSettings {
     pub policy: RetentionPolicy,
     pub interval: Duration,
-}
-
-/// Loads restart-applied versioned retention defaults and overrides.
-///
-/// # Errors
-/// Returns a typed error for malformed or unsafe values.
-pub fn load_retention_from_environment() -> Result<RetentionSettings, EnvironmentConfigError> {
-    load_retention_with(|key| std::env::var(key).ok())
-}
-
-fn load_retention_with(
-    lookup: impl Fn(&str) -> Option<String>,
-) -> Result<RetentionSettings, EnvironmentConfigError> {
-    let positive = |key: &'static str, default: u64| -> Result<u64, EnvironmentConfigError> {
-        lookup(key).map_or(Ok(default), |value| {
-            value
-                .parse::<u64>()
-                .ok()
-                .filter(|value| *value != 0)
-                .ok_or(EnvironmentConfigError::InvalidPositiveInteger(key))
-        })
-    };
-    let days = positive(RETENTION_DAYS, 30)?;
-    let protected_hours = positive(RETENTION_PROTECTED_HOURS, 1)?;
-    let files = usize::try_from(positive(RETENTION_BATCH_FILES, 100)?)
-        .ok()
-        .and_then(NonZeroUsize::new)
-        .ok_or(EnvironmentConfigError::InvalidPositiveInteger(
-            RETENTION_BATCH_FILES,
-        ))?;
-    let bytes = NonZeroU64::new(positive(RETENTION_BATCH_BYTES, 10 * 1024 * 1024 * 1024)?).ok_or(
-        EnvironmentConfigError::InvalidPositiveInteger(RETENTION_BATCH_BYTES),
-    )?;
-    let interval = Duration::from_secs(positive(RETENTION_INTERVAL_SECONDS, 60)?);
-    let watermarks = StorageWatermarks::new(80, 90, 97, 2)
-        .map_err(|_| EnvironmentConfigError::InvalidRetentionConfiguration)?;
-    let policy = RetentionPolicy::new(
-        Duration::from_secs(days.saturating_mul(24 * 60 * 60)),
-        Duration::from_secs(protected_hours.saturating_mul(60 * 60)),
-        files,
-        bytes,
-        watermarks,
-    )
-    .map_err(|_| EnvironmentConfigError::InvalidRetentionConfiguration)?;
-    Ok(RetentionSettings { policy, interval })
 }
 
 /// Loads required deployment values without ever providing a public camera URL.
@@ -295,7 +388,10 @@ fn parse_u32(value: &str, key: &'static str) -> Result<u32, EnvironmentConfigErr
         .ok_or(EnvironmentConfigError::InvalidPositiveInteger(key))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// No longer `Copy`: the file and environment variants carry the detail an
+// operator needs to find the offending key, which is worth more than the
+// convenience of implicit copying.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EnvironmentConfigError {
     Missing(&'static str),
     InvalidBoolean(&'static str),
@@ -306,6 +402,11 @@ pub enum EnvironmentConfigError {
     HealthBindNotLoopback,
     InvalidDatabaseConfiguration,
     InvalidRetentionConfiguration,
+    /// A named configuration file that is unreadable, malformed, or contains an
+    /// unknown key. Startup fails rather than skipping it.
+    InvalidConfigurationFile(String),
+    /// An environment layer that is ambiguous or malformed.
+    InvalidEnvironment(String),
 }
 
 impl fmt::Display for EnvironmentConfigError {
@@ -343,6 +444,12 @@ impl fmt::Display for EnvironmentConfigError {
             Self::InvalidDatabaseConfiguration => {
                 formatter.write_str("database connection configuration is invalid")
             }
+            Self::InvalidConfigurationFile(detail) => {
+                write!(formatter, "configuration file is invalid: {detail}")
+            }
+            Self::InvalidEnvironment(detail) => {
+                write!(formatter, "environment configuration is invalid: {detail}")
+            }
             Self::InvalidRetentionConfiguration => {
                 formatter.write_str("retention configuration is invalid")
             }
@@ -355,8 +462,8 @@ impl Error for EnvironmentConfigError {}
 #[cfg(test)]
 mod tests {
     use super::{
-        load_database_with, load_health_bind_with, load_retention_with, load_supervision_with,
-        load_with, EnvironmentConfigError,
+        defaults, load_database_with, load_health_bind_with, load_retention, load_supervision_with,
+        load_with, EnvironmentConfigError, ResolvedSettings,
     };
     use std::{collections::HashMap, time::Duration};
 
@@ -448,23 +555,49 @@ mod tests {
         assert!(!debug.contains("secret"));
     }
 
+    /// Ported from the deleted environment-only retention loader, which
+    /// hardcoded `StorageWatermarks::new(80, 90, 97, 2)`. The same two claims
+    /// are asserted through the configuration domain: versioned defaults, and a
+    /// rejected invalid override.
     #[test]
     fn retention_defaults_are_versioned_and_invalid_overrides_are_rejected() {
+        let resolved = ResolvedSettings::resolve(vec![defaults::layer()]);
         let settings =
-            load_retention_with(|_| None).unwrap_or_else(|error| panic!("valid defaults: {error}"));
+            load_retention(&resolved).unwrap_or_else(|error| panic!("valid defaults: {error}"));
         assert_eq!(
             settings.policy.retention(),
             Duration::from_secs(30 * 24 * 60 * 60)
         );
         assert_eq!(settings.policy.maximum_files(), 100);
+        assert_eq!(settings.interval, Duration::from_secs(60));
+
+        // A zero retention age is rejected, and the rejection still names the
+        // legacy variable that supplied it.
+        let overrides = std::collections::BTreeMap::from([(
+            "SURVEILLANCE_RETENTION_DAYS".to_owned(),
+            "0".to_owned(),
+        )]);
+        let environment =
+            surveillance_config::environment::layer_from(|key| overrides.get(key).cloned())
+                .unwrap_or_else(|error| panic!("the layer itself parses: {error}"));
+        let with_override = ResolvedSettings::resolve(vec![defaults::layer(), environment]);
         assert_eq!(
-            load_retention_with(|key| {
-                (key == "SURVEILLANCE_RETENTION_DAYS").then(|| "0".to_owned())
-            })
-            .err(),
-            Some(EnvironmentConfigError::InvalidPositiveInteger(
-                "SURVEILLANCE_RETENTION_DAYS"
-            ))
+            load_retention(&with_override).err(),
+            Some(EnvironmentConfigError::InvalidRetentionConfiguration),
+            "a zero retention age must not become active"
         );
+    }
+
+    #[test]
+    fn storage_watermarks_come_from_configuration_and_match_the_previous_constants() {
+        // The values this replaces were `StorageWatermarks::new(80, 90, 97, 2)`
+        // hardcoded in the retention loader. Making them configurable must not
+        // have changed the shipped behavior.
+        let resolved = ResolvedSettings::resolve(vec![defaults::layer()]);
+        let watermarks = surveillance_config::assemble::storage_watermarks(&resolved)
+            .unwrap_or_else(|error| panic!("shipped watermarks are legal: {error}"));
+        let previous = surveillance_storage::retention::StorageWatermarks::new(80, 90, 97, 2)
+            .unwrap_or_else(|error| panic!("previous constants were legal: {error:?}"));
+        assert_eq!(watermarks, previous);
     }
 }
