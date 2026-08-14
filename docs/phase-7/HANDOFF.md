@@ -113,10 +113,22 @@ unreachable at startup, load that file instead and mark configuration state
 `Stale` with the timestamp of the last successful load. Behavior is preserved
 across outages, staleness is observable, and nothing silently reverts.
 
-**Open question for the deployment target:** is PostgreSQL local to each unit
-or central? If central, a site that loses its uplink cannot read its own
-configuration and the cache becomes the primary path rather than a fallback.
-Phase 4 was designed before Jetson was the production target.
+**PostgreSQL is per-unit** (confirmed 2026-08-14). That makes the cache a
+genuine fallback rather than the primary path: a local store is unavailable
+during a startup race or after corruption, not during a network partition.
+
+Two consequences for the design. `Stale` should be **transient with retry** —
+the server keeps attempting to reach the local store and leaves `Stale` on the
+first successful load, rather than treating it as a steady operating mode. And
+because the cache and the database share a disk, a disk failure takes both;
+the cache defends against ordering and corruption, not against storage loss.
+
+Two consequences outside this phase, recorded so they are not discovered later.
+PostgreSQL competes with camera decoders, recording buffers, and the TensorRT
+engine for unified memory on a Jetson, so it is an input to the detection
+sizing rule rather than a free background cost. And per-unit storage means
+there is no fleet-wide configuration view — changing a setting across sites is
+a distribution problem this phase does not solve.
 
 ### Precedence and origin
 
@@ -204,6 +216,11 @@ Startup loads persisted settings after bootstrap. On store unavailability, load
 the local last-known-good cache and enter `Stale`; never fall back to defaults.
 Every successful load rewrites that cache.
 
+`Stale` is transient: retry the local store on a bounded interval and leave
+`Stale` on the first successful load. The dominant cause is a startup race with
+a local PostgreSQL that is not ready yet, so the retry must outlast typical
+service start ordering without blocking the server from coming up.
+
 ### P7.6 — Expose settings APIs
 
 Read and update endpoints in `apps/server/src/health_http.rs`, following the
@@ -248,6 +265,8 @@ At minimum qualify:
 - PostgreSQL unavailable at startup, and lost while running;
 - store unavailable with a valid cache, with a corrupt cache, and with no cache,
   verifying `Stale` state and that defaults are never silently substituted;
+- store unavailable at startup and reachable shortly after, verifying `Stale`
+  clears on the first successful load without a restart;
 - cache rewritten on every successful load, and survives forced process exit;
 - settings change succeeds but the audit write fails, verifying neither commits;
 - mutating endpoints disabled by default, and rejected when disabled;
