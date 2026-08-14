@@ -464,20 +464,40 @@ bypass.
 
 Bounded cardinality: setting key and outcome category only, never values.
 
+All series are prefixed `surveillance_` to match the existing exposition.
+Implemented in `render_configuration_metrics`, asserted by
+`configuration_metrics_are_exposed_with_bounded_cardinality`.
+
 | Metric | Type | Labels |
 |---|---|---|
-| `configuration_generation` | gauge | — |
-| `configuration_last_applied_seconds` | gauge | — |
-| `configuration_origin` | gauge | `group`, `origin` |
-| `configuration_pending_boundary` | gauge | `boundary` |
-| `configuration_rejected_total` | counter | `reason` |
-| `configuration_store_available` | gauge | — |
-| `configuration_freshness` | gauge | — (0 fresh, 1 stale) |
-| `configuration_last_success_age_seconds` | gauge | — |
-| `configuration_cache_state` | gauge | `state` |
-| `configuration_mutating_surface_enabled` | gauge | — |
-| `configuration_audit_write_total` | counter | `outcome` |
-| `configuration_notify_total` | counter | `outcome` |
+| `surveillance_configuration_generation` | gauge | — |
+| `surveillance_configuration_freshness` | gauge | — (0 fresh, 1 stale) |
+| `surveillance_configuration_store_available` | gauge | — |
+| `surveillance_configuration_mutating_surface_enabled` | gauge | — |
+| `surveillance_configuration_unreadable_rows` | gauge | — |
+| `surveillance_configuration_last_success_age_seconds` | gauge | — |
+| `surveillance_configuration_cache_state` | gauge | `state` |
+| `surveillance_configuration_origin` | gauge | `origin` |
+| `surveillance_configuration_pending` | gauge | `boundary` |
+| `surveillance_configuration_applied_total` | counter | — |
+| `surveillance_configuration_rejected_total` | counter | — |
+| `surveillance_configuration_audit_write_total` | counter | — |
+| `surveillance_configuration_audit_write_failed_total` | counter | — |
+| `surveillance_configuration_notify_published_total` | counter | — |
+| `surveillance_configuration_notify_dropped_total` | counter | — |
+| `surveillance_configuration_cache_write_total` | counter | — |
+| `surveillance_configuration_cache_write_failed_total` | counter | — |
+
+Two departures from the first draft of this table, both deliberate:
+
+- Outcome is carried by the **series name** rather than an `outcome` label, so a
+  dashboard cannot accidentally sum a success and a failure into one number.
+- `configuration_rejected_total` has no `reason` label. Breaking rejections down
+  by reason needs per-reason counters that do not exist yet; a label that always
+  reads `unknown` would be worse than its absence.
+
+`surveillance_configuration_last_success_age_seconds` is **absent**, not zero,
+when no load has ever succeeded. Zero would read as "just loaded".
 
 Audit-write and notification outcomes are counted separately and deliberately.
 Collapsing them would hide the case ADR 008 cares about: a change that is durably

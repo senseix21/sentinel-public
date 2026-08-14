@@ -59,6 +59,32 @@ pub struct SettingsMetrics {
     pub cache_write_failures: AtomicU64,
 }
 
+/// Everything `/metrics` needs, gathered under one lock acquisition.
+///
+/// Label cardinality is bounded by construction: origins, boundaries, and cache
+/// states are closed enumerations, and no setting *value* appears anywhere.
+pub struct ConfigurationMetricsView {
+    pub generation: u64,
+    pub freshness: Freshness,
+    pub cache: CacheState,
+    pub store_available: bool,
+    pub mutating_surface_enabled: bool,
+    pub last_success_age_seconds: Option<u64>,
+    pub unreadable_rows: usize,
+    /// Effective settings per origin. Four entries at most.
+    pub by_origin: Vec<(Origin, usize)>,
+    /// Settings awaiting each boundary. Five entries at most.
+    pub pending_by_boundary: Vec<(ApplicationBoundary, usize)>,
+    pub applied: u64,
+    pub rejected: u64,
+    pub audit_written: u64,
+    pub audit_failed: u64,
+    pub notify_published: u64,
+    pub notify_dropped: u64,
+    pub cache_writes: u64,
+    pub cache_write_failures: u64,
+}
+
 /// A point-in-time view of the configuration.
 pub struct SettingsSnapshot {
     pub generation: u64,
@@ -264,6 +290,69 @@ impl SettingsService {
             .resolved
             .effective(id, camera)
             .map(|resolved| (resolved.value().render(), resolved.origin()))
+    }
+
+    /// Gathers everything `/metrics` needs in one pass.
+    ///
+    /// Fulfils `docs/phase-7/contracts.md` §6. Setting *identity* and outcome
+    /// category are exposed; values never are.
+    pub async fn metrics_view(&self) -> ConfigurationMetricsView {
+        let state = self.state.read().await;
+        let mut by_origin: Vec<(Origin, usize)> = Vec::with_capacity(Origin::ALL.len());
+        for origin in Origin::ALL.iter().copied() {
+            let count = SettingId::ALL
+                .iter()
+                .filter(|id| state.resolved.origin_of(**id, None) == Some(origin))
+                .count();
+            by_origin.push((origin, count));
+        }
+
+        let mut pending_by_boundary: Vec<(ApplicationBoundary, usize)> =
+            Vec::with_capacity(ApplicationBoundary::ALL.len());
+        for boundary in ApplicationBoundary::ALL.iter().copied() {
+            let count = state
+                .pending
+                .iter()
+                .filter(|(_, pending)| *pending == boundary)
+                .count();
+            pending_by_boundary.push((boundary, count));
+        }
+
+        let last_success_age_seconds = match state.freshness {
+            Freshness::Fresh { loaded_at } => SystemTime::now()
+                .duration_since(loaded_at)
+                .ok()
+                .map(|elapsed| elapsed.as_secs()),
+            // A unit that has never loaded successfully has no age to report.
+            // Reporting zero would read as "just loaded", which is the opposite
+            // of the truth.
+            Freshness::Stale { last_success, .. } => last_success.and_then(|at| {
+                SystemTime::now()
+                    .duration_since(at)
+                    .ok()
+                    .map(|elapsed| elapsed.as_secs())
+            }),
+        };
+
+        ConfigurationMetricsView {
+            generation: state.generation,
+            freshness: state.freshness,
+            cache: state.cache,
+            store_available: self.repository.is_some() && !state.freshness.is_stale(),
+            mutating_surface_enabled: self.surface.is_enabled(),
+            last_success_age_seconds,
+            unreadable_rows: state.rejected_rows.len(),
+            by_origin,
+            pending_by_boundary,
+            applied: self.metrics.applied.load(Ordering::Relaxed),
+            rejected: self.metrics.rejected.load(Ordering::Relaxed),
+            audit_written: self.metrics.audit_written.load(Ordering::Relaxed),
+            audit_failed: self.metrics.audit_failed.load(Ordering::Relaxed),
+            notify_published: self.metrics.notify_published.load(Ordering::Relaxed),
+            notify_dropped: self.metrics.notify_dropped.load(Ordering::Relaxed),
+            cache_writes: self.metrics.cache_writes.load(Ordering::Relaxed),
+            cache_write_failures: self.metrics.cache_write_failures.load(Ordering::Relaxed),
+        }
     }
 
     /// The effective value of one setting, typed.
