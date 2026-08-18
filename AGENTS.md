@@ -24,7 +24,7 @@ The existing `cam_rtsp` code is a prototype and reference implementation. It is 
 
 ## Current Repository Reality
 
-Last verified 2026-08-14. Re-verify before relying on any specific claim; this
+Last verified 2026-08-18. Re-verify before relying on any specific claim; this
 section describes a moving tree.
 
 ### The workspace
@@ -32,11 +32,11 @@ section describes a moving tree.
 A real `[workspace]` root builds `apps/server`, `apps/worker`, and the `crates/*`
 members. `make check` passes: `cargo fmt --all --check`, `cargo clippy
 --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace
---all-features` (126 passed, 0 failed, 20 ignored), and `cargo build --workspace
+--all-features` (509 passed, 0 failed, 34 ignored across 43 suites), and `cargo build --workspace
 --release`. Ignored tests require FFmpeg/libx264, MediaMTX, PostgreSQL, or a
 LiveKit server; the corresponding fixtures live in `scripts/phaseN/`.
 
-Roadmap phases 0 through 6 are implemented. `ROADMAP.md` carries per-item status
+Roadmap phases 0 through 8 are implemented, with Phase 8's exit gate open. `ROADMAP.md` carries per-item status
 and is the authority; several exit-gate items remain `[!]` pending representative
 cameras, target hardware, or product decisions.
 
@@ -59,9 +59,35 @@ Implemented today:
   cardinality), and camera-scoped `/api/cameras` resources covering health,
   recording search and detail, lifecycle operations, and development-only
   LiveKit viewer tokens.
+- Live publication that a browser decodes, by decoding and re-encoding behind a
+  viewer gate (ADR 012). Encoded pass-through is implemented and unusable — see
+  ADR 011 Decision 5 — so `TranscodePublicationAdapter` owns an FFmpeg decode
+  process and hands I420 to libwebrtc, whose encoders are correct. Nothing
+  decodes while no remote participant is present, and the adapter reports
+  `TimestampAuthority::AdapterClock`, so no latency claim can be made through
+  it. It is the same `PublicationAdapter` as the pass-through path, so the
+  camera still holds one upstream connection.
 - Sampled detection as an independently degradable consumer: an owned FFmpeg
   decode process, media-timestamp sampling, a freshness-preferring bounded queue,
   and a bounded in-process event bus with per-class overflow policy.
+- Persistent, layered, transactionally validated configuration with an audit
+  trail that commits in the same transaction as the change it records.
+- Authentication and camera-scoped authorization (Phase 8, ADR 009): opaque
+  bearer tokens hashed with Argon2id, principals with roles and camera scope,
+  and one chokepoint every protected route provably reaches. Reads are
+  authenticated; `/live`, `/ready`, and `/metrics` deliberately are not.
+  Verification runs off the executor under a bounded memory budget.
+- A reverse-proxy trust boundary whose origin is *proved* — peer allowlist plus
+  a constant-time shared-secret header — before any forwarded header is read.
+  A non-loopback listener is refused unless that boundary and an enabled
+  principal both exist.
+- Secrets in a `0600`-enforced file with per-key environment override, which is
+  what makes per-camera credentials expressible. File *ownership* is not
+  enforced; that belongs with the blocked packaging work.
+- Access audit covering authentication, authorization, camera lifecycle, export,
+  and identity changes, with database-enforced categories and fingerprints
+  rather than values.
+- `cargo deny` and `cargo audit` in `make check`.
 
 Not yet implemented, and not to be described as working:
 
@@ -72,10 +98,11 @@ Not yet implemented, and not to be described as working:
   fixture. No accuracy claim is supported.
 - There is no durable event log. ADR 002 defers persistence and replay to
   explicit adapters and reconstructs lifecycle facts from indexed state.
-- No authentication or authorization exists. The API is loopback-only and
-  LiveKit viewer tokens are labeled development-only. Phases 7 and 8 have not
-  started, so persistent configuration APIs, ROI, rules, TLS, audit logging, and
-  packaging are absent.
+- ROI, rules, and analytics remain absent, blocked on product semantics.
+- No packaging, and no deployment/upgrade/rollback/backup runbooks: the
+  deployment target is unconfirmed and ADR 009 declines to guess one.
+- Alert rules exist but have never been executed against an evaluator, and no
+  fuzzing exists. Neither is to be described as tested.
 
 ### The prototype
 

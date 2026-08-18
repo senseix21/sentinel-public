@@ -35,7 +35,12 @@ scripts/phase0/retina-rtsp-fixture.sh    # needs MediaMTX (also `make fixture`)
 scripts/phase3/multi-camera-fixture.sh   # ten synthetic sources
 scripts/phase4/postgres-fixture.sh       # needs PostgreSQL
 scripts/phase5/livekit-fixture.sh        # needs a LiveKit server
+scripts/phase7/config-fixture.sh         # needs PostgreSQL
+scripts/phase8/security-fixture.sh       # needs PostgreSQL, cargo-deny, cargo-audit
 ```
+
+`make check` includes `make audit` (`cargo deny check`, `cargo audit`), which
+needs both tools installed.
 
 Local media loop: `make mediamtx`, then `make webcam`, then `make server`, then
 `make health` / `make verify-recordings`.
@@ -51,12 +56,31 @@ claim. `ROADMAP.md` is the authority on per-phase status.
 | Path | State |
 |---|---|
 | `apps/server` | The runnable binary. Pipeline wiring, HTTP health/metrics/API, retention owner. Largest crate. |
-| `crates/camera` `media` `recorder` `storage` `database` `events` `detector` `livekit` `config` `common` | Real implementations. |
+| `crates/camera` `media` `recorder` `storage` `database` `events` `detector` `livekit` `config` `common` `auth` | Real implementations. `auth` (Phase 8) owns principals, roles, camera scope, and bearer-token verification. |
 | `crates/api` `analytics` `rules`, `apps/worker` | Empty stubs. The HTTP surface is in `apps/server/src/health_http.rs`, not `crates/api`. |
+| `apps/server/ui/dashboard.html` | The operator dashboard. One self-contained file, `include_str!`d and served at `/` and `/ui`. No build step and no external request — do not introduce either. Contract in `docs/phase-8/ui-spec.md`. |
 | `src/` | The original `cam_rtsp` prototype. Reference only — not an architectural constraint. |
 | `docs/adr/` | Accepted decisions. Outrank this file and `analysis.md`. |
 | `docs/phase-N/` | Per-phase contracts and evidence. |
 | `context/YYYY-MM-DD[-HHMM]/` | Dated session snapshots; `context/README.md` points at the latest. |
+
+Since Phase 8 the API is authenticated. Every protected route passes through
+`apps/server/src/authorize.rs`, and `Authorized` has no public constructor, so a
+handler that skips the check does not compile. A deployment with no identity
+store grants a conspicuous `principal:service:loopback-development` identity to
+loopback callers only — that posture is safe *only* because a routable listener
+is refused without both a trust boundary and an enabled principal. Do not relax
+one of those without the other.
+
+Live publication decodes and re-encodes (ADR 012). Encoded pass-through exists in
+`crates/livekit/src/native.rs` and cannot run on Apple targets (ADR 011
+Decision 5); `apps/server/src/pipeline.rs` selects
+`TranscodePublicationAdapter` instead. Two properties are easy to break: nothing
+decodes while `surveillance_livekit_viewers` is 0, and it is an adapter behind
+the existing `PublicationAdapter` seam rather than a second pipeline. Adding a
+camera-count or latency claim to this path needs measurements it does not have —
+it reports `TimestampAuthority::AdapterClock` precisely so that no latency number
+can be inferred from it.
 
 Detection currently runs `DeterministicFakeInference` — the only implementation
 of the `PersonInference` trait. There is no production model. Do not describe
