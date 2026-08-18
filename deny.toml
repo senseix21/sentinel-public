@@ -1,0 +1,74 @@
+# Phase 8 (P8.10): dependency policy.
+#
+# Run by `make check` and `make audit`. Two questions this file answers:
+#
+#   1. Are we shipping a dependency with a known advisory?
+#   2. Are we shipping a licence we have not agreed to?
+#
+# Both are checked in the gate rather than reviewed periodically, because a
+# periodic review is a review that stops happening.
+#
+# System libraries are NOT covered here. FFmpeg and the RTSP stack are the
+# highest-value attack surface in this system (see docs/phase-8/threat-model.md
+# boundary B1) and cargo has no visibility into them; their patching policy is
+# documented in docs/phase-8/dependency-policy.md.
+
+[graph]
+all-features = true
+
+[advisories]
+# Fail on any advisory. `unmaintained` is a warning rather than a failure
+# because "no longer maintained" is not by itself an exploitable condition, and
+# treating it as one trains people to add ignores.
+yanked = "deny"
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+# Permissive licences only. This is a self-hosted product; a copyleft
+# dependency is a decision that needs making deliberately, not one that should
+# arrive with a `cargo update`.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    # webpki-roots, via sqlx: the Mozilla CA certificate bundle. A permissive
+    # *data* licence rather than a code one, which is why it is not on the
+    # usual list. Allowed deliberately, not to make the gate go green.
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate versions are a warning, not a failure. In a tree this size a
+# transitive duplicate is common and usually harmless; making it fatal would
+# mean pinning other people's dependency graphs.
+multiple-versions = "warn"
+wildcards = "deny"
+# The workspace's own crates are path dependencies and so carry no version.
+# Without this every `crates/*` entry is reported as a wildcard, which would
+# make the check useless noise rather than a control on external crates.
+allow-wildcard-paths = true
+
+# Crates that must never appear. Each needs a reason.
+deny = [
+    # A TLS stack we have not chosen. ADR 009 Decision 3 puts TLS termination
+    # in the reverse proxy; an in-process OpenSSL arriving transitively would
+    # be an unreviewed change to that decision.
+    { name = "openssl-sys", reason = "TLS terminates at the proxy (ADR 009); no in-process OpenSSL" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
