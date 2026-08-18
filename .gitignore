@@ -4,3 +4,13 @@ auto.key
 auto.crt
 Multi-Camera_Security_
 .serena/
+
+# `make run` state: a development PostgreSQL cluster, generated LiveKit
+# config and per-run logs. None of it is an artifact of the build.
+/.local/
+# Recordings written by `make run` and `make server`. Real media, not source.
+/recordings/
+
+# Browser automation and manual screenshot artifacts.
+/.playwright-mcp/
+/makerun-live.png
