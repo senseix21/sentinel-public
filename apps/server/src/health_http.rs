@@ -861,12 +861,44 @@ const DEFAULT_MAX_REQUEST_BYTES: usize = 16 * 1024;
 const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_PLAYBACK_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The operator dashboard, compiled into the binary.
+/// One allowlisted operator-UI asset compiled into the binary.
 ///
-/// `include_str!` rather than a served directory: there is one artifact to ship,
-/// nothing to path-traverse, and the page cannot drift from the API it was
-/// written against — a mismatch would be a build failure, not a broken screen.
-const DASHBOARD: &str = include_str!("../ui/dashboard.html");
+/// Request paths are data, not filesystem paths. The router performs an exact
+/// lookup in [`UI_ASSETS`]; it never joins, decodes, or reads a caller-supplied
+/// path from disk.
+#[derive(Clone, Copy)]
+struct UiAsset {
+    path: &'static str,
+    content_type: &'static str,
+    body: &'static str,
+}
+
+const fn ui_asset(path: &'static str, content_type: &'static str, body: &'static str) -> UiAsset {
+    UiAsset {
+        path,
+        content_type,
+        body,
+    }
+}
+
+const HTML: &str = "text/html; charset=utf-8";
+const CSS: &str = "text/css; charset=utf-8";
+const JAVASCRIPT: &str = "application/javascript; charset=utf-8";
+const INDEX_HTML: &str = include_str!("../ui/index.html");
+// Transitional test corpus while the remaining byte-inspection tests are
+// replaced with route and executable JavaScript tests.
+#[cfg(test)]
+const DASHBOARD: &str = concat!(
+    include_str!("../ui/index.html"),
+    include_str!("../ui/js/app.js"),
+    include_str!("../ui/js/api.js"),
+    include_str!("../ui/js/formatting.js"),
+    include_str!("../ui/js/metrics.js"),
+    include_str!("../ui/js/playback.js"),
+    include_str!("../ui/js/router.js"),
+    include_str!("../ui/js/state.js"),
+    include_str!("../ui/js/theme.js"),
+);
 
 /// The `LiveKit` browser SDK, compiled into the binary for the same reasons.
 ///
@@ -880,6 +912,78 @@ const DASHBOARD: &str = include_str!("../ui/dashboard.html");
 ///
 /// Provenance, version, and hash are recorded in `ui/vendor/README.md`.
 const LIVEKIT_CLIENT: &str = include_str!("../ui/vendor/livekit-client.umd.js");
+
+const UI_ASSETS: &[UiAsset] = &[
+    ui_asset("/", HTML, INDEX_HTML),
+    ui_asset("/ui", HTML, INDEX_HTML),
+    ui_asset(
+        "/ui/styles/base.css",
+        CSS,
+        include_str!("../ui/styles/base.css"),
+    ),
+    ui_asset(
+        "/ui/styles/layout.css",
+        CSS,
+        include_str!("../ui/styles/layout.css"),
+    ),
+    ui_asset(
+        "/ui/styles/components.css",
+        CSS,
+        include_str!("../ui/styles/components.css"),
+    ),
+    ui_asset(
+        "/ui/styles/screens.css",
+        CSS,
+        include_str!("../ui/styles/screens.css"),
+    ),
+    ui_asset("/ui/js/app.js", JAVASCRIPT, include_str!("../ui/js/app.js")),
+    ui_asset("/ui/js/api.js", JAVASCRIPT, include_str!("../ui/js/api.js")),
+    ui_asset(
+        "/ui/js/formatting.js",
+        JAVASCRIPT,
+        include_str!("../ui/js/formatting.js"),
+    ),
+    ui_asset(
+        "/ui/js/metrics.js",
+        JAVASCRIPT,
+        include_str!("../ui/js/metrics.js"),
+    ),
+    ui_asset(
+        "/ui/js/playback.js",
+        JAVASCRIPT,
+        include_str!("../ui/js/playback.js"),
+    ),
+    ui_asset(
+        "/ui/js/router.js",
+        JAVASCRIPT,
+        include_str!("../ui/js/router.js"),
+    ),
+    ui_asset(
+        "/ui/js/state.js",
+        JAVASCRIPT,
+        include_str!("../ui/js/state.js"),
+    ),
+    ui_asset(
+        "/ui/js/theme.js",
+        JAVASCRIPT,
+        include_str!("../ui/js/theme.js"),
+    ),
+    ui_asset(
+        "/ui/js/components/banner.js",
+        JAVASCRIPT,
+        include_str!("../ui/js/components/banner.js"),
+    ),
+    ui_asset(
+        "/ui/js/components/empty-state.js",
+        JAVASCRIPT,
+        include_str!("../ui/js/components/empty-state.js"),
+    ),
+    ui_asset("/ui/livekit-client.js", JAVASCRIPT, LIVEKIT_CLIENT),
+];
+
+fn find_ui_asset(path: &str) -> Option<UiAsset> {
+    UI_ASSETS.iter().copied().find(|asset| asset.path == path)
+}
 
 /// Reads the request bounds for this request.
 ///
@@ -1612,6 +1716,12 @@ async fn route_with_recordings(
         audit: access_audit,
     };
 
+    if method == "GET" {
+        if let Some(asset) = find_ui_asset(path) {
+            return response("200 OK", asset.content_type, asset.body);
+        }
+    }
+
     match (method, path) {
         // The dashboard shell, served without an `Authorized` for the same
         // reason as the three below it (ADR 009 Decision 2): it is a
@@ -1622,16 +1732,6 @@ async fn route_with_recordings(
         // It must also be reachable by a caller this system will refuse, or an
         // unprovisioned person would meet a raw JSON `401` instead of the
         // screen that explains signing in again cannot help them.
-        ("GET", "/" | "/ui") => response("200 OK", "text/html; charset=utf-8", DASHBOARD),
-        // The player's SDK, on the same terms as the shell above: a
-        // compile-time constant, byte-identical for every caller, naming
-        // nothing. It is inert without a viewer token, and a viewer token is
-        // issued only through an authenticated, camera-scoped call.
-        ("GET", "/ui/livekit-client.js") => response(
-            "200 OK",
-            "application/javascript; charset=utf-8",
-            LIVEKIT_CLIENT,
-        ),
         ("GET", "/live") => response("200 OK", "text/plain; charset=utf-8", "live\n"),
         ("GET", "/ready") => {
             readiness_response(&registry.snapshots(), recordings, metadata, phase4).await
