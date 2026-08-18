@@ -320,6 +320,45 @@ Use logical camera-scoped resources under `/api`; do not expose storage paths or
 
 An API bound beyond loopback requires an explicit authentication, authorization, TLS/proxy, and secret-management decision. Development-only insecure behavior must be opt-in and visibly labeled. Avoid returning raw internal errors.
 
+### Protocol strategy and gRPC decision gate
+
+Do not replace the external HTTP API with gRPC. HTTP/JSON remains the
+operator/browser control API; HTTP streaming remains the recording playback and
+download transport; `/live`, `/ready`, and `/metrics` remain ordinary HTTP; and
+LiveKit/WebRTC remains the browser live-video path. Browser compatibility,
+standard proxy behavior, debuggability, and streaming semantics matter more at
+these boundaries than protobuf encoding cost. API serialization is not a
+credible camera-scale bottleneck without measurements proving otherwise.
+
+The current code has no project-owned gRPC service. Transitive protobuf support
+inside LiveKit does not make gRPC part of this platform's contract. If the HTTP
+surface outgrows the existing adapter, prefer migrating it behind a mature Rust
+HTTP stack while preserving its domain contracts rather than changing its
+protocol merely to obtain server machinery.
+
+gRPC is reserved for an internal control-plane boundary only after Phase 9
+measurements justify extracting `apps/worker` or another component into a
+separately deployed process. A first gRPC slice must be narrow and deployable,
+such as camera assignment/health or bounded detection work. It requires an ADR
+that records the measured bottleneck, ownership, deadlines, cancellation,
+idempotency and retry rules, ordering, authentication/TLS, message-size bounds,
+failure isolation, operational cost, and reversal criteria.
+
+Generated protobuf types are wire types. Translate them at the adapter boundary;
+do not let them become the domain model in `camera`, `media`, `recorder`,
+`storage`, `events`, or `detector`. Every RPC and stream must have explicit
+concurrency and payload bounds, deadlines, graceful shutdown, bounded-cardinality
+metrics, and tests for unavailable peers, duplicate delivery after timeout, slow
+consumers, malformed/oversized messages, and reconnect.
+
+Do not use ordinary gRPC as the media plane. RTSP owns camera ingest, WebRTC owns
+interactive live delivery, and HTTP owns playback. Encoded packets and decoded
+frames stay with the singular camera/media owner unless a measured topology
+constraint and an ADR justify a purpose-built cross-process media transport.
+Introducing gRPC must not create a second upstream camera connection, move media
+onto the domain event bus, or turn local bounded backpressure into an unbounded
+network queue.
+
 ## Observability and Operations
 
 Use structured tracing with camera, stream, recording, and request identifiers. Log state transitions and actionable failures, not every media item. Redact credentials and signed tokens.
