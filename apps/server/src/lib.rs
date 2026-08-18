@@ -1,5 +1,6 @@
 //! Application-level ownership and shutdown policy.
 
+pub mod authenticate;
 pub mod authorize;
 pub mod camera_supervisor;
 pub mod health_http;
@@ -11,4 +12,6 @@ pub mod playback;
 pub mod reconciliation_owner;
 pub mod retention_owner;
 pub mod runtime_config;
+pub mod security_config;
 pub mod settings_service;
+pub mod trust_boundary;

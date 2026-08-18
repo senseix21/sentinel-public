@@ -151,16 +151,28 @@ camera cardinality is already bounded by `supervision.maximum_cameras`.
 | `camera.livekit.api_key` | `Secret<String>` | `PipelineRestart` | **Secret** |
 | `camera.livekit.api_secret` | `Secret<String>` | `PipelineRestart` | **Secret** |
 | `camera.livekit.deployment_namespace` | `String` | `PipelineRestart` | Public |
-| `camera.livekit.cli_path` | `PathBuf` | `PipelineRestart` | Public |
-| `camera.livekit.cli_version` | `String` | `PipelineRestart` | Public |
 | `camera.livekit.queue_items` | `usize` | `PipelineRestart` | Public |
 | `camera.livekit.max_lag` | `Duration` | `PipelineRestart` | Public |
 | `camera.livekit.max_access_unit_bytes` | `usize` | `PipelineRestart` | Public |
-| `camera.livekit.ipc_write_timeout` | `Duration` | `PipelineRestart` | Public |
 | `camera.livekit.shutdown_timeout` | `Duration` | `PipelineRestart` | Public |
 | `camera.livekit.reconnect_initial` | `Duration` | `PipelineRestart` | Public |
 | `camera.livekit.reconnect_maximum` | `Duration` | `PipelineRestart` | Public |
 | `camera.livekit.reconnect_stable_reset` | `Duration` | `PipelineRestart` | Public |
+| `camera.livekit.decoder` | `PathBuf` | `PipelineRestart` | Public |
+| `camera.livekit.max_publish_height` | `u32` | `PipelineRestart` | Public |
+
+Amended 2026-08-16: `camera.livekit.cli_path`, `camera.livekit.cli_version` and
+`camera.livekit.ipc_write_timeout` were removed with the child-process publisher
+they described (ADR 011). The settings cache treats a persisted key it cannot
+classify as corruption, so the rows are deleted — and audited — by migration
+`0005_retire_livekit_cli_settings.sql` rather than left behind.
+
+Amended 2026-08-17: `camera.livekit.decoder` and `camera.livekit.max_publish_height`
+were added with the transcoding publisher (ADR 012). Both are additions, so no
+migration is needed — an absent key falls back to its versioned default, and the
+cache only rejects a key it cannot classify.
+`max_publish_height` is the one knob that trades published resolution for CPU;
+`0` means publish the camera's own height.
 
 `camera_id` is not in the table. It is the scope key, not a setting; changing it
 would create a different camera, which is a lifecycle operation the existing

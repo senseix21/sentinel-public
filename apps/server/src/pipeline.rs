@@ -26,8 +26,8 @@ use surveillance_events::{
     },
 };
 use surveillance_livekit::{
-    adapter::CliPublicationAdapter,
     owner::{LivePublicationOwner, PublicationHealth},
+    transcode::TranscodePublicationAdapter,
 };
 use surveillance_media::distribution::MediaDistributor;
 use surveillance_media::frame::FrameLimits;
@@ -61,6 +61,7 @@ pub enum ActionableFailure {
 pub enum CameraPipelineError {
     Reconciliation,
     DetectionConfiguration,
+    PublicationConfiguration,
     JoinCancelled,
     JoinPanicked,
 }
@@ -70,6 +71,7 @@ impl fmt::Display for CameraPipelineError {
         formatter.write_str(match self {
             Self::Reconciliation => "camera recording reconciliation discovery failed",
             Self::DetectionConfiguration => "camera detection configuration is invalid",
+            Self::PublicationConfiguration => "camera live publication configuration is invalid",
             Self::JoinCancelled => "camera pipeline task was cancelled",
             Self::JoinPanicked => "camera pipeline task panicked",
         })
@@ -142,7 +144,23 @@ impl CameraPipeline {
             (None, DetectionHealth::disabled())
         };
         let (publication_task, publication_health) = if let Some(livekit) = config.livekit.clone() {
-            let adapter = CliPublicationAdapter::new(livekit.clone());
+            // A publisher that cannot mint its own token will never publish.
+            // Reporting that at startup is better than a camera whose live
+            // view silently never appears.
+            //
+            // The transcoding adapter, not the encoded pass-through one:
+            // pass-through crashes the process on Apple platforms and selects
+            // the wrong encoder everywhere else (ADR 011 Decision 5, corrected;
+            // ADR 012). `NativePublicationAdapter` is kept, not deleted, so the
+            // reversal criterion in ADR 012 is a constructor change here.
+            //
+            // Nothing decodes until a viewer joins the room, so a deployment
+            // with no operator watching pays nothing for this.
+            let adapter = TranscodePublicationAdapter::new(
+                &livekit,
+                TranscodePublicationAdapter::DEFAULT_TOKEN_TTL,
+            )
+            .map_err(|_| CameraPipelineError::PublicationConfiguration)?;
             let (owner, health) = LivePublicationOwner::new(livekit, adapter, subscriptions.live);
             (Some(owner), health)
         } else {

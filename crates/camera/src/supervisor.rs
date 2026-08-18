@@ -326,7 +326,15 @@ pub async fn run_h264_camera_observed<J: JitterSource>(
                     let report = distributor.publish(Arc::new(access_unit));
                     counters.access_units = counters.access_units.saturating_add(1);
                     health.access_unit();
-                    if report.live == PublishOutcome::ReplacedOldest {
+                    // Both live outcomes mean the live consumer did not get this
+                    // access unit: one evicted older items to take it, the other
+                    // withheld it to keep the consumer's run decodable. The
+                    // per-queue counters separate them; this one counts the
+                    // camera-visible fact that live is not keeping up.
+                    if matches!(
+                        report.live,
+                        PublishOutcome::ReplacedOldest | PublishOutcome::DroppedUndecodable
+                    ) {
                         counters.live_evictions = counters.live_evictions.saturating_add(1);
                         health.live_eviction();
                     }

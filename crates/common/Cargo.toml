@@ -4,9 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+# Internal to this workspace; never published to a registry.
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
 serde.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+toml.workspace = true

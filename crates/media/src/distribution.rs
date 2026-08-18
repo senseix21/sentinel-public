@@ -53,6 +53,18 @@ impl fmt::Display for QueueCapacityError {
 
 impl Error for QueueCapacityError {}
 
+/// Media whose retention under overload depends on what can be decoded without it.
+///
+/// A freshness-oriented queue that evicts purely by age can strand the items it
+/// keeps: an inter-coded picture whose reference was discarded is not merely
+/// late, it is undecodable, and a decoder handed one emits whatever its frame
+/// buffer already held. The queue therefore has to know which items begin a run
+/// that a consumer can decode on its own.
+pub trait DecodableRunStart {
+    /// Whether this item can begin a decodable run without any earlier item.
+    fn starts_decodable_run(&self) -> bool;
+}
+
 /// The result of publishing to one consumer queue.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublishOutcome {
@@ -62,6 +74,9 @@ pub enum PublishOutcome {
     Full,
     /// The live queue discarded its oldest item and accepted the new item.
     ReplacedOldest,
+    /// The live queue dropped this item because delivering it would have
+    /// handed the consumer a picture whose reference it never received.
+    DroppedUndecodable,
     /// The consumer has been dropped and cannot receive more items.
     Closed,
 }
@@ -103,6 +118,12 @@ pub struct QueueMetrics {
     pub rejected_full: u64,
     /// Old items evicted to preserve live freshness.
     pub dropped_oldest: u64,
+    /// Items withheld because the consumer could not have decoded them.
+    ///
+    /// A sustained nonzero rate here means the live consumer is slower than the
+    /// source: the queue is holding a decodable backlog and waiting for the next
+    /// run start rather than emitting pictures that would decode to nothing.
+    pub dropped_undecodable: u64,
     /// Retained items discarded when the consumer closed.
     pub dropped_on_close: u64,
     /// Whether the consumer can still receive publications.
@@ -201,14 +222,21 @@ impl<T> MediaDistributor<T> {
         )
     }
 
-    /// Attempts delivery to both consumers without waiting for either one.
+    /// Attempts delivery to every consumer without waiting for any of them.
     ///
     /// Recorder overflow preserves the existing backlog and returns
-    /// [`PublishOutcome::Full`]. Live overflow evicts that queue's oldest item
-    /// and returns [`PublishOutcome::ReplacedOldest`].
-    pub fn publish(&self, item: Arc<T>) -> PublishReport {
+    /// [`PublishOutcome::Full`]. Live overflow prefers freshness but will not
+    /// break the consumer's decodable run: it evicts to the newest run start
+    /// where it can, returning [`PublishOutcome::ReplacedOldest`], and
+    /// otherwise withholds the item as [`PublishOutcome::DroppedUndecodable`]
+    /// until the next run start arrives. Detection keeps plain age-ordered
+    /// eviction; it owns its own sampling policy.
+    pub fn publish(&self, item: Arc<T>) -> PublishReport
+    where
+        T: DecodableRunStart,
+    {
         let recorder = self.recorder.send_preserving_backlog(Arc::clone(&item));
-        let live = self.live.send_latest(Arc::clone(&item));
+        let live = self.live.send_latest_decodable(Arc::clone(&item));
         let detection = self.detection.send_latest(item);
 
         PublishReport {
@@ -380,6 +408,65 @@ impl<T> QueueSender<T> {
         }
     }
 
+    /// Freshness-oriented delivery that keeps what it delivers decodable.
+    ///
+    /// Age-ordered eviction alone is unsound for a consumer that decodes: it
+    /// discards the reference and keeps the pictures that depend on it. This
+    /// preserves one invariant instead — every item handed to the consumer is
+    /// either a run start, or immediately follows an item the consumer also
+    /// received. Freshness is still preferred wherever it can be had without
+    /// breaking that invariant.
+    fn send_latest_decodable(&self, item: Arc<T>) -> PublishOutcome
+    where
+        T: DecodableRunStart,
+    {
+        let mut state = lock_recover(&self.queue);
+        if !state.consumer_open {
+            return PublishOutcome::Closed;
+        }
+
+        let starts_run = item.starts_decodable_run();
+        let full = state.items.len() >= state.capacity;
+
+        if !starts_run && (state.run_broken || full) {
+            // Either the run is already broken, or evicting to make room would
+            // break it. Hold the decodable backlog and resynchronise at the
+            // next run start rather than emit pictures that decode to nothing.
+            state.run_broken = true;
+            state.dropped_undecodable = state.dropped_undecodable.saturating_add(1);
+            return PublishOutcome::DroppedUndecodable;
+        }
+
+        if full {
+            // `item` starts its own run, so the queue may be shortened. Evict
+            // the smallest prefix that still leaves a run start at the head.
+            let _ = state.items.pop_front();
+            state.dropped_oldest = state.dropped_oldest.saturating_add(1);
+            while state
+                .items
+                .front()
+                .is_some_and(|head| !head.starts_decodable_run())
+            {
+                let _ = state.items.pop_front();
+                state.dropped_oldest = state.dropped_oldest.saturating_add(1);
+            }
+        }
+
+        if starts_run {
+            state.run_broken = false;
+        }
+        state.items.push_back(item);
+        state.accepted = state.accepted.saturating_add(1);
+        drop(state);
+        self.signal_change();
+
+        if full {
+            PublishOutcome::ReplacedOldest
+        } else {
+            PublishOutcome::Accepted
+        }
+    }
+
     fn metrics(&self) -> QueueMetrics {
         QueueState::metrics(&lock_recover(&self.queue))
     }
@@ -402,9 +489,15 @@ struct QueueState<T> {
     received: u64,
     rejected_full: u64,
     dropped_oldest: u64,
+    dropped_undecodable: u64,
     dropped_on_close: u64,
     consumer_open: bool,
     producer_open: bool,
+    /// Set when an eviction would have left a gap in the delivered run. While
+    /// it is set the queue accepts only items that start their own run, so a
+    /// consumer never receives a picture whose predecessor it never saw.
+    /// Starts set: nothing has been delivered yet, so no run is established.
+    run_broken: bool,
 }
 
 impl<T> QueueState<T> {
@@ -416,9 +509,11 @@ impl<T> QueueState<T> {
             received: 0,
             rejected_full: 0,
             dropped_oldest: 0,
+            dropped_undecodable: 0,
             dropped_on_close: 0,
             consumer_open: true,
             producer_open: true,
+            run_broken: true,
         }
     }
 
@@ -430,6 +525,7 @@ impl<T> QueueState<T> {
             received: self.received,
             rejected_full: self.rejected_full,
             dropped_oldest: self.dropped_oldest,
+            dropped_undecodable: self.dropped_undecodable,
             dropped_on_close: self.dropped_on_close,
             consumer_open: self.consumer_open,
             producer_open: self.producer_open,
@@ -447,9 +543,144 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MediaDistributor, PublishOutcome, QueueCapacity, QueueCapacityError, ReceiveOutcome,
+        DecodableRunStart, MediaDistributor, PublishOutcome, QueueCapacity, QueueCapacityError,
+        ReceiveOutcome,
     };
     use std::sync::Arc;
+
+    /// The overload tests below are about capacity and ownership, not about
+    /// codec structure, so their items are all independently decodable. That
+    /// keeps them exercising exactly the age-ordered behaviour they were
+    /// written for; the decodability rule is tested separately against items
+    /// that are not.
+    impl DecodableRunStart for u64 {
+        fn starts_decodable_run(&self) -> bool {
+            true
+        }
+    }
+
+    /// An item that carries whether a consumer could decode it on its own.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct Coded {
+        id: u64,
+        run_start: bool,
+    }
+
+    impl Coded {
+        const fn start(id: u64) -> Self {
+            Self {
+                id,
+                run_start: true,
+            }
+        }
+        const fn delta(id: u64) -> Self {
+            Self {
+                id,
+                run_start: false,
+            }
+        }
+    }
+
+    impl DecodableRunStart for Coded {
+        fn starts_decodable_run(&self) -> bool {
+            self.run_start
+        }
+    }
+
+    fn drain(subscriber: &super::MediaSubscriber<Coded>) -> Vec<Coded> {
+        let mut received = Vec::new();
+        loop {
+            match subscriber.try_receive() {
+                ReceiveOutcome::Item(item) => received.push(*item),
+                ReceiveOutcome::Empty | ReceiveOutcome::Closed => return received,
+            }
+        }
+    }
+
+    #[test]
+    fn the_live_queue_never_delivers_a_picture_whose_reference_it_dropped() {
+        let (distributor, subscriptions) = MediaDistributor::<Coded>::new(capacity(8), capacity(4));
+
+        // Deltas before any run start cannot be decoded by a joining consumer.
+        assert_eq!(
+            distributor.publish(Arc::new(Coded::delta(0))).live,
+            PublishOutcome::DroppedUndecodable
+        );
+
+        assert_eq!(
+            distributor.publish(Arc::new(Coded::start(1))).live,
+            PublishOutcome::Accepted
+        );
+        for id in 2..=4 {
+            assert_eq!(
+                distributor.publish(Arc::new(Coded::delta(id))).live,
+                PublishOutcome::Accepted
+            );
+        }
+
+        // The queue is now full of one contiguous run. Evicting to make room
+        // would strand everything that follows the evicted item, so the new
+        // delta is withheld instead.
+        for id in 5..=7 {
+            assert_eq!(
+                distributor.publish(Arc::new(Coded::delta(id))).live,
+                PublishOutcome::DroppedUndecodable
+            );
+        }
+
+        // A run start resynchronises: it needs nothing earlier, so the stale
+        // run is evicted for it.
+        assert_eq!(
+            distributor.publish(Arc::new(Coded::start(8))).live,
+            PublishOutcome::ReplacedOldest
+        );
+        assert_eq!(
+            distributor.publish(Arc::new(Coded::delta(9))).live,
+            PublishOutcome::Accepted
+        );
+
+        let delivered = drain(&subscriptions.live);
+        assert_eq!(
+            delivered,
+            vec![Coded::start(8), Coded::delta(9)],
+            "the consumer receives a contiguous run beginning at a run start"
+        );
+
+        let metrics = subscriptions.live.metrics();
+        assert_eq!(metrics.dropped_undecodable, 4);
+        assert_eq!(metrics.dropped_oldest, 4);
+    }
+
+    #[test]
+    fn eviction_stops_at_the_newest_run_start_rather_than_dropping_one_item() {
+        let (distributor, subscriptions) = MediaDistributor::<Coded>::new(capacity(8), capacity(4));
+
+        for item in [
+            Coded::start(1),
+            Coded::delta(2),
+            Coded::start(3),
+            Coded::delta(4),
+        ] {
+            assert_eq!(
+                distributor.publish(Arc::new(item)).live,
+                PublishOutcome::Accepted
+            );
+        }
+
+        // Full. The incoming run start makes room by discarding the prefix up
+        // to the newest retained run start, not just the single oldest item,
+        // because item 2 cannot be decoded once item 1 is gone.
+        assert_eq!(
+            distributor.publish(Arc::new(Coded::start(5))).live,
+            PublishOutcome::ReplacedOldest
+        );
+
+        assert_eq!(
+            drain(&subscriptions.live),
+            vec![Coded::start(3), Coded::delta(4), Coded::start(5)]
+        );
+        assert_eq!(subscriptions.live.metrics().dropped_oldest, 2);
+    }
 
     fn capacity(value: usize) -> QueueCapacity {
         QueueCapacity::new(value).unwrap_or_else(|error| panic!("valid test capacity: {error}"))

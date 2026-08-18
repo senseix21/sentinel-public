@@ -37,10 +37,27 @@ impl PublicationState {
                     S::Connecting,
                     S::Publishing | S::Backoff | S::Terminal | S::Stopping
                 )
-                | (S::Publishing, S::Degraded | S::Backoff | S::Stopping)
+                // Publishing reaches Terminal when the adapter refuses in a way
+                // reconnecting cannot change. That edge did not exist while the
+                // only non-retryable failures were raised at connect time; a
+                // publisher that has already sent access units can still meet
+                // one on the send path.
+                | (
+                    S::Publishing,
+                    S::Degraded | S::Backoff | S::Terminal | S::Stopping
+                )
+                // Degraded returns to Publishing when the session resynchronises
+                // within itself, which a media-timeline discontinuity does: the
+                // next parameterised keyframe establishes a fresh pacing origin
+                // and publication continues on the same connection.
+                //
+                // Without this edge Degraded is a one-way door, and the state
+                // would stay Degraded for the life of the connection after the
+                // first camera reconnect — a signal an operator learns to ignore
+                // is no better than the `Publishing` this replaced.
                 | (
                     S::Degraded,
-                    S::Backoff | S::Connecting | S::Terminal | S::Stopping
+                    S::Publishing | S::Backoff | S::Connecting | S::Terminal | S::Stopping
                 )
                 | (S::Backoff, S::Connecting | S::Terminal | S::Stopping)
                 | (S::Terminal, S::Stopping | S::Stopped)
@@ -64,7 +81,6 @@ pub enum PublicationFailureCategory {
     TimestampDiscontinuity,
     MalformedMedia,
     OversizedMedia,
-    ChildExited,
     Shutdown,
 }
 

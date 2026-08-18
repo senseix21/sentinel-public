@@ -91,9 +91,16 @@ fn rtp_payloads_cross_one_ingest_distribution_and_recorder_path() {
     assert_eq!(recorder.sink().keyframes, [true, false]);
     assert_eq!(recorder.metrics().written, 2);
 
-    // Live was intentionally never drained. Its private freshness loss did not
-    // prevent recorder delivery.
+    // Live was intentionally never drained. Its private loss did not prevent
+    // recorder delivery: the recorder still wrote both access units above.
+    //
+    // With a live capacity of one, the second access unit is a non-IDR slice
+    // that only decodes against the keyframe already queued. Evicting the
+    // keyframe for it would leave the live consumer holding a picture it cannot
+    // decode, so the queue keeps the keyframe and withholds the delta until the
+    // next run start.
     let live_metrics = subscriptions.live.metrics();
-    assert_eq!(live_metrics.accepted, 2);
-    assert_eq!(live_metrics.dropped_oldest, 1);
+    assert_eq!(live_metrics.accepted, 1);
+    assert_eq!(live_metrics.dropped_oldest, 0);
+    assert_eq!(live_metrics.dropped_undecodable, 1);
 }

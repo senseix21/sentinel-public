@@ -120,6 +120,13 @@ fn global_operational(layer: &mut Layer) {
         SettingId::ApiIoTimeout,
         SettingValue::Duration(Duration::from_secs(5)),
     );
+    // Sixty seconds is a reversible guess, not a measurement: it is longer than
+    // any media buffer observed in a browser here and short enough that a client
+    // that has actually gone away releases its assembler child within a minute.
+    set(
+        SettingId::ApiPlaybackStallTimeout,
+        SettingValue::Duration(Duration::from_secs(60)),
+    );
     set(
         SettingId::RetentionMaxAge,
         SettingValue::Duration(Duration::from_secs(30 * 24 * 60 * 60)),
@@ -312,14 +319,6 @@ fn camera_detection(layer: &mut Layer) {
 fn camera_livekit(layer: &mut Layer) {
     let mut set = |id, value| put(layer, id, value);
     set(
-        SettingId::CameraLiveKitCliPath,
-        SettingValue::Path(PathBuf::from("lk")),
-    );
-    set(
-        SettingId::CameraLiveKitCliVersion,
-        SettingValue::Text("2.4.14".to_owned()),
-    );
-    set(
         SettingId::CameraLiveKitQueueItems,
         SettingValue::Unsigned(8),
     );
@@ -330,10 +329,6 @@ fn camera_livekit(layer: &mut Layer) {
     set(
         SettingId::CameraLiveKitMaxAccessUnitBytes,
         SettingValue::Unsigned(2 * 1024 * 1024),
-    );
-    set(
-        SettingId::CameraLiveKitIpcWriteTimeout,
-        SettingValue::Duration(Duration::from_secs(2)),
     );
     set(
         SettingId::CameraLiveKitShutdownTimeout,
@@ -350,6 +345,17 @@ fn camera_livekit(layer: &mut Layer) {
     set(
         SettingId::CameraLiveKitReconnectStableReset,
         SettingValue::Duration(Duration::from_secs(30)),
+    );
+    set(
+        SettingId::CameraLiveKitDecoder,
+        SettingValue::Path(PathBuf::from("ffmpeg")),
+    );
+    // No ceiling by default. Choosing a viewing resolution is a product
+    // decision; capping silently would publish something the operator never
+    // asked for, and uncapped is at least the honest reading of the stream.
+    set(
+        SettingId::CameraLiveKitMaxPublishHeight,
+        SettingValue::Unsigned(0),
     );
 }
 

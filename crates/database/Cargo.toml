@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+# Internal to this workspace; never published to a registry.
+publish = false
 
 [lints]
 workspace = true
@@ -11,6 +13,7 @@ workspace = true
 [dependencies]
 chrono.workspace = true
 sqlx.workspace = true
+surveillance-auth = { path = "../auth" }
 surveillance-common = { path = "../common" }
 surveillance-config = { path = "../config" }
 surveillance-storage = { path = "../storage" }

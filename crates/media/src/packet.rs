@@ -202,6 +202,16 @@ impl H264AccessUnit {
     }
 }
 
+impl crate::distribution::DecodableRunStart for H264AccessUnit {
+    /// A decoder can start here only on an IDR that also carries the parameter
+    /// sets describing it. A keyframe without them is not self-contained: a
+    /// consumer joining at that point has no sequence or picture parameter set
+    /// to decode it against.
+    fn starts_decodable_run(&self) -> bool {
+        self.is_keyframe() && self.has_parameter_sets()
+    }
+}
+
 /// Incrementally groups depayloaded NAL units using the transport's explicit
 /// end-of-access-unit marker.
 #[derive(Debug, Default)]

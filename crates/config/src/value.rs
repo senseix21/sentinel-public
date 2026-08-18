@@ -413,9 +413,9 @@ mod tests {
             SettingValue::Secret(value) => assert_eq!(value.expose(), " pad "),
             _ => panic!("expected a secret"),
         }
-        let public = SettingValue::parse(SettingId::CameraLiveKitCliVersion, " 1.2.3 ")
+        let public = SettingValue::parse(SettingId::CameraLiveKitEndpoint, " ws://127.0.0.1:7880 ")
             .unwrap_or(SettingValue::Boolean(false));
-        assert_eq!(public.render(), "1.2.3");
+        assert_eq!(public.render(), "ws://127.0.0.1:7880");
     }
 
     #[test]

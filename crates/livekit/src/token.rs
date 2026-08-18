@@ -147,6 +147,100 @@ impl ViewerTokenIssuer {
     }
 }
 
+/// A token for the publisher itself, as distinct from a viewer.
+///
+/// The publisher produces media and consumes none, so this grants publication
+/// into exactly one room and nothing else. A token that could also subscribe
+/// would carry authority the publisher never exercises.
+#[derive(Clone)]
+pub struct PublisherAccess {
+    endpoint: String,
+    token: String,
+}
+
+impl PublisherAccess {
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+    #[must_use]
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+}
+
+impl fmt::Debug for PublisherAccess {
+    /// Deliberately omits the token: it is a bearer credential, and a `Debug`
+    /// impl is exactly the accident that puts one in a log.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublisherAccess")
+            .field("endpoint", &self.endpoint)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Mints the publisher's own room credential.
+#[derive(Clone)]
+pub struct PublisherTokenIssuer {
+    endpoint: String,
+    api_key: String,
+    api_secret: String,
+    ttl: Duration,
+}
+
+impl fmt::Debug for PublisherTokenIssuer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublisherTokenIssuer")
+            .field("endpoint", &self.endpoint)
+            .field("ttl", &self.ttl)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PublisherTokenIssuer {
+    pub fn new(config: &LiveKitConfig, ttl: Duration) -> Result<Self, TokenIssueError> {
+        if ttl < Duration::from_secs(30) || ttl > Duration::from_secs(15 * 60) {
+            return Err(TokenIssueError::InvalidLifetime);
+        }
+        Ok(Self {
+            endpoint: config.endpoint.as_str().to_owned(),
+            api_key: config.credentials.api_key().to_owned(),
+            api_secret: config.credentials.api_secret().to_owned(),
+            ttl,
+        })
+    }
+
+    /// Issues a fresh token for one connection attempt.
+    ///
+    /// The lifetime only has to cover joining, and a reconnect mints another,
+    /// so a short-lived credential costs nothing here.
+    pub fn issue(
+        &self,
+        identity: &PublicationIdentity,
+    ) -> Result<PublisherAccess, TokenIssueError> {
+        let grants = VideoGrants {
+            room_join: true,
+            room: identity.room.as_str().to_owned(),
+            can_publish: true,
+            can_subscribe: false,
+            can_publish_data: false,
+            ..VideoGrants::default()
+        };
+        let token = AccessToken::with_api_key(&self.api_key, &self.api_secret)
+            .with_identity(identity.participant.as_str())
+            .with_grants(grants)
+            .with_ttl(self.ttl)
+            .to_jwt()
+            .map_err(|_| TokenIssueError::Unavailable)?;
+        Ok(PublisherAccess {
+            endpoint: self.endpoint.clone(),
+            token,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TokenIssueError {
     InvalidViewerIdentity,
@@ -168,13 +262,15 @@ mod tests {
         domain::PublicationIdentity,
     };
     use livekit_api::access_token::Claims;
-    use std::{num::NonZeroUsize, path::PathBuf};
+    use std::num::NonZeroUsize;
     use surveillance_common::types::CameraId;
     use url::Url;
 
     fn config() -> LiveKitConfig {
         let camera = CameraId::new("camera-01").unwrap_or_else(|error| panic!("{error}"));
         LiveKitConfig {
+            decoder_program: "ffmpeg".to_owned(),
+            max_publish_height: 0,
             endpoint: Url::parse("ws://127.0.0.1:7880").unwrap_or_else(|error| panic!("{error}")),
             credentials: LiveKitCredentials::new(
                 "devkey".to_owned(),
@@ -184,12 +280,9 @@ mod tests {
             identity: PublicationIdentity::for_camera("test", &camera)
                 .unwrap_or_else(|error| panic!("{error}")),
             deployment_namespace: "test".to_owned(),
-            cli_path: PathBuf::from("lk"),
-            cli_version: "2.18.2".to_owned(),
             queue_items: NonZeroUsize::new(4).unwrap_or(NonZeroUsize::MIN),
             max_lag: Duration::from_secs(1),
             max_access_unit_bytes: NonZeroUsize::new(1024).unwrap_or(NonZeroUsize::MIN),
-            ipc_write_timeout: Duration::from_secs(1),
             shutdown_timeout: Duration::from_secs(1),
             backoff: PublicationBackoff::new(
                 Duration::from_millis(1),

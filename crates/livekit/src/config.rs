@@ -2,7 +2,7 @@
     clippy::missing_errors_doc,
     reason = "typed validation errors are documented at the module boundary"
 )]
-use std::{error::Error, fmt, num::NonZeroUsize, path::PathBuf, time::Duration};
+use std::{error::Error, fmt, num::NonZeroUsize, time::Duration};
 
 use url::Url;
 
@@ -78,14 +78,24 @@ pub struct LiveKitConfig {
     pub credentials: LiveKitCredentials,
     pub identity: PublicationIdentity,
     pub deployment_namespace: String,
-    pub cli_path: PathBuf,
-    pub cli_version: String,
     pub queue_items: NonZeroUsize,
     pub max_lag: Duration,
     pub max_access_unit_bytes: NonZeroUsize,
-    pub ipc_write_timeout: Duration,
     pub shutdown_timeout: Duration,
     pub backoff: PublicationBackoff,
+    /// Program that decodes H.264 for the live-viewing path.
+    ///
+    /// Live publication transcodes (ADR 012), so this is on the path to a
+    /// working live view rather than an optional extra. Named rather than
+    /// hardcoded because the binary's location is a deployment fact.
+    pub decoder_program: String,
+    /// Ceiling on published picture height; `0` means no ceiling.
+    ///
+    /// The single largest CPU lever on the live path — publishing 4K into a
+    /// browser tile is waste. It defaults to no ceiling because choosing a
+    /// viewing resolution is a product decision, not one this code may make
+    /// silently.
+    pub max_publish_height: u32,
 }
 
 impl fmt::Debug for LiveKitConfig {
@@ -96,29 +106,37 @@ impl fmt::Debug for LiveKitConfig {
             .field("credentials", &self.credentials)
             .field("identity", &self.identity)
             .field("deployment_namespace", &self.deployment_namespace)
-            .field("cli_path", &self.cli_path)
-            .field("cli_version", &self.cli_version)
             .field("queue_items", &self.queue_items)
             .field("max_lag", &self.max_lag)
             .finish_non_exhaustive()
     }
 }
 
+/// Deliberately has no `Debug`: two of its fields are the API key and secret,
+/// and unlike [`LiveKitConfig`] there is no redacting implementation to stand
+/// between them and a log line.
+///
+/// `Clone` exists because these values are a property of the deployment, not of
+/// a camera — one unit publishes to one server — so the process owner keeps a
+/// template and stamps a copy onto every camera that publishes, including the
+/// ones created through the API after startup.
+#[derive(Clone)]
 pub struct LiveKitSettings {
     pub endpoint: String,
     pub api_key: String,
     pub api_secret: String,
     pub deployment_namespace: String,
-    pub cli_path: PathBuf,
-    pub cli_version: String,
     pub queue_items: usize,
     pub max_lag: Duration,
     pub max_access_unit_bytes: usize,
-    pub ipc_write_timeout: Duration,
     pub shutdown_timeout: Duration,
     pub reconnect_initial: Duration,
     pub reconnect_maximum: Duration,
     pub reconnect_stable_reset: Duration,
+    /// Program that decodes H.264 for the live-viewing path.
+    pub decoder_program: String,
+    /// Ceiling on published picture height; `0` means no ceiling.
+    pub max_publish_height: u32,
 }
 
 impl LiveKitConfig {
@@ -136,31 +154,29 @@ impl LiveKitConfig {
         {
             return Err(LiveKitConfigError::InvalidEndpoint);
         }
-        if settings.cli_path.as_os_str().is_empty() || settings.cli_version.trim().is_empty() {
-            return Err(LiveKitConfigError::InvalidAdapter);
-        }
         let queue_items =
             NonZeroUsize::new(settings.queue_items).ok_or(LiveKitConfigError::InvalidQueue)?;
         let max_access_unit_bytes = NonZeroUsize::new(settings.max_access_unit_bytes)
             .ok_or(LiveKitConfigError::InvalidMediaLimit)?;
-        if settings.max_lag.is_zero()
-            || settings.ipc_write_timeout.is_zero()
-            || settings.shutdown_timeout.is_zero()
-        {
+        if settings.max_lag.is_zero() || settings.shutdown_timeout.is_zero() {
             return Err(LiveKitConfigError::InvalidTiming);
         }
+        // An empty program name would fail at spawn time, one camera at a
+        // time, long after the operator could connect it to what they typed.
+        if settings.decoder_program.trim().is_empty() {
+            return Err(LiveKitConfigError::InvalidDecoder);
+        }
         Ok(Self {
+            decoder_program: settings.decoder_program,
+            max_publish_height: settings.max_publish_height,
             endpoint,
             credentials: LiveKitCredentials::new(settings.api_key, settings.api_secret)?,
             identity: PublicationIdentity::for_camera(&settings.deployment_namespace, camera_id)
                 .map_err(LiveKitConfigError::Identity)?,
             deployment_namespace: settings.deployment_namespace,
-            cli_path: settings.cli_path,
-            cli_version: settings.cli_version,
             queue_items,
             max_lag: settings.max_lag,
             max_access_unit_bytes,
-            ipc_write_timeout: settings.ipc_write_timeout,
             shutdown_timeout: settings.shutdown_timeout,
             backoff: PublicationBackoff::new(
                 settings.reconnect_initial,
@@ -175,11 +191,11 @@ impl LiveKitConfig {
 pub enum LiveKitConfigError {
     InvalidEndpoint,
     InvalidCredentials,
-    InvalidAdapter,
     InvalidQueue,
     InvalidMediaLimit,
     InvalidTiming,
     InvalidBackoff,
+    InvalidDecoder,
     Identity(IdentityError),
 }
 
@@ -197,16 +213,15 @@ mod tests {
 
     fn valid() -> LiveKitSettings {
         LiveKitSettings {
+            decoder_program: "ffmpeg".to_owned(),
+            max_publish_height: 0,
             endpoint: "ws://127.0.0.1:7880".to_owned(),
             api_key: "devkey".to_owned(),
             api_secret: "development-secret".to_owned(),
             deployment_namespace: "site-a".to_owned(),
-            cli_path: PathBuf::from("lk"),
-            cli_version: "2.18.2".to_owned(),
             queue_items: 4,
             max_lag: Duration::from_millis(500),
             max_access_unit_bytes: 2 * 1024 * 1024,
-            ipc_write_timeout: Duration::from_millis(250),
             shutdown_timeout: Duration::from_secs(2),
             reconnect_initial: Duration::from_millis(250),
             reconnect_maximum: Duration::from_secs(30),
