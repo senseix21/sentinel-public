@@ -22,7 +22,7 @@ RECORDING_ROOT ?= ./recordings
 HEALTH_BIND ?= 127.0.0.1:3000
 MEDIAMTX_CONFIG ?= config/mediamtx-webcam.yml
 
-.PHONY: help prerequisites webcam-devices run mediamtx webcam server health live ready metrics recordings play verify-recordings fixture check
+.PHONY: help prerequisites webcam-devices run run-release mediamtx webcam server health live ready metrics recordings play verify-recordings fixture check
 
 help: ## Show manual development commands and configurable values.
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-20s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -44,13 +44,16 @@ webcam-devices: ## List macOS AVFoundation video and audio device indices.
 # still run standalone; this supervises them together, adds the PostgreSQL the
 # Playback and Settings screens need, adds LiveKit so the live tile carries
 # video, and puts the trust-boundary proxy in front that an authenticated
-# dashboard session requires. Development only, loopback only — the proxy
-# asserts an identity without checking anything. See the script's header.
+# dashboard session requires. Development only, loopback only — the proxy owns
+# a bounded in-memory password session. See the script's header.
 # It does not depend on `prerequisites`: it needs a strict superset of those
 # tools and checks them itself, and two competing "missing X" messages for the
 # same run would be one too many.
 run: ## Bring up the full local stack and serve the dashboard.
 	scripts/dev/local-stack.sh
+
+run-release: ## Run the local stack with the optimized qualification binary.
+	SENTINEL_BUILD_PROFILE=release scripts/dev/local-stack.sh
 
 mediamtx: prerequisites ## Run loopback-only MediaMTX for the webcam RTSP bridge.
 	"$(MEDIAMTX_BIN)" "$(MEDIAMTX_CONFIG)"
@@ -106,6 +109,8 @@ fixture: ## Run the complete deterministic MediaMTX/Retina Phase 2 qualification
 	scripts/phase0/retina-rtsp-fixture.sh
 
 check: ## Run the complete Rust workspace quality gate.
+	bash -n scripts/dev/local-stack.sh scripts/phase9/authenticated-ui-fixture.sh
+	python3 -m unittest scripts/dev/test_trust_boundary_proxy.py
 	"$(CARGO)" fmt --all --check
 	"$(CARGO)" clippy --workspace --all-targets --all-features -- -D warnings
 	"$(CARGO)" test --workspace --all-features

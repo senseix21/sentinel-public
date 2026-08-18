@@ -234,6 +234,22 @@ identity a proxy can assert ever needs to carry authorization with it; that
 would be a different decision about where policy lives, and this one should be
 reopened rather than extended.
 
+### Development login clarification (2026-08-18)
+
+The loopback-only proxy used by `make run` owns a deliberately small development
+login: one environment/per-run password and a bounded in-memory session. This
+does not reverse Decision 6. The proxy still owns authentication and sessions;
+the Rust server still accepts only a proved principal assertion and owns all
+authorization. The fixture has no TLS, account recovery, MFA, durable sessions,
+or packaging and refuses to bind beyond loopback. It must not be deployed.
+
+No reusable password is committed. `SENTINEL_DEV_PASSWORD` may provide one for
+a run; otherwise the launcher generates one, prints it once, and keeps it only
+in process memory. Production still requires the deployment's identity-aware
+TLS proxy. If the product instead requires standalone local human accounts,
+this ADR must be reopened before adding password or session ownership to the
+surveillance server.
+
 ## Deferred — Deployment target
 
 **Not confirmed.** The Linux distribution, whether the unit is a container or a

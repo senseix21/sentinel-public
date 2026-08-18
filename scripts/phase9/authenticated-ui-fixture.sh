@@ -16,11 +16,11 @@ set -euo pipefail
 #   MediaMTX + FFmpeg  synthetic RTSP sources, so segments are real files
 #   livekit-server     so a camera added through the UI can actually publish
 #   surveillance-server  loopback, with a trust boundary configured
-#   header proxy       the reverse proxy the trust boundary expects
+#   login proxy        the reverse proxy the trust boundary expects
 #
-# The proxy is a *fixture*, not a deployment artifact: it asserts a principal
-# without checking anything, which is exactly what a real proxy must not do.
-# It exists so the screens behind authentication can be driven at all.
+# The proxy is a *fixture*, not a deployment artifact: it checks one generated
+# password and keeps bounded sessions only in memory. It exists so the screens
+# behind authentication can be driven without inventing a production provider.
 #
 # Usage:  scripts/phase9/authenticated-ui-fixture.sh
 # Vars:   WINDOW (seconds to hold, default 1800), CAMERAS (default 2),
@@ -35,6 +35,7 @@ WINDOW="${WINDOW:-1800}"
 CAMERAS="${CAMERAS:-2}"
 PRINCIPAL="${PRINCIPAL:-admin}"
 ROLE="${ROLE:-administrator}"
+DEV_PASSWORD=$(python3 -c 'import secrets; print(secrets.token_urlsafe(12))')
 WIDTH="${WIDTH:-640}"
 HEIGHT="${HEIGHT:-360}"
 FPS="${FPS:-15}"
@@ -258,21 +259,35 @@ expected=$(ls "${REPO_ROOT}"/migrations/0*.sql | wc -l | tr -d ' ')
   || fail "${applied} of ${expected} migrations applied; see ${LOG_DIR}/server.log"
 echo "  ok: ${applied} migrations applied by the server"
 
-# ------------------------------------------------------------- the fake proxy
-note "starting the header-injecting proxy on http://127.0.0.1:${PROXY_PORT}"
+# ------------------------------------------------------ development auth proxy
+note "starting the development login proxy on http://127.0.0.1:${PROXY_PORT}"
 # The proxy lives in scripts/dev/trust-boundary-proxy.py rather than in a
 # heredoc here, because scripts/dev/local-stack.sh needs the same thing and a
 # second copy of its STRIP set is a hole waiting to open.
 
 UPSTREAM_PORT="${SERVER_PORT}" LISTEN_PORT="${PROXY_PORT}" \
 PROOF_SECRET="${PROOF_SECRET}" PRINCIPAL="${PRINCIPAL}" \
+DEV_USERNAME="${PRINCIPAL}" DEV_PASSWORD="${DEV_PASSWORD}" \
+DEV_SESSION_TTL_SECONDS="3600" \
 python3 "${REPO_ROOT}/scripts/dev/trust-boundary-proxy.py" > "${LOG_DIR}/proxy.log" 2>&1 &
 PIDS+=($!)
 sleep 2
 
 status=$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:${PROXY_PORT}/api/cameras")
-[[ "${status}" == "200" ]] || fail "the proxied API answered ${status}, not 200; see ${LOG_DIR}"
-echo "  ok: /api/cameras answers 200 through the proxy"
+[[ "${status}" == "401" ]] || fail "the proxied API answered ${status} without login, not 401; see ${LOG_DIR}"
+login_headers=$(curl -sS -D - -o /dev/null -m 5 \
+  -H "Origin: http://127.0.0.1:${PROXY_PORT}" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "username=${PRINCIPAL}" \
+  --data-urlencode "password=${DEV_PASSWORD}" \
+  "http://127.0.0.1:${PROXY_PORT}/login")
+session_cookie=$(printf '%s\n' "${login_headers}" \
+  | awk 'BEGIN {IGNORECASE=1} /^Set-Cookie:/ {sub(/^[^:]*:[[:space:]]*/, ""); sub(/;.*/, ""); print; exit}' \
+  | tr -d '\r')
+status=$(curl -s -o /dev/null -w '%{http_code}' -m 5 \
+  -H "Cookie: ${session_cookie}" "http://127.0.0.1:${PROXY_PORT}/api/cameras")
+[[ "${status}" == "200" ]] || fail "the proxied API answered ${status} after login, not 200; see ${LOG_DIR}"
+echo "  ok: /api/cameras answers 401 before login and 200 with a session"
 
 direct=$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:${SERVER_PORT}/api/cameras")
 [[ "${direct}" == "401" ]] || fail "the direct API answered ${direct}, expected 401"
@@ -283,6 +298,8 @@ cat <<EOF
 == ready ==
 
   Dashboard (authenticated): http://127.0.0.1:${PROXY_PORT}/
+  Login username: ${PRINCIPAL}
+  Login password: ${DEV_PASSWORD}
   Dashboard (unauthenticated, for comparison): http://127.0.0.1:${SERVER_PORT}/
   Principal: ${PRINCIPAL} (${ROLE}, all cameras)
   Spare RTSP sources for the add form (readable without a credential):

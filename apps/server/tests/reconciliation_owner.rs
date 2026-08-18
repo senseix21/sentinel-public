@@ -128,10 +128,28 @@ async fn repairs_filesystem_database_divergence_idempotently() {
             Some(expected)
         );
     }
+    // Once the orphan is indexed, a second repair pass must not need ffprobe
+    // to validate immutable path-and-size evidence. A deliberately missing
+    // executable makes a redundant probe fail the pass instead of hiding in
+    // timing data.
+    let layout = RecordingLayout::new(PathBuf::from(required_environment(
+        "PHASE4_RECONCILIATION_ROOT",
+    )))
+    .unwrap_or_else(|error| panic!("recording layout: {error}"));
+    let mut owner = ReconciliationOwner::new(
+        repository.clone(),
+        layout.clone(),
+        SegmentFileStore::new(layout, PathBuf::from("missing-ffprobe-by-design")),
+        ReconciliationLimit::new(32).unwrap_or_else(|error| panic!("scan limit: {error}")),
+        32,
+        Duration::ZERO,
+        Duration::from_secs(60),
+    );
     let second = owner
         .run_pass()
         .await
         .unwrap_or_else(|category| panic!("second pass: {category}"));
     assert_eq!(second.imported, 0);
     assert_eq!(second.incomplete, 0);
+    assert_eq!(second.skipped_indexed, 2);
 }

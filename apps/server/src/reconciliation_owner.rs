@@ -28,6 +28,7 @@ pub struct ReconciliationPass {
     pub imported: u64,
     pub incomplete: u64,
     pub inconsistent: u64,
+    pub skipped_indexed: u64,
     pub skipped_active: u64,
     pub malformed: u64,
 }
@@ -74,6 +75,7 @@ impl ReconciliationOwner {
 
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
         loop {
+            self.metrics.reconciliation_started();
             match self.run_pass().await {
                 Ok(report) => {
                     self.metrics.reconciliation(
@@ -81,6 +83,7 @@ impl ReconciliationOwner {
                         report.imported,
                         report.incomplete,
                         report.inconsistent,
+                        report.skipped_indexed,
                     );
                     tracing::info!(?report, "bounded recording reconciliation pass completed");
                 }
@@ -165,69 +168,95 @@ impl ReconciliationOwner {
                         .recording_status(identity.recording_id())
                         .await
                         .map_err(|_| "database_status")?;
-                    match self.store.probe_durable(path.clone()).await {
-                        Ok(stored) if existing.is_none() => {
-                            let ended_at = identity
-                                .started_at()
-                                .checked_add(stored.duration())
-                                .ok_or("duration_overflow")?;
-                            let relative = path
-                                .strip_prefix(self.layout.root())
-                                .map_err(|_| "durable_path")?;
-                            let completed = CompletedRecording::new(
-                                identity.recording_id().clone(),
-                                identity.camera_id().clone(),
-                                identity.started_at(),
-                                ended_at,
-                                RecordingLocator::new(relative.to_path_buf())
-                                    .map_err(|_| "durable_locator")?,
-                                RecordingContainer::FragmentedMp4,
-                                VideoCodec::H264,
-                                stored.width(),
-                                stored.height(),
-                                stored.size_bytes(),
-                                MetadataProvenance::Reconciliation,
-                            )
-                            .map_err(|_| "durable_evidence")?;
-                            self.repository
-                                .insert_or_confirm_completed(&completed)
-                                .await
-                                .map_err(|_| "database_import")?;
-                            pass.imported = pass.imported.saturating_add(1);
-                        }
-                        Ok(_) => {}
-                        Err(_) if existing == Some(RecordingStatus::Completed) => {
+                    if existing == Some(RecordingStatus::Completed) {
+                        let indexed = self
+                            .repository
+                            .find_completed(identity.camera_id(), identity.recording_id())
+                            .await
+                            .map_err(|_| "database_completed")?
+                            .ok_or("database_completed_invariant")?;
+                        let relative = path
+                            .strip_prefix(self.layout.root())
+                            .map_err(|_| "durable_path")?;
+                        let observed_size = tokio::fs::metadata(&path)
+                            .await
+                            .map_err(|_| "durable_metadata")?
+                            .len();
+                        if indexed.locator().as_path() != relative
+                            || indexed.size_bytes() != observed_size
+                        {
                             self.repository
                                 .mark_inconsistent(identity.recording_id())
                                 .await
                                 .map_err(|_| "database_inconsistent")?;
                             pass.inconsistent = pass.inconsistent.saturating_add(1);
+                        } else {
+                            // Recorder completion already probed this immutable
+                            // file. Re-running ffprobe for every indexed segment
+                            // on every reconciliation pass turned repair into an
+                            // archive scrub and made startup scale with history.
+                            // Path and size still catch replacement/truncation;
+                            // content scrubbing is a separate bounded concern.
+                            pass.skipped_indexed = pass.skipped_indexed.saturating_add(1);
                         }
-                        Err(_) if existing.is_none() => {
-                            let relative = path
-                                .strip_prefix(self.layout.root())
-                                .map_err(|_| "durable_path")?;
-                            let evidence = NonPlayableRecording::new(
-                                identity.recording_id().clone(),
-                                identity.camera_id().clone(),
-                                identity.started_at(),
-                                None,
-                                RecordingEvidenceLocator::new(relative.to_path_buf())
-                                    .map_err(|_| "durable_locator")?,
-                                RecordingStatus::Inconsistent,
-                                RecordingFailureCategory::Reconciliation,
-                                MetadataProvenance::Reconciliation,
-                            )
-                            .map_err(|_| "durable_evidence")?;
-                            self.repository
-                                .insert_or_confirm_non_playable(&evidence)
-                                .await
-                                .map_err(|_| "database_inconsistent")?;
-                            pass.inconsistent = pass.inconsistent.saturating_add(1);
-                        }
-                        Err(_) => {
-                            pass.inconsistent = pass.inconsistent.saturating_add(1);
-                        }
+                        continue;
+                    }
+                    if existing.is_some() {
+                        // The old path probed these rows and discarded either
+                        // result. Preserve the lifecycle state without paying
+                        // for an observation no transition consumes.
+                        pass.skipped_indexed = pass.skipped_indexed.saturating_add(1);
+                        continue;
+                    }
+                    if let Ok(stored) = self.store.probe_durable(path.clone()).await {
+                        let ended_at = identity
+                            .started_at()
+                            .checked_add(stored.duration())
+                            .ok_or("duration_overflow")?;
+                        let relative = path
+                            .strip_prefix(self.layout.root())
+                            .map_err(|_| "durable_path")?;
+                        let completed = CompletedRecording::new(
+                            identity.recording_id().clone(),
+                            identity.camera_id().clone(),
+                            identity.started_at(),
+                            ended_at,
+                            RecordingLocator::new(relative.to_path_buf())
+                                .map_err(|_| "durable_locator")?,
+                            RecordingContainer::FragmentedMp4,
+                            VideoCodec::H264,
+                            stored.width(),
+                            stored.height(),
+                            stored.size_bytes(),
+                            MetadataProvenance::Reconciliation,
+                        )
+                        .map_err(|_| "durable_evidence")?;
+                        self.repository
+                            .insert_or_confirm_completed(&completed)
+                            .await
+                            .map_err(|_| "database_import")?;
+                        pass.imported = pass.imported.saturating_add(1);
+                    } else {
+                        let relative = path
+                            .strip_prefix(self.layout.root())
+                            .map_err(|_| "durable_path")?;
+                        let evidence = NonPlayableRecording::new(
+                            identity.recording_id().clone(),
+                            identity.camera_id().clone(),
+                            identity.started_at(),
+                            None,
+                            RecordingEvidenceLocator::new(relative.to_path_buf())
+                                .map_err(|_| "durable_locator")?,
+                            RecordingStatus::Inconsistent,
+                            RecordingFailureCategory::Reconciliation,
+                            MetadataProvenance::Reconciliation,
+                        )
+                        .map_err(|_| "durable_evidence")?;
+                        self.repository
+                            .insert_or_confirm_non_playable(&evidence)
+                            .await
+                            .map_err(|_| "database_inconsistent")?;
+                        pass.inconsistent = pass.inconsistent.saturating_add(1);
                     }
                 }
             }

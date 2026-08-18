@@ -9,12 +9,14 @@ use surveillance_storage::retention::StoragePressure;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Phase4Snapshot {
+    pub reconciliation_active: u64,
     pub reconciliation_passes: u64,
     pub reconciliation_failures: u64,
     pub reconciliation_examined: u64,
     pub reconciliation_imported: u64,
     pub reconciliation_incomplete: u64,
     pub reconciliation_inconsistent: u64,
+    pub reconciliation_skipped_indexed: u64,
     pub recording_queries: u64,
     pub recording_query_failures: u64,
     pub recording_query_results: u64,
@@ -41,12 +43,14 @@ pub struct Phase4Metrics(Arc<Counters>);
 
 #[derive(Default)]
 struct Counters {
+    reconciliation_active: AtomicU64,
     reconciliation_passes: AtomicU64,
     reconciliation_failures: AtomicU64,
     reconciliation_examined: AtomicU64,
     reconciliation_imported: AtomicU64,
     reconciliation_incomplete: AtomicU64,
     reconciliation_inconsistent: AtomicU64,
+    reconciliation_skipped_indexed: AtomicU64,
     recording_queries: AtomicU64,
     recording_query_failures: AtomicU64,
     recording_query_results: AtomicU64,
@@ -68,13 +72,18 @@ struct Counters {
 }
 
 impl Phase4Metrics {
+    pub fn reconciliation_started(&self) {
+        self.0.reconciliation_active.store(1, Ordering::Relaxed);
+    }
     pub fn reconciliation(
         &self,
         examined: usize,
         imported: u64,
         incomplete: u64,
         inconsistent: u64,
+        skipped_indexed: u64,
     ) {
+        self.0.reconciliation_active.store(0, Ordering::Relaxed);
         self.0.reconciliation_passes.fetch_add(1, Ordering::Relaxed);
         self.0.reconciliation_examined.fetch_add(
             u64::try_from(examined).unwrap_or(u64::MAX),
@@ -89,8 +98,12 @@ impl Phase4Metrics {
         self.0
             .reconciliation_inconsistent
             .fetch_add(inconsistent, Ordering::Relaxed);
+        self.0
+            .reconciliation_skipped_indexed
+            .fetch_add(skipped_indexed, Ordering::Relaxed);
     }
     pub fn reconciliation_failed(&self) {
+        self.0.reconciliation_active.store(0, Ordering::Relaxed);
         self.0
             .reconciliation_failures
             .fetch_add(1, Ordering::Relaxed);
@@ -163,12 +176,14 @@ impl Phase4Metrics {
             };
         }
         Phase4Snapshot {
+            reconciliation_active: load!(reconciliation_active),
             reconciliation_passes: load!(reconciliation_passes),
             reconciliation_failures: load!(reconciliation_failures),
             reconciliation_examined: load!(reconciliation_examined),
             reconciliation_imported: load!(reconciliation_imported),
             reconciliation_incomplete: load!(reconciliation_incomplete),
             reconciliation_inconsistent: load!(reconciliation_inconsistent),
+            reconciliation_skipped_indexed: load!(reconciliation_skipped_indexed),
             recording_queries: load!(recording_queries),
             recording_query_failures: load!(recording_query_failures),
             recording_query_results: load!(recording_query_results),

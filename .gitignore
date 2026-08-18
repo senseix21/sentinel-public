@@ -14,3 +14,7 @@ Multi-Camera_Security_
 # Browser automation and manual screenshot artifacts.
 /.playwright-mcp/
 /makerun-live.png
+
+# Python development fixture bytecode.
+__pycache__/
+*.pyc

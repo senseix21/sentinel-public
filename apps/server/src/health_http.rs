@@ -2738,6 +2738,10 @@ fn render_metrics(
         let value = metrics.snapshot();
         for (name, metric_value) in [
             (
+                "surveillance_reconciliation_active",
+                value.reconciliation_active,
+            ),
+            (
                 "surveillance_reconciliation_passes_total",
                 value.reconciliation_passes,
             ),
@@ -2760,6 +2764,10 @@ fn render_metrics(
             (
                 "surveillance_reconciliation_inconsistent_total",
                 value.reconciliation_inconsistent,
+            ),
+            (
+                "surveillance_reconciliation_skipped_indexed_total",
+                value.reconciliation_skipped_indexed,
             ),
             (
                 "surveillance_recording_queries_total",

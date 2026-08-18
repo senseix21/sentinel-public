@@ -99,7 +99,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // configuration, and a per-unit PostgreSQL is one database, not two.
     let metadata_handle = if let Some(database) = database.as_ref() {
         let repository = PostgresRecordingRepository::connect_lazy(database);
-        let mut reconciliation = ReconciliationOwner::new(
+        let reconciliation = ReconciliationOwner::new(
             repository.clone(),
             config.layout.clone(),
             SegmentFileStore::new(config.layout.clone(), config.ffprobe.clone()),
@@ -115,12 +115,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 .unwrap_or(std::time::Duration::from_secs(30)),
         )
         .with_metrics(phase4_metrics.clone());
-        if let Err(category) = reconciliation.run_pass().await {
-            tracing::warn!(
-                category,
-                "startup reconciliation deferred; recording will start degraded"
-            );
-        }
+        // Reconciliation is recovery/repair work, not a prerequisite for the
+        // control plane. Running a complete pass here made `/live` and the
+        // login page wait for one sequential ffprobe per durable segment. The
+        // owned task below starts its first bounded pass immediately; new
+        // recording remains protected by the metadata writer and partial-file
+        // grace rules while that idempotent pass is in progress.
+        tracing::info!("recording reconciliation scheduled in the background");
         let (reconciliation_shutdown, reconciliation_shutdown_rx) = watch::channel(false);
         let reconciliation_task = tokio::spawn(reconciliation.run(reconciliation_shutdown_rx));
         reconciliation_owner = Some((reconciliation_shutdown, reconciliation_task));

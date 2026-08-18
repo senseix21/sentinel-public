@@ -488,6 +488,7 @@
     <button class="btn icon" data-act="refresh" title="Refresh now">
       <svg class="ic"><use href="#i-refresh"></use></svg>
     </button>
+    <button class="btn" data-act="logout" title="End this browser session">Sign out</button>
     <div class="who">
       <div class="avatar"><svg class="ic"><use href="#i-user"></use></svg></div>
       <div class="id">
@@ -546,6 +547,10 @@ class ApiError extends Error {
 
 async function api(path, options) {
   const response = await fetch(path, Object.assign({ headers: { Accept: "application/json" } }, options || {}));
+  if (response.status === 401 && response.headers.get("X-Sentinel-Login")) {
+    window.location.assign(response.headers.get("X-Sentinel-Login"));
+    throw new ApiError(401, "session_expired");
+  }
   const text = await response.text();
   let body = null;
   try { body = text ? JSON.parse(text) : null; } catch (error) { body = null; }
@@ -568,6 +573,14 @@ function errorBanner(error) {
   }
   if (error.status === 404) {
     return banner("warn", "Not found.", "The server has no such resource.");
+  }
+  if (error.status === 401) {
+    return banner("bad", "Authentication required.",
+      "Open SENTINEL through its authenticated gateway. This direct server endpoint does not carry a browser session.");
+  }
+  if (error.status === 403) {
+    return banner("warn", "Permission denied.",
+      "Your identity is valid but does not have permission for this operation.");
   }
   if (error.status === 503) {
     return banner("warn", "That part of the system is not running.",
@@ -2179,6 +2192,13 @@ document.addEventListener("click", async (event) => {
 
   if (act === "refresh") {
     await tick();
+    return;
+  }
+
+  if (act === "logout") {
+    const response = await fetch("/logout", { method: "POST" });
+    if (response.redirected) window.location.assign(response.url);
+    else window.location.assign("/login");
     return;
   }
 
