@@ -1,3 +1,5 @@
+//! Qualifies bounded RGB frame decoding from a real `FFmpeg`-generated H.264 keyframe.
+
 use std::{
     process::Command,
     sync::Arc,

@@ -1,3 +1,5 @@
+//! Maps H.264 access units into bounded RTP timestamps and payloads for publication.
+
 #![allow(
     clippy::missing_errors_doc,
     reason = "adaptation methods share the typed AdaptationError contract"

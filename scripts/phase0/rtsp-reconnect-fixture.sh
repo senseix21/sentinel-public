@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# Exercises deterministic RTSP publisher loss and recovery through MediaMTX.
+
 set -euo pipefail
 
 mediamtx_bin="${MEDIAMTX_BIN:-/usr/local/opt/mediamtx/bin/mediamtx}"
@@ -142,4 +144,3 @@ capture_generation 2
 stop_publisher
 
 echo "fixture results: ${fixture_root}"
-

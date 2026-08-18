@@ -1,3 +1,5 @@
+//! Proves durable recording preservation and later indexing across a `PostgreSQL` outage.
+
 use std::{num::NonZeroU32, path::PathBuf, time::Duration};
 
 use surveillance_database::{DatabaseConfig, PostgresRecordingRepository};

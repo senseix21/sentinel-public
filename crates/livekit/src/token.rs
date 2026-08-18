@@ -1,3 +1,5 @@
+//! Issues validated, camera-scoped `LiveKit` publisher and viewer access tokens.
+
 #![allow(
     clippy::missing_errors_doc,
     reason = "token issuance exposes one secret-safe typed error contract"

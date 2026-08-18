@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# Qualifies PostgreSQL indexing, playback, reconciliation, retention, and outage recovery.
+
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)

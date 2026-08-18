@@ -1,3 +1,5 @@
+//! Models publication lifecycle, failure categories, and validated `LiveKit` identities.
+
 #![allow(
     clippy::missing_errors_doc,
     reason = "identity constructors share one typed validation contract"

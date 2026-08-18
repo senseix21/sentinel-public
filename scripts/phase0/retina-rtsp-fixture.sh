@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# Qualifies authenticated Retina H.264 ingest, recording, and reconnect behavior.
+
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

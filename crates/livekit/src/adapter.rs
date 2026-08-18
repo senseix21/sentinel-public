@@ -1,3 +1,5 @@
+//! Defines the publication adapter contract, observations, errors, and in-memory test adapter.
+
 use std::{error::Error, fmt, future::Future, pin::Pin};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

@@ -1,3 +1,5 @@
+//! Qualifies multi-segment MP4 playback assembly against the Phase 4 `PostgreSQL` fixture.
+
 use std::{
     num::NonZeroU32,
     path::PathBuf,

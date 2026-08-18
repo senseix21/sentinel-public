@@ -1,3 +1,5 @@
+//! Qualifies crash-safe retention ownership and protection of recent recordings.
+
 use std::{
     num::{NonZeroU32, NonZeroU64, NonZeroUsize},
     path::PathBuf,

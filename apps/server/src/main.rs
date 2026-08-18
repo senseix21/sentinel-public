@@ -1,3 +1,5 @@
+//! Composes and owns the SENTINEL server process from startup through joined shutdown.
+
 use std::{error::Error, path::PathBuf, sync::Arc};
 
 use surveillance_config::{

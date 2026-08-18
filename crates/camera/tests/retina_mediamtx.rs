@@ -1,3 +1,5 @@
+//! Qualifies authenticated Retina RTSP ingest and reconnect behavior against `MediaMTX`.
+
 use std::time::Duration;
 
 use surveillance_camera::{

@@ -1,3 +1,5 @@
+//! Validates `LiveKit` credentials, endpoint settings, and bounded publication backoff.
+
 #![allow(
     clippy::missing_errors_doc,
     reason = "typed validation errors are documented at the module boundary"

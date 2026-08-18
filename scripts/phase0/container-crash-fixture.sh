@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# Compares normal and forced-exit finalization across codecs and containers.
+
 set -euo pipefail
 
 ffmpeg_bin="${FFMPEG_BIN:-ffmpeg}"

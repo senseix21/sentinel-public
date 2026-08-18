@@ -1,3 +1,5 @@
+-- Establishes cameras and the indexed recording-segment lifecycle schema.
+
 CREATE TABLE cameras (
     camera_id text PRIMARY KEY,
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),

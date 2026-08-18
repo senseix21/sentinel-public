@@ -1,3 +1,5 @@
+//! Qualifies Retina ingest through probeable, decodable fragmented-MP4 segmentation.
+
 use std::{path::PathBuf, process::Command, time::Duration};
 
 use surveillance_camera::rtsp::{

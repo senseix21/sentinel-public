@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# Runs the focused LiveKit startup-outage isolation integration test.
+
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

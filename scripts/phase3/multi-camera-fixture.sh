@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# Qualifies multi-camera ownership, failure isolation, reconnect, and shutdown.
+
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

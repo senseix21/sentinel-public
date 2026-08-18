@@ -1,3 +1,5 @@
+//! Qualifies owned reconciliation of filesystem and recording-index divergence.
+
 use std::{num::NonZeroU32, path::PathBuf, time::Duration};
 
 use surveillance_common::types::{CameraId, RecordingId};

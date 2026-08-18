@@ -1,3 +1,5 @@
+//! Qualifies recording repository migrations, queries, transitions, and failure behavior.
+
 use std::{
     num::NonZeroU32,
     path::PathBuf,

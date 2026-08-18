@@ -1,3 +1,5 @@
+//! Qualifies `LiveKit` outage isolation so publication retries cannot block recording.
+
 use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
 use surveillance_common::types::CameraId;

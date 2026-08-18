@@ -1,3 +1,5 @@
+//! Owns live publication lifecycle, pacing, health, retry, cancellation, and counters.
+
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,

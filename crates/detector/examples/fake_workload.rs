@@ -1,3 +1,5 @@
+//! Measures the deterministic fake inference seam without claiming production accuracy.
+
 use std::{
     sync::Arc,
     time::{Instant, SystemTime},

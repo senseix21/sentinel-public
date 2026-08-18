@@ -1,3 +1,5 @@
+//! Proves RTP/H.264 media crosses one ingest, bounded distribution, and recorder path.
+
 use std::sync::Arc;
 
 use surveillance_camera::h264_depay::{H264Depayloader, H264DepayloaderLimits, RtpH264Payload};

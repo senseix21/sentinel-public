@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+# Qualifies LiveKit publication against a real server and subscribed observer.
+
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
