@@ -13,9 +13,10 @@
 # Durations always carry a unit: ms, s, m, h, d.
 
 # --- Secrets are NOT configured here -----------------------------------------
-# Credentials come from the environment only. ADR 003 leaves the production
-# secret store open, so Phase 7 neither persists nor accepts credentials through
-# the API. Supply these out of band:
+# Credentials come from the Phase 8 secret boundary: a permission-enforced
+# secrets file with per-key environment override. They are neither persisted as
+# ordinary settings nor accepted through the settings API. Environment values
+# used by the current server bootstrap include:
 #
 #   SURVEILLANCE_DATABASE_URL
 #   SURVEILLANCE_RTSP_USERNAME       (with SURVEILLANCE_RTSP_PASSWORD)
@@ -40,7 +41,9 @@ watermark_hysteresis = 3
 
 [api]
 # Leave false unless this deployment is meant to be reconfigured over HTTP.
-# There is no authentication yet; the listener is loopback-only.
+# Authentication and authorization are enforced independently of this switch.
+# Keep the listener loopback-only unless ADR 009's trusted proxy boundary and
+# an enabled principal are configured.
 mutating_surface_enabled = false
 # The two settings that are read per request rather than captured at startup.
 max_request_bytes = 16384

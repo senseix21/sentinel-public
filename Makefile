@@ -68,7 +68,7 @@ webcam: prerequisites ## Publish the selected Mac webcam as qualified H.264 RTSP
 		-g "$(VIDEO_FPS)" -keyint_min "$(VIDEO_FPS)" -sc_threshold 0 -bf 0 \
 		-f rtsp -rtsp_transport tcp "$(RTSP_URL)"
 
-server: ## Run the Phase 2 server against the configured local RTSP source.
+server: ## Run the standalone server against the configured local RTSP source.
 	SURVEILLANCE_CAMERA_ID="$(CAMERA_ID)" \
 	SURVEILLANCE_RTSP_URL="$(RTSP_URL)" \
 	SURVEILLANCE_VIDEO_WIDTH="$(VIDEO_WIDTH)" \
