@@ -1,0 +1,111 @@
+  /* ---------- camera tiles ---------- */
+
+  .tiles { display: grid; gap: 12px; }
+  .tile {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); overflow: hidden; min-width: 0;
+  }
+  .tile-head { display: flex; align-items: center; gap: 8px; padding: 9px 11px; font-size: 12px; }
+  .tile-head b { font-weight: 650; }
+  .tile-head .sp { flex: 1; }
+  .stage {
+    position: relative; aspect-ratio: 16 / 9; background: #05080d;
+    border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
+  }
+  .stage video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #05080d; }
+  .idle {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+    color: var(--dimmer); font-size: 11.5px; text-align: center; padding: 12px;
+  }
+  .idle .ic { width: 26px; height: 26px; }
+  /* The footer must stay one line at any density, but the controls are the part
+     an operator needs: clipping the whole row hides the watch and stop buttons
+     at 5x. Only the LiveKit label is allowed to give up width. */
+  .tile-foot { display: flex; align-items: center; gap: 8px; padding: 8px 11px; font-size: 11.5px; color: var(--dim); white-space: nowrap; }
+  .tile-foot .row { flex-wrap: nowrap; }
+  .tile-foot .shrink { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .tile-foot .shrink .dot { flex: 0 0 auto; }
+  .tile-foot .lk-word { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  /* At four or more tiles per row a footer is ~220px and the three controls take
+     most of it. Squeezing the words into the remainder renders two ellipses and
+     nothing readable, so drop them and keep the status dot; the chip's title
+     still carries the full state. */
+  .tiles[data-density="4"] .lk-word,
+  .tiles[data-density="5"] .lk-word { display: none; }
+  .tile-foot .btn { flex: 0 0 auto; }
+  .tile-foot .sp { flex: 1; }
+  .tile-note:empty { display: none; }
+  .tile-note { padding: 0 11px 10px; }
+  .tile-note .banner { margin: 0; }
+
+  .strip {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 0; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  }
+  .strip > div { display: flex; align-items: center; gap: 12px; padding: 16px 18px; border-left: 1px solid var(--line); }
+  .strip > div:first-child { border-left: 0; }
+  .strip .v { font-size: 17px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .strip .l { font-size: 11.5px; color: var(--dim); }
+
+  /* ---------- donut ---------- */
+
+  .donut { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+  .donut svg { width: 170px; height: 170px; flex: 0 0 auto; }
+  .donut .mid { font-size: 20px; font-weight: 650; fill: var(--text); }
+  .donut .mid2 { font-size: 9.5px; fill: var(--dim); }
+  .legend { flex: 1; min-width: 190px; font-size: 12.5px; }
+  .legend div { display: flex; align-items: center; gap: 9px; padding: 5px 0; }
+  .legend .sw { width: 9px; height: 9px; border-radius: 2px; }
+  .legend .nm { flex: 1; color: var(--dim); }
+
+  /* ---------- coverage / timeline ---------- */
+
+  .cover { display: flex; gap: 1px; height: 22px; border-radius: 5px; overflow: hidden; background: #0b1119; }
+  .cover i { flex: 1; background: var(--line); }
+  .cover i.has { background: var(--blue); }
+  .ticks { display: flex; justify-content: space-between; font-size: 10.5px; color: var(--dimmer); margin-top: 5px; }
+
+  .kv { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px 14px; font-size: 12.5px; }
+  .kv .k { color: var(--dim); }
+  .kv .v { text-align: right; font-variant-numeric: tabular-nums; }
+
+  .srow { display: grid; grid-template-columns: minmax(220px, 1.4fr) minmax(160px, 1fr) auto; gap: 12px; align-items: center; padding: 9px 0; border-bottom: 1px solid #151d29; }
+  .srow:last-child { border-bottom: 0; }
+  .srow .key { font-size: 12px; }
+  .srow .key small { display: block; color: var(--dimmer); font-size: 10.5px; }
+  .srow.dirty { background: #101a2c; box-shadow: inset 2px 0 0 var(--amber); }
+
+  .savebar {
+    position: sticky; bottom: 0; margin-top: 16px;
+    display: flex; align-items: center; gap: 12px;
+    padding: 13px 16px; border-radius: var(--radius);
+    background: var(--panel); border: 1px solid var(--line);
+  }
+  .savebar .sp { flex: 1; }
+
+  /* Light-mode corrections for intentionally literal dark surfaces. Video
+     stages remain black: they are media canvases, not application panels. */
+  :root[data-theme="light"] .top { background: linear-gradient(180deg, #ffffff, #f4f7fb); }
+  :root[data-theme="light"] td,
+  :root[data-theme="light"] .srow { border-bottom-color: #e5eaf1; }
+  :root[data-theme="light"] tbody tr:hover { background: #f5f8fc; }
+  :root[data-theme="light"] tr.sel { background: #e8f0ff; }
+  :root[data-theme="light"] .srow.dirty { background: #fff7e6; }
+  :root[data-theme="light"] input.f,
+  :root[data-theme="light"] select.f,
+  :root[data-theme="light"] .cover,
+  :root[data-theme="light"] .absent code { background: #ffffff; }
+  :root[data-theme="light"] input.f:disabled { background: #eef2f7; }
+  :root[data-theme="light"] .seg button.on { background: #dbeafe; color: #1d4ed8; }
+  :root[data-theme="light"] .pill.live,
+  :root[data-theme="light"] .pill.arch { background: #dcfce7; border-color: #86efac; color: #166534; }
+  :root[data-theme="light"] .pill.off { background: #fee2e2; border-color: #fecaca; color: #991b1b; }
+  :root[data-theme="light"] .pill.warn { background: #fef3c7; border-color: #fde68a; color: #92400e; }
+  :root[data-theme="light"] .banner.bad { border-color: #fecaca; background: #fff1f2; }
+  :root[data-theme="light"] .banner.bad b { color: #991b1b; }
+  :root[data-theme="light"] .banner.warn { border-color: #fde68a; background: #fffbeb; }
+  :root[data-theme="light"] .banner.warn b { color: #92400e; }
+  :root[data-theme="light"] .absent {
+    background: repeating-linear-gradient(135deg, #f8fafc, #f8fafc 9px, #f1f5f9 9px, #f1f5f9 18px);
+  }

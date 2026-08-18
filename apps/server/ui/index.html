@@ -1,0 +1,103 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SENTINEL Surveillance System</title>
+
+<!--
+  The operator console. One file, `include_str!`d into the server binary and
+  served at `/` and `/ui`. No build step and no external request: no CDN, no
+  webfont, no icon package. Icons are inline SVG symbols below, which is also
+  why none of them carry an `xmlns` — an HTML-parsed SVG does not need one, and
+  the URL in it would be the only outbound-looking string in the file.
+
+  The rule this page is built around: nothing on screen is invented. Every
+  number traces to `/api/*` or `/metrics`. Where the product design calls for a
+  panel the system cannot yet fill, the panel renders as an explicit
+  unimplemented state naming what is missing — never as a plausible number.
+-->
+
+<link rel="stylesheet" href="/ui/styles/base.css">
+<link rel="stylesheet" href="/ui/styles/layout.css">
+<link rel="stylesheet" href="/ui/styles/components.css">
+<link rel="stylesheet" href="/ui/styles/screens.css">
+<svg style="display:none" aria-hidden="true">
+  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="8" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="11" width="7" height="10" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/></symbol>
+  <symbol id="i-live" viewBox="0 0 24 24"><rect x="2.5" y="4.5" width="19" height="15" rx="2.5"/><path d="M10 9.5l5 2.5-5 2.5z"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5.3l3.4 2"/></symbol>
+  <symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 10-12 0c0 5-2 6.5-2 6.5h16S18 13 18 8z"/><path d="M10.3 18.5a2 2 0 003.4 0"/></symbol>
+  <symbol id="i-heat" viewBox="0 0 24 24"><path d="M4 20v-6M9 20V8M14 20v-9M19 20V5"/><circle cx="9" cy="5" r="1.6"/><circle cx="19" cy="2.6" r="1.2"/></symbol>
+  <symbol id="i-db" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="8" ry="3.2"/><path d="M4 6v12c0 1.8 3.6 3.2 8 3.2s8-1.4 8-3.2V6"/><path d="M4 12c0 1.8 3.6 3.2 8 3.2s8-1.4 8-3.2"/></symbol>
+  <symbol id="i-cam" viewBox="0 0 24 24"><rect x="2.5" y="6.5" width="13" height="11" rx="2"/><path d="M15.5 11l6-3.5v9l-6-3.5z"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.6l1.5 2.6 3-.4.5 3 2.7 1.4-1.4 2.7 1.4 2.7-2.7 1.4-.5 3-3-.4L12 21.4l-1.5-2.6-3 .4-.5-3-2.7-1.4L5.7 12 4.3 9.3l2.7-1.4.5-3 3 .4z"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2.6l7.5 3v6c0 5-3.2 8.6-7.5 9.8C7.7 20.2 4.5 16.6 4.5 11.6v-6z"/><path d="M9.3 12l1.9 1.9 3.6-3.8"/></symbol>
+  <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8.5" r="3.6"/><path d="M4.6 20a7.5 7.5 0 0114.8 0"/></symbol>
+  <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M6 9.5l6 5.5 6-5.5"/></symbol>
+  <symbol id="i-left" viewBox="0 0 24 24"><path d="M14.5 5.5L8 12l6.5 6.5"/></symbol>
+  <symbol id="i-expand" viewBox="0 0 24 24"><path d="M4 9V4.5h5M20 9V4.5h-5M4 15v4.5h5M20 15v4.5h-5"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 11-2.5-5.8"/><path d="M20 3.5V9h-5.4"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.3"/><path d="M15.4 15.4L20 20"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3.5l9 15.5H3z"/><path d="M12 9.5v4M12 16.4v.1"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 12.3l2.7 2.7L16 9.4"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.8l12 7.2-12 7.2z"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+  <symbol id="i-net" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.6 2.7 3.9 6 3.9 9s-1.3 6.3-3.9 9c-2.6-2.7-3.9-6-3.9-9S9.4 5.7 12 3z"/></symbol>
+  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v3.5M15.5 12v2.5"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M18.7 5.3l-2.1 2.1M7.4 16.6l-2.1 2.1"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20.5 15.2A8.5 8.5 0 018.8 3.5 8.5 8.5 0 1020.5 15.2z"/></symbol>
+</svg>
+
+<aside class="side">
+  <div class="brand">
+    <div class="mark"><svg class="ic xl"><use href="#i-shield"></use></svg></div>
+    <div class="who">
+      <div class="name">SENTINEL</div>
+      <div class="sub">Surveillance System</div>
+    </div>
+  </div>
+  <nav class="nav" id="nav"></nav>
+  <div class="side-foot">
+    <div class="gauges" id="gauges"></div>
+    <button class="collapse" data-act="collapse">
+      <svg class="ic"><use href="#i-left"></use></svg><span>Collapse</span>
+    </button>
+  </div>
+</aside>
+
+<div class="app">
+  <header class="top">
+    <div class="badge"><svg class="ic lg" id="page-icon"><use href="#i-dashboard"></use></svg></div>
+    <div>
+      <h1 id="page-title">Surveillance Dashboard</h1>
+      <div class="sub" id="page-sub">System overview and real-time status</div>
+    </div>
+    <div class="spacer"></div>
+    <div class="clock">
+      <div class="t" id="clock-time">--:--:--</div>
+      <div class="d" id="clock-date">&nbsp;</div>
+    </div>
+    <button class="btn icon" data-act="refresh" title="Refresh now">
+      <svg class="ic"><use href="#i-refresh"></use></svg>
+    </button>
+    <button class="btn icon" id="theme-toggle" data-act="theme" title="Use light mode" aria-label="Use light mode" aria-pressed="false">
+      <svg class="ic"><use id="theme-icon" href="#i-sun"></use></svg>
+    </button>
+    <button class="btn" data-act="logout" title="End this browser session">Sign out</button>
+    <div class="who">
+      <div class="avatar"><svg class="ic"><use href="#i-user"></use></svg></div>
+      <div class="id">
+        <b id="who-name">operator</b>
+        <span id="who-role">identity not reported</span>
+      </div>
+    </div>
+  </header>
+
+  <main id="main"></main>
+
+  <footer>
+    <div>SENTINEL Surveillance System &middot; self-hosted</div>
+    <div id="foot-right">&nbsp;</div>
+  </footer>
+</div>
+
+<script type="module" src="/ui/js/app.js"></script>

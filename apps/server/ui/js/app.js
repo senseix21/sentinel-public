@@ -1,570 +1,33 @@
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SENTINEL Surveillance System</title>
-
-<!--
-  The operator console. One file, `include_str!`d into the server binary and
-  served at `/` and `/ui`. No build step and no external request: no CDN, no
-  webfont, no icon package. Icons are inline SVG symbols below, which is also
-  why none of them carry an `xmlns` — an HTML-parsed SVG does not need one, and
-  the URL in it would be the only outbound-looking string in the file.
-
-  The rule this page is built around: nothing on screen is invented. Every
-  number traces to `/api/*` or `/metrics`. Where the product design calls for a
-  panel the system cannot yet fill, the panel renders as an explicit
-  unimplemented state naming what is missing — never as a plausible number.
--->
-
-<style>
-  :root {
-    --bg: #070b12;
-    --side: #0a0f18;
-    --panel: #0f151f;
-    --panel-2: #131b27;
-    --raise: #18212f;
-    --line: #1e2938;
-    --line-2: #27354a;
-    --text: #e6edf3;
-    --dim: #8a99ad;
-    --dimmer: #5b6879;
-    --blue: #3b82f6;
-    --blue-2: #60a5fa;
-    --green: #22c55e;
-    --red: #ef4444;
-    --amber: #f59e0b;
-    --purple: #a855f7;
-    --cyan: #22d3ee;
-    --radius: 10px;
-  }
-
-  * { box-sizing: border-box; }
-  /* The user-agent's `[hidden] { display: none }` is a bare attribute selector,
-     so any class rule that sets `display` outranks it. Several elements below
-     are both classed and toggled with `.hidden` — the idle overlay on a live
-     tile is the one that matters: without this, it keeps painting over a video
-     that is decoding fine. Make the attribute mean what it says. */
-  [hidden] { display: none !important; }
-
-  html, body {
-    margin: 0;
-    padding: 0;
-    background: var(--bg);
-    color: var(--text);
-    font: 13px/1.5 ui-sans-serif, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-    -webkit-font-smoothing: antialiased;
-  }
-
-  body {
-    display: grid;
-    grid-template-columns: 248px minmax(0, 1fr);
-    min-height: 100vh;
-  }
-
-  body.narrow { grid-template-columns: 68px minmax(0, 1fr); }
-
-  a { color: inherit; text-decoration: none; }
-  /* A camera identifier in a table is the only way into that camera's detail
-     view, so it has to look like the link it is. The navigation styles itself. */
-  table a { color: var(--blue); }
-  table a:hover { text-decoration: underline; }
-  button { font: inherit; color: inherit; }
-
-  .ic { width: 16px; height: 16px; flex: 0 0 auto; stroke: currentColor; fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
-  .ic.lg { width: 20px; height: 20px; }
-  .ic.xl { width: 26px; height: 26px; }
-
-  /* ---------- sidebar ---------- */
-
-  .side {
-    background: var(--side);
-    border-right: 1px solid var(--line);
-    display: flex;
-    flex-direction: column;
-    position: sticky;
-    top: 0;
-    height: 100vh;
-    overflow: hidden auto;
-  }
-
-  .brand {
-    display: flex;
-    align-items: center;
-    gap: 11px;
-    padding: 18px 18px 20px;
-    border-bottom: 1px solid var(--line);
-  }
-  .brand .mark {
-    width: 36px; height: 36px; flex: 0 0 auto;
-    display: grid; place-items: center;
-    border-radius: 9px;
-    background: linear-gradient(160deg, #1d4ed8, #0b3a8f);
-    color: #dbeafe;
-    box-shadow: 0 0 0 1px #2a4fa8 inset;
-  }
-  .brand .name { font-size: 16px; font-weight: 700; letter-spacing: 1.4px; }
-  .brand .sub { font-size: 10.5px; color: var(--dim); letter-spacing: 0.3px; }
-  body.narrow .brand .who { display: none; }
-
-  .nav { padding: 12px 10px; display: flex; flex-direction: column; gap: 2px; }
-  .nav a {
-    display: flex; align-items: center; gap: 12px;
-    padding: 9px 12px; border-radius: 8px;
-    color: var(--dim); font-size: 13px;
-    border-left: 2px solid transparent;
-  }
-  .nav a:hover { background: var(--panel); color: var(--text); }
-  .nav a.on {
-    background: var(--panel-2);
-    color: var(--blue-2);
-    border-left-color: var(--blue);
-    font-weight: 600;
-  }
-  body.narrow .nav a span { display: none; }
-
-  .side-foot { margin-top: auto; padding: 14px 12px 16px; }
-  .gauges {
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: var(--radius);
-    padding: 14px;
-  }
-  .gauges h4 { margin: 0 0 12px; font-size: 12.5px; font-weight: 600; }
-  .gauge { margin-bottom: 12px; }
-  .gauge:last-child { margin-bottom: 0; }
-  .gauge .lbl { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--dim); margin-bottom: 5px; }
-  .gauge .lbl b { color: var(--text); font-weight: 600; }
-  .bar { height: 4px; border-radius: 3px; background: var(--raise); overflow: hidden; }
-  .bar > i { display: block; height: 100%; border-radius: 3px; background: var(--blue); }
-  .gauge.na .bar > i { width: 0; }
-  .gauge.na .lbl b { color: var(--dimmer); font-weight: 400; font-style: italic; }
-  body.narrow .side-foot { display: none; }
-
-  .collapse {
-    margin-top: 12px; width: 100%;
-    display: flex; align-items: center; justify-content: center; gap: 8px;
-    padding: 9px; border-radius: 8px;
-    background: var(--panel); border: 1px solid var(--line);
-    color: var(--dim); cursor: pointer;
-  }
-  .collapse:hover { color: var(--text); }
-  body.narrow .collapse span { display: none; }
-
-  /* ---------- top bar ---------- */
-
-  .app { display: flex; flex-direction: column; min-width: 0; }
-
-  .top {
-    display: flex; align-items: center; gap: 16px;
-    padding: 14px 26px;
-    border-bottom: 1px solid var(--line);
-    background: linear-gradient(180deg, #0a1019, #070b12);
-    position: sticky; top: 0; z-index: 20;
-  }
-  .top .badge {
-    width: 38px; height: 38px; border-radius: 10px;
-    display: grid; place-items: center;
-    background: var(--panel-2); border: 1px solid var(--line-2);
-    color: var(--blue-2);
-  }
-  .top h1 { margin: 0; font-size: 19px; font-weight: 650; letter-spacing: 0.2px; }
-  .top .sub { font-size: 12px; color: var(--dim); }
-  .top .spacer { flex: 1; }
-  .clock { text-align: right; line-height: 1.25; }
-  .clock .t { font-size: 15px; font-variant-numeric: tabular-nums; }
-  .clock .d { font-size: 11px; color: var(--dim); }
-  .top .who {
-    display: flex; align-items: center; gap: 10px;
-    padding-left: 16px; border-left: 1px solid var(--line);
-  }
-  .avatar {
-    width: 32px; height: 32px; border-radius: 50%;
-    display: grid; place-items: center;
-    background: var(--panel-2); border: 1px solid var(--line-2); color: var(--dim);
-  }
-  .who .id { line-height: 1.25; max-width: 190px; }
-  .who .id b { font-size: 12.5px; font-weight: 600; display: block; }
-  .who .id span { font-size: 10.5px; color: var(--dim); display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-  main { padding: 22px 26px 34px; min-width: 0; }
-
-  footer {
-    margin-top: auto;
-    display: flex; justify-content: space-between;
-    padding: 14px 26px;
-    border-top: 1px solid var(--line);
-    color: var(--dimmer); font-size: 11.5px;
-  }
-
-  /* ---------- primitives ---------- */
-
-  .card {
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: var(--radius);
-    padding: 16px;
-    min-width: 0;
-  }
-  .card > h3 {
-    margin: 0 0 3px; font-size: 14px; font-weight: 650;
-    display: flex; align-items: center; gap: 9px;
-  }
-  .card > h3 .ic { color: var(--blue-2); }
-  .card > h3 .right { margin-left: auto; font-size: 11.5px; font-weight: 400; color: var(--dim); display: flex; gap: 10px; align-items: center; }
-  .card > .note { margin: 0 0 14px; color: var(--dim); font-size: 12px; }
-
-  .grid { display: grid; gap: 14px; }
-  .cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-  .cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .split { display: grid; grid-template-columns: minmax(0, 2.1fr) minmax(0, 1fr); gap: 14px; }
-  .split-wide { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 14px; }
-  @media (max-width: 1400px) {
-    .cols-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .split, .split-wide, .cols-3 { grid-template-columns: minmax(0, 1fr); }
-  }
-
-  .kpi { display: flex; align-items: flex-start; gap: 12px; }
-  .kpi .k { flex: 1; min-width: 0; }
-  .kpi .head { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--dim); margin-bottom: 8px; }
-  .kpi .big { font-size: 27px; font-weight: 650; line-height: 1.1; font-variant-numeric: tabular-nums; }
-  .kpi .big small { font-size: 15px; color: var(--dim); font-weight: 400; }
-  .kpi .foot { margin-top: 9px; font-size: 11.5px; }
-  .kpi .orb {
-    width: 46px; height: 46px; border-radius: 50%;
-    display: grid; place-items: center; flex: 0 0 auto;
-    border: 1px solid var(--line-2); background: var(--panel-2);
-  }
-  .spark { display: block; width: 100%; height: 30px; margin-top: 8px; overflow: visible; }
-
-  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--dimmer); flex: 0 0 auto; }
-  .dot.ok { background: var(--green); box-shadow: 0 0 7px #22c55e88; }
-  .dot.warn { background: var(--amber); }
-  .dot.bad { background: var(--red); box-shadow: 0 0 7px #ef444488; }
-  .dot.rec { background: var(--red); animation: pulse 2s ease-in-out infinite; }
-  @keyframes pulse { 50% { opacity: 0.35; } }
-
-  .pill {
-    display: inline-flex; align-items: center; gap: 5px;
-    padding: 2px 8px; border-radius: 5px;
-    font-size: 10.5px; font-weight: 650; letter-spacing: 0.5px;
-    border: 1px solid var(--line-2); background: var(--panel-2); color: var(--dim);
-  }
-  .pill.live { background: #052e16; border-color: #166534; color: #4ade80; }
-  .pill.off { background: #1c1417; border-color: #4c1d24; color: #fca5a5; }
-  .pill.arch { background: #052e16; border-color: #166534; color: #4ade80; }
-  .pill.warn { background: #2a1e05; border-color: #78500a; color: #fcd34d; }
-
-  .muted { color: var(--dim); }
-  .tiny { font-size: 11.5px; }
-  .ok { color: var(--green); }
-  .warn { color: var(--amber); }
-  .bad { color: var(--red); }
-  .row { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
-  .stack { display: flex; flex-direction: column; gap: 12px; }
-  .mt { margin-top: 14px; }
-
-  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-  th {
-    text-align: left; font-weight: 600; color: var(--dim); font-size: 11.5px;
-    padding: 9px 10px; border-bottom: 1px solid var(--line); white-space: nowrap;
-  }
-  td { padding: 10px; border-bottom: 1px solid #151d29; vertical-align: middle; }
-  tr:last-child td { border-bottom: 0; }
-  tbody tr:hover { background: #121a26; }
-  tr.sel { background: #10233f; box-shadow: inset 2px 0 0 var(--blue); }
-  .num { font-variant-numeric: tabular-nums; }
-  .wrap { overflow-x: auto; }
-
-  button.btn, .btn {
-    display: inline-flex; align-items: center; gap: 7px;
-    padding: 7px 13px; border-radius: 7px; cursor: pointer;
-    background: var(--panel-2); border: 1px solid var(--line-2); color: var(--text);
-    font-size: 12.5px;
-  }
-  .btn:hover { background: var(--raise); }
-  .btn.primary { background: #1d4ed8; border-color: #2563eb; color: #eff6ff; }
-  .btn.primary:hover { background: #2563eb; }
-  .btn.danger { border-color: #612020; color: #fca5a5; }
-  .btn.danger:hover { background: #2a1414; }
-  .btn:disabled { opacity: 0.45; cursor: not-allowed; }
-  .btn.icon { padding: 6px; }
-
-  .seg { display: inline-flex; gap: 3px; padding: 3px; border-radius: 8px; background: var(--panel); border: 1px solid var(--line); }
-  .seg button {
-    padding: 6px 9px; border-radius: 6px; cursor: pointer;
-    background: transparent; border: 0; color: var(--dim);
-    display: inline-flex; align-items: center; gap: 6px;
-  }
-  .seg button.on { background: #17335e; color: var(--blue-2); }
-  .seg button:hover { color: var(--text); }
-
-  label.f { display: block; font-size: 11.5px; color: var(--dim); margin-bottom: 6px; }
-  input.f, select.f {
-    width: 100%; padding: 8px 10px; border-radius: 7px;
-    background: #0b1119; border: 1px solid var(--line-2); color: var(--text);
-    font: inherit;
-  }
-  input.f:focus, select.f:focus { outline: 0; border-color: var(--blue); }
-  input.f:disabled { color: var(--dimmer); background: #090e15; }
-  .field { min-width: 0; }
-  /* An RTSP URL is far longer than a camera identifier or a pixel count, and at
-     `minmax(180px, 1fr)` it would be truncated in a box the same width as one
-     holding four digits. */
-  .field.grow { grid-column: span 2; }
-  .filters { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); align-items: end; }
-
-  .banner {
-    display: flex; gap: 11px; align-items: flex-start;
-    padding: 12px 14px; border-radius: 8px; margin: 12px 0;
-    border: 1px solid var(--line-2); background: var(--panel-2);
-    font-size: 12.5px;
-  }
-  .banner b { display: block; margin-bottom: 3px; }
-  .banner.bad { border-color: #612020; background: #1a0f10; }
-  .banner.bad b { color: #fca5a5; }
-  .banner.warn { border-color: #6b4a08; background: #191307; }
-  .banner.warn b { color: #fcd34d; }
-  .banner.info b { color: var(--blue-2); }
-  .banner .ic { margin-top: 1px; }
-
-  /* Unimplemented capability. Deliberately looks like a real panel so it sits
-     in the layout, and deliberately reads as an absence so it is never mistaken
-     for data. */
-  .absent {
-    border: 1px dashed var(--line-2);
-    border-radius: 8px;
-    padding: 22px;
-    background: repeating-linear-gradient(135deg, #0d131c, #0d131c 9px, #0f1621 9px, #0f1621 18px);
-    color: var(--dim);
-  }
-  .absent h4 { margin: 0 0 7px; color: var(--text); font-size: 13px; display: flex; align-items: center; gap: 8px; }
-  .absent p { margin: 0 0 9px; font-size: 12.5px; max-width: 70ch; }
-  .absent ul { margin: 0; padding-left: 18px; font-size: 12px; }
-  .absent li { margin-bottom: 3px; }
-  .absent code { background: #0b1119; padding: 1px 5px; border-radius: 4px; font-size: 11.5px; }
-
-  /* ---------- camera tiles ---------- */
-
-  .tiles { display: grid; gap: 12px; }
-  .tile {
-    background: var(--panel); border: 1px solid var(--line);
-    border-radius: var(--radius); overflow: hidden; min-width: 0;
-  }
-  .tile-head { display: flex; align-items: center; gap: 8px; padding: 9px 11px; font-size: 12px; }
-  .tile-head b { font-weight: 650; }
-  .tile-head .sp { flex: 1; }
-  .stage {
-    position: relative; aspect-ratio: 16 / 9; background: #05080d;
-    border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
-  }
-  .stage video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #05080d; }
-  .idle {
-    position: absolute; inset: 0;
-    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
-    color: var(--dimmer); font-size: 11.5px; text-align: center; padding: 12px;
-  }
-  .idle .ic { width: 26px; height: 26px; }
-  /* The footer must stay one line at any density, but the controls are the part
-     an operator needs: clipping the whole row hides the watch and stop buttons
-     at 5x. Only the LiveKit label is allowed to give up width. */
-  .tile-foot { display: flex; align-items: center; gap: 8px; padding: 8px 11px; font-size: 11.5px; color: var(--dim); white-space: nowrap; }
-  .tile-foot .row { flex-wrap: nowrap; }
-  .tile-foot .shrink { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-  .tile-foot .shrink .dot { flex: 0 0 auto; }
-  .tile-foot .lk-word { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-  /* At four or more tiles per row a footer is ~220px and the three controls take
-     most of it. Squeezing the words into the remainder renders two ellipses and
-     nothing readable, so drop them and keep the status dot; the chip's title
-     still carries the full state. */
-  .tiles[data-density="4"] .lk-word,
-  .tiles[data-density="5"] .lk-word { display: none; }
-  .tile-foot .btn { flex: 0 0 auto; }
-  .tile-foot .sp { flex: 1; }
-  .tile-note:empty { display: none; }
-  .tile-note { padding: 0 11px 10px; }
-  .tile-note .banner { margin: 0; }
-
-  .strip {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-    gap: 0; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
-  }
-  .strip > div { display: flex; align-items: center; gap: 12px; padding: 16px 18px; border-left: 1px solid var(--line); }
-  .strip > div:first-child { border-left: 0; }
-  .strip .v { font-size: 17px; font-weight: 650; font-variant-numeric: tabular-nums; }
-  .strip .l { font-size: 11.5px; color: var(--dim); }
-
-  /* ---------- donut ---------- */
-
-  .donut { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
-  .donut svg { width: 170px; height: 170px; flex: 0 0 auto; }
-  .donut .mid { font-size: 20px; font-weight: 650; fill: var(--text); }
-  .donut .mid2 { font-size: 9.5px; fill: var(--dim); }
-  .legend { flex: 1; min-width: 190px; font-size: 12.5px; }
-  .legend div { display: flex; align-items: center; gap: 9px; padding: 5px 0; }
-  .legend .sw { width: 9px; height: 9px; border-radius: 2px; }
-  .legend .nm { flex: 1; color: var(--dim); }
-
-  /* ---------- coverage / timeline ---------- */
-
-  .cover { display: flex; gap: 1px; height: 22px; border-radius: 5px; overflow: hidden; background: #0b1119; }
-  .cover i { flex: 1; background: var(--line); }
-  .cover i.has { background: var(--blue); }
-  .ticks { display: flex; justify-content: space-between; font-size: 10.5px; color: var(--dimmer); margin-top: 5px; }
-
-  .kv { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px 14px; font-size: 12.5px; }
-  .kv .k { color: var(--dim); }
-  .kv .v { text-align: right; font-variant-numeric: tabular-nums; }
-
-  .srow { display: grid; grid-template-columns: minmax(220px, 1.4fr) minmax(160px, 1fr) auto; gap: 12px; align-items: center; padding: 9px 0; border-bottom: 1px solid #151d29; }
-  .srow:last-child { border-bottom: 0; }
-  .srow .key { font-size: 12px; }
-  .srow .key small { display: block; color: var(--dimmer); font-size: 10.5px; }
-  .srow.dirty { background: #101a2c; box-shadow: inset 2px 0 0 var(--amber); }
-
-  .savebar {
-    position: sticky; bottom: 0; margin-top: 16px;
-    display: flex; align-items: center; gap: 12px;
-    padding: 13px 16px; border-radius: var(--radius);
-    background: var(--panel); border: 1px solid var(--line);
-  }
-  .savebar .sp { flex: 1; }
-</style>
-
-<svg style="display:none" aria-hidden="true">
-  <symbol id="i-dashboard" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="8" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="11" width="7" height="10" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/></symbol>
-  <symbol id="i-live" viewBox="0 0 24 24"><rect x="2.5" y="4.5" width="19" height="15" rx="2.5"/><path d="M10 9.5l5 2.5-5 2.5z"/></symbol>
-  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5.3l3.4 2"/></symbol>
-  <symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 10-12 0c0 5-2 6.5-2 6.5h16S18 13 18 8z"/><path d="M10.3 18.5a2 2 0 003.4 0"/></symbol>
-  <symbol id="i-heat" viewBox="0 0 24 24"><path d="M4 20v-6M9 20V8M14 20v-9M19 20V5"/><circle cx="9" cy="5" r="1.6"/><circle cx="19" cy="2.6" r="1.2"/></symbol>
-  <symbol id="i-db" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="8" ry="3.2"/><path d="M4 6v12c0 1.8 3.6 3.2 8 3.2s8-1.4 8-3.2V6"/><path d="M4 12c0 1.8 3.6 3.2 8 3.2s8-1.4 8-3.2"/></symbol>
-  <symbol id="i-cam" viewBox="0 0 24 24"><rect x="2.5" y="6.5" width="13" height="11" rx="2"/><path d="M15.5 11l6-3.5v9l-6-3.5z"/></symbol>
-  <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.6l1.5 2.6 3-.4.5 3 2.7 1.4-1.4 2.7 1.4 2.7-2.7 1.4-.5 3-3-.4L12 21.4l-1.5-2.6-3 .4-.5-3-2.7-1.4L5.7 12 4.3 9.3l2.7-1.4.5-3 3 .4z"/></symbol>
-  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2.6l7.5 3v6c0 5-3.2 8.6-7.5 9.8C7.7 20.2 4.5 16.6 4.5 11.6v-6z"/><path d="M9.3 12l1.9 1.9 3.6-3.8"/></symbol>
-  <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8.5" r="3.6"/><path d="M4.6 20a7.5 7.5 0 0114.8 0"/></symbol>
-  <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M6 9.5l6 5.5 6-5.5"/></symbol>
-  <symbol id="i-left" viewBox="0 0 24 24"><path d="M14.5 5.5L8 12l6.5 6.5"/></symbol>
-  <symbol id="i-expand" viewBox="0 0 24 24"><path d="M4 9V4.5h5M20 9V4.5h-5M4 15v4.5h5M20 15v4.5h-5"/></symbol>
-  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 11-2.5-5.8"/><path d="M20 3.5V9h-5.4"/></symbol>
-  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.3"/><path d="M15.4 15.4L20 20"/></symbol>
-  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 3.5l9 15.5H3z"/><path d="M12 9.5v4M12 16.4v.1"/></symbol>
-  <symbol id="i-check" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M8 12.3l2.7 2.7L16 9.4"/></symbol>
-  <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.8l12 7.2-12 7.2z"/></symbol>
-  <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
-  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
-  <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
-  <symbol id="i-net" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.6 2.7 3.9 6 3.9 9s-1.3 6.3-3.9 9c-2.6-2.7-3.9-6-3.9-9S9.4 5.7 12 3z"/></symbol>
-  <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v3.5M15.5 12v2.5"/></symbol>
-</svg>
-
-<aside class="side">
-  <div class="brand">
-    <div class="mark"><svg class="ic xl"><use href="#i-shield"></use></svg></div>
-    <div class="who">
-      <div class="name">SENTINEL</div>
-      <div class="sub">Surveillance System</div>
-    </div>
-  </div>
-  <nav class="nav" id="nav"></nav>
-  <div class="side-foot">
-    <div class="gauges" id="gauges"></div>
-    <button class="collapse" data-act="collapse">
-      <svg class="ic"><use href="#i-left"></use></svg><span>Collapse</span>
-    </button>
-  </div>
-</aside>
-
-<div class="app">
-  <header class="top">
-    <div class="badge"><svg class="ic lg" id="page-icon"><use href="#i-dashboard"></use></svg></div>
-    <div>
-      <h1 id="page-title">Surveillance Dashboard</h1>
-      <div class="sub" id="page-sub">System overview and real-time status</div>
-    </div>
-    <div class="spacer"></div>
-    <div class="clock">
-      <div class="t" id="clock-time">--:--:--</div>
-      <div class="d" id="clock-date">&nbsp;</div>
-    </div>
-    <button class="btn icon" data-act="refresh" title="Refresh now">
-      <svg class="ic"><use href="#i-refresh"></use></svg>
-    </button>
-    <button class="btn" data-act="logout" title="End this browser session">Sign out</button>
-    <div class="who">
-      <div class="avatar"><svg class="ic"><use href="#i-user"></use></svg></div>
-      <div class="id">
-        <b id="who-name">operator</b>
-        <span id="who-role">identity not reported</span>
-      </div>
-    </div>
-  </header>
-
-  <main id="main"></main>
-
-  <footer>
-    <div>SENTINEL Surveillance System &middot; self-hosted</div>
-    <div id="foot-right">&nbsp;</div>
-  </footer>
-</div>
-
-<script>
 "use strict";
 
+import { ApiError, api, apiText } from "./api.js";
+import { banner } from "./components/banner.js";
+import { absent } from "./components/empty-state.js";
+import { ago, bytes, esc, fmtPct, icon, pct, utc } from "./formatting.js";
+import { createMetricsView, parseMetrics } from "./metrics.js";
+import { contiguousRuns, coverageBuckets, createPlaybackState, playbackPath, recordingSearchPath, searchRange } from "./playback.js";
+import { SCREENS, parseRoute, screenFor } from "./router.js";
+import { createAppState, createTrendStore } from "./state.js";
+import { createThemeController } from "./theme.js";
+
+const state = createAppState();
+const { trends: trend, push: pushTrend } = createTrendStore();
+const metrics = createMetricsView(() => state.metrics);
+const metricSamples = metrics.samples;
+const metric = metrics.first;
+const metricSum = metrics.sum;
+const metricWhere = metrics.where;
+const theme = createThemeController();
+
+function route() {
+  return parseRoute(location.hash);
+}
+
+function currentScreen() {
+  return screenFor(location.hash);
+}
+
 // ---------------------------------------------------------------- utilities
-
-function esc(s) {
-  return String(s === null || s === undefined ? "" : s)
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-}
-
-function icon(name, cls) {
-  return `<svg class="ic ${cls || ""}"><use href="#i-${name}"></use></svg>`;
-}
-
-// `detail` is inserted as markup so a caller can link or emphasise inside it.
-// Every caller that interpolates server data through here escapes it first.
-function banner(kind, title, detail) {
-  const glyph = kind === "bad" || kind === "warn" ? "alert" : "check";
-  return `<div class="banner ${kind}">${icon(glyph)}<div><b>${esc(title)}</b>${detail || ""}</div></div>`;
-}
-
-function absent(title, why, needs) {
-  return `<div class="absent">
-      <h4>${icon("alert")}${esc(title)}</h4>
-      <p>${why}</p>
-      ${needs && needs.length ? `<ul>${needs.map((n) => `<li>${n}</li>`).join("")}</ul>` : ""}
-    </div>`;
-}
-
-class ApiError extends Error {
-  constructor(status, code, detail) {
-    super(code);
-    this.status = status;
-    this.code = code;
-    this.detail = detail;
-  }
-}
-
-async function api(path, options) {
-  const response = await fetch(path, Object.assign({ headers: { Accept: "application/json" } }, options || {}));
-  if (response.status === 401 && response.headers.get("X-Sentinel-Login")) {
-    window.location.assign(response.headers.get("X-Sentinel-Login"));
-    throw new ApiError(401, "session_expired");
-  }
-  const text = await response.text();
-  let body = null;
-  try { body = text ? JSON.parse(text) : null; } catch (error) { body = null; }
-  if (!response.ok) {
-    throw new ApiError(response.status, (body && body.error) || `http_${response.status}`, body && body.detail);
-  }
-  return body;
-}
-
-async function apiText(path) {
-  const response = await fetch(path);
-  if (!response.ok) throw new ApiError(response.status, `http_${response.status}`);
-  return response.text();
-}
 
 function errorBanner(error) {
   if (!(error instanceof ApiError)) {
@@ -590,115 +53,13 @@ function errorBanner(error) {
     `The server answered <code>${esc(error.code)}</code>.${error.detail ? ` ${esc(error.detail)}` : ""}`);
 }
 
-function utc(ms) {
-  if (ms === null || ms === undefined) return "—";
-  const d = new Date(Number(ms));
-  if (Number.isNaN(d.getTime())) return "—";
-  return d.toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
-}
-
-function ago(ms) {
-  if (ms === null || ms === undefined) return "—";
-  const seconds = Math.max(0, Math.round((Date.now() - Number(ms)) / 1000));
-  if (seconds < 60) return `${seconds}s ago`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
-  return `${Math.floor(seconds / 86400)}d ago`;
-}
-
-function bytes(n) {
-  if (n === null || n === undefined || !Number.isFinite(Number(n))) return "—";
-  let value = Number(n);
-  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
-  return `${value >= 100 || unit === 0 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
-}
-
-function pct(part, whole) {
-  if (!whole || !Number.isFinite(part / whole)) return null;
-  return (part / whole) * 100;
-}
-
-function fmtPct(value, digits) {
-  return value === null || value === undefined ? "—" : `${value.toFixed(digits === undefined ? 1 : digits)}%`;
-}
-
 // ---------------------------------------------------------- metrics reading
 
 // `/metrics` is the only source for facts the JSON API does not model — disk
 // capacity, retention passes, event-bus counters. It is Prometheus text, and it
 // is deliberately unauthenticated, so reading it here adds no API surface and
 // no new authorisation decision.
-function parseMetrics(text) {
-  const table = new Map();
-  for (const line of text.split("\n")) {
-    if (!line || line.charCodeAt(0) === 35) continue;
-    const cut = line.lastIndexOf(" ");
-    if (cut < 0) continue;
-    const value = Number(line.slice(cut + 1));
-    if (!Number.isFinite(value)) continue;
-    const key = line.slice(0, cut);
-    const brace = key.indexOf("{");
-    const name = brace < 0 ? key : key.slice(0, brace);
-    const labels = {};
-    if (brace >= 0) {
-      const inner = key.slice(brace + 1, key.lastIndexOf("}"));
-      for (const pair of inner.split(",")) {
-        const eq = pair.indexOf("=");
-        if (eq < 0) continue;
-        labels[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim().replace(/^"|"$/g, "");
-      }
-    }
-    if (!table.has(name)) table.set(name, []);
-    table.get(name).push({ labels, value });
-  }
-  return table;
-}
-
-function metricSamples(name) {
-  return (state.metrics && state.metrics.get(name)) || [];
-}
-
-function metric(name) {
-  const samples = metricSamples(name);
-  return samples.length ? samples[0].value : null;
-}
-
-function metricSum(name) {
-  const samples = metricSamples(name);
-  return samples.length ? samples.reduce((total, s) => total + s.value, 0) : null;
-}
-
-function metricWhere(name, label, value) {
-  const found = metricSamples(name).find((s) => s.labels[label] === value);
-  return found ? found.value : null;
-}
-
 // -------------------------------------------------------------------- state
-
-const state = {
-  cameras: null,
-  system: null,
-  settings: null,
-  settingsError: null,
-  metrics: null,
-  fleetError: null,
-  systemError: null,
-  loadedAt: null,
-};
-
-// Sparklines are built from what this browser has observed since the page was
-// opened, and are labelled as such. The server keeps no time series, so any
-// longer trend drawn here would be invented.
-const trend = { cameras: [], events: [], storage: [] };
-
-function pushTrend(key, value) {
-  if (value === null || value === undefined || !Number.isFinite(value)) return;
-  const series = trend[key];
-  series.push(value);
-  if (series.length > 60) series.shift();
-}
 
 // Detection ships with `DeterministicFakeInference` and no production model.
 // Until `/api/system` says otherwise, every detection count on this page is a
@@ -709,29 +70,6 @@ function detectionIsFixture() {
 }
 
 // --------------------------------------------------------------- navigation
-
-const SCREENS = [
-  { id: "dashboard", path: "/", icon: "dashboard", label: "Dashboard", title: "Surveillance Dashboard", sub: "System overview and real-time status" },
-  { id: "live", path: "/live", icon: "live", label: "Live View", title: "Live View", sub: "Attached publishers, one subscription per tile" },
-  { id: "playback", path: "/playback", icon: "clock", label: "Playback", title: "Historical Playback", sub: "Recorded segments from the indexed archive" },
-  { id: "events", path: "/events", icon: "bell", label: "Events", title: "Event Center", sub: "Domain events published on the in-process bus" },
-  { id: "heatmap", path: "/heatmap", icon: "heat", label: "Heatmap", title: "Heatmap Analytics", sub: "Spatial activity analysis" },
-  { id: "storage", path: "/storage", icon: "db", label: "Storage", title: "Storage", sub: "Capacity, retention and per-camera recording state" },
-  { id: "cameras", path: "/cameras", icon: "cam", label: "Cameras", title: "Cameras", sub: "Fleet management and per-camera health" },
-  { id: "settings", path: "/settings", icon: "gear", label: "Settings", title: "System Settings", sub: "Persistent, layered, transactionally applied configuration" },
-  { id: "system", path: "/system", icon: "shield", label: "System", title: "System", sub: "Capabilities, surfaces and instrumentation" },
-];
-
-function route() {
-  const raw = (location.hash || "#/").slice(1) || "/";
-  const parts = raw.split("/").filter(Boolean);
-  return { name: parts[0] || "dashboard", args: parts.slice(1).map(decodeURIComponent) };
-}
-
-function currentScreen() {
-  const name = route().name;
-  return SCREENS.find((s) => s.id === name) || SCREENS[0];
-}
 
 function renderNav() {
   const active = currentScreen().id;
@@ -1332,7 +670,7 @@ function screenLive() {
 
 // ------------------------------------------------------------------ playback
 
-const pb = { camera: "", date: "", from: "00:00:00", to: "01:00:00", result: null, error: null, busy: false, selected: null };
+const pb = createPlaybackState();
 
 // What the operator has typed into the add-camera form.
 //
@@ -1404,31 +742,6 @@ function playbackDetails() {
     </div>`;
 }
 
-// A range that spans a gap is two recordings, not one. The server refuses to
-// join across missing footage, because joined video would play continuously
-// while not being continuous. The gap is detected before a URL is offered.
-function contiguousRuns(recordings) {
-  const sorted = [...recordings].sort((a, b) => (a.started_at < b.started_at ? -1 : 1));
-  const runs = [];
-  let current = null;
-  for (const recording of sorted) {
-    if (current && current.ended_at === recording.started_at) {
-      current.ended_at = recording.ended_at;
-      current.count += 1;
-      current.bytes += Number(recording.size_bytes || 0);
-      continue;
-    }
-    current = {
-      started_at: recording.started_at,
-      ended_at: recording.ended_at,
-      count: 1,
-      bytes: Number(recording.size_bytes || 0),
-    };
-    runs.push(current);
-  }
-  return runs;
-}
-
 function playerPanel(result) {
   const runs = contiguousRuns(result.recordings);
   if (!runs.length) {
@@ -1488,21 +801,10 @@ function segmentPanel(result) {
 }
 
 function coverage(recordings) {
-  if (!recordings.length) return "";
-  // The server does not promise an order, so the extent is taken from the whole
-  // set rather than from the first row.
-  const first = Math.min(...recordings.map((r) => Date.parse(r.started_at)));
-  const last = Math.max(...recordings.map((r) => Date.parse(r.ended_at)));
-  const span = last - first || 1;
-  const buckets = 96;
-  const filled = new Array(buckets).fill(false);
-  for (const recording of recordings) {
-    const from = Math.floor(((Date.parse(recording.started_at) - first) / span) * buckets);
-    const to = Math.ceil(((Date.parse(recording.ended_at) - first) / span) * buckets);
-    for (let i = Math.max(0, from); i < Math.min(buckets, Math.max(to, from + 1)); i += 1) filled[i] = true;
-  }
-  return `<div class="cover">${filled.map((has) => `<i class="${has ? "has" : ""}"></i>`).join("")}</div>
-    <div class="ticks"><span>${esc(utc(first))}</span><span>${esc(utc(last))}</span></div>`;
+  const result = coverageBuckets(recordings);
+  if (!result) return "";
+  return `<div class="cover">${result.filled.map((has) => `<i class="${has ? "has" : ""}"></i>`).join("")}</div>
+    <div class="ticks"><span>${esc(utc(result.first))}</span><span>${esc(utc(result.last))}</span></div>`;
 }
 
 // -------------------------------------------------------------------- events
@@ -2195,6 +1497,11 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
+  if (act === "theme") {
+    theme.toggle();
+    return;
+  }
+
   if (act === "logout") {
     const response = await fetch("/logout", { method: "POST" });
     if (response.redirected) window.location.assign(response.url);
@@ -2235,8 +1542,7 @@ document.addEventListener("click", async (event) => {
   if (act === "play") {
     const video = document.getElementById("v");
     if (!video) return;
-    const url = `/api/cameras/${encodeURIComponent(pb.camera)}/recordings/playback`
-      + `?start=${encodeURIComponent(target.dataset.start)}&end=${encodeURIComponent(target.dataset.end)}`;
+    const url = playbackPath(pb.camera, target.dataset.start, target.dataset.end);
     // `setAttribute` rather than `.src`, so that the only assignment to a `src`
     // property in this file remains the one that loads the vendored SDK from
     // this server. That single site is what the no-external-request test pins.
@@ -2379,14 +1685,11 @@ async function loadPlayback() {
   pb.busy = true;
   pb.error = null;
   await render();
-  const from = `${pb.date}T${pb.from}Z`;
-  const to = `${pb.date}T${pb.to}Z`;
   try {
     // `start`/`end`, not `from`/`to`. The route reads those two names and
     // answers `missing_recording_range` to anything else, so the wrong pair
     // does not degrade — every search fails, whatever the range.
-    pb.result = await api(`/api/cameras/${encodeURIComponent(pb.camera)}/recordings`
-      + `?start=${encodeURIComponent(from)}&end=${encodeURIComponent(to)}`);
+    pb.result = await api(recordingSearchPath(pb.camera, searchRange(pb)));
   } catch (error) {
     pb.result = null;
     pb.error = error;
@@ -2434,6 +1737,7 @@ function startClock() {
 }
 
 (async function boot() {
+  theme.paint();
   startClock();
   renderNav();
   await Promise.all([loadSystem(), loadSettings()]);
@@ -2441,4 +1745,3 @@ function startClock() {
   await render();
   setInterval(tick, 5000);
 })();
-</script>
