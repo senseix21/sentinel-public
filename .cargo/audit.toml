@@ -1,0 +1,28 @@
+# Phase 8 (P8.10): cargo-audit configuration.
+#
+# `cargo audit` reads Cargo.lock, which lists every optional dependency of every
+# crate in the tree, including ones our feature selection never builds.
+# `cargo deny check advisories` reads the resolved dependency *graph* with
+# `all-features = true`. Both are run: deny is the accurate gate, audit is the
+# broader net that catches something deny's graph resolution might miss.
+#
+# An entry here needs a reason and a re-check condition. It is not a way to make
+# the gate green.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 - Marvin attack in `rsa`, no fixed version available.
+    #
+    # `rsa` reaches Cargo.lock through sqlx-mysql, which is an optional sqlx
+    # dependency. This workspace pins sqlx with `default-features = false` and
+    # only the postgres driver, so sqlx-mysql is never compiled.
+    #
+    # Verified, not assumed: `cargo tree -i rsa --target all` reports "nothing
+    # to print", and `cargo deny check advisories` (graph-aware, all features
+    # enabled) passes.
+    #
+    # Re-check if: a MySQL driver is ever enabled, `cargo tree -i rsa` starts
+    # returning a path, or a fixed `rsa` is released - at which point this
+    # entry is deleted rather than updated.
+    "RUSTSEC-2023-0071",
+]

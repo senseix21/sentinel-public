@@ -65,8 +65,6 @@ export SURVEILLANCE_LIVEKIT_URL="ws://127.0.0.1:7880"
 export SURVEILLANCE_LIVEKIT_API_KEY="devkey"
 export SURVEILLANCE_LIVEKIT_API_SECRET="development-secret"
 export SURVEILLANCE_LIVEKIT_NAMESPACE="surveillance"
-export SURVEILLANCE_LIVEKIT_CLI="${lk_bin}"
-export SURVEILLANCE_LIVEKIT_CLI_VERSION="2.18.2"
 
 "${repo_root}/scripts/phase0/retina-rtsp-fixture.sh" | tee "${fixture_root}/rtsp-fixture.log"
 

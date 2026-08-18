@@ -297,6 +297,16 @@ settings! {
         "api.max_request_bytes", Operational, Immediate, Public, Global, Unsigned, [];
     ApiIoTimeout =>
         "api.io_timeout", Operational, Immediate, Public, Global, Duration, [];
+    // Separate from `api.io_timeout` because it bounds a different thing. That
+    // one bounds a request or a JSON response, which a client has no reason to
+    // read slowly. A playback body is read by a media element, which stops
+    // reading on purpose once its buffer is full and does not read again until
+    // the buffer drains. At five seconds the server cancelled every browser
+    // that paced itself -- the client saw a few seconds of footage and rewound
+    // -- so this budget has to be sized for "the client is gone", not "the
+    // client is buffering".
+    ApiPlaybackStallTimeout =>
+        "api.playback_stall_timeout", Operational, Immediate, Public, Global, Duration, [];
     RetentionMaxAge =>
         "retention.max_age", Operational, ProcessRestart, Public, Global, Duration, [Retention];
     RetentionProtectedRecent =>
@@ -439,10 +449,6 @@ settings! {
     CameraLiveKitDeploymentNamespace =>
         "camera.livekit.deployment_namespace", Operational, PipelineRestart, Public, PerCamera,
         Text, [];
-    CameraLiveKitCliPath =>
-        "camera.livekit.cli_path", Operational, PipelineRestart, Public, PerCamera, Path, [];
-    CameraLiveKitCliVersion =>
-        "camera.livekit.cli_version", Operational, PipelineRestart, Public, PerCamera, Text, [];
     CameraLiveKitQueueItems =>
         "camera.livekit.queue_items", Operational, PipelineRestart, Public, PerCamera, Unsigned, [];
     CameraLiveKitMaxLag =>
@@ -450,9 +456,6 @@ settings! {
     CameraLiveKitMaxAccessUnitBytes =>
         "camera.livekit.max_access_unit_bytes", Operational, PipelineRestart, Public, PerCamera,
         Unsigned, [];
-    CameraLiveKitIpcWriteTimeout =>
-        "camera.livekit.ipc_write_timeout", Operational, PipelineRestart, Public, PerCamera,
-        Duration, [];
     CameraLiveKitShutdownTimeout =>
         "camera.livekit.shutdown_timeout", Operational, PipelineRestart, Public, PerCamera,
         Duration, [];
@@ -465,6 +468,11 @@ settings! {
     CameraLiveKitReconnectStableReset =>
         "camera.livekit.reconnect_stable_reset", Operational, PipelineRestart, Public, PerCamera,
         Duration, [];
+    CameraLiveKitDecoder =>
+        "camera.livekit.decoder", Operational, PipelineRestart, Public, PerCamera, Path, [];
+    CameraLiveKitMaxPublishHeight =>
+        "camera.livekit.max_publish_height", Operational, PipelineRestart, Public, PerCamera,
+        Unsigned, [];
 }
 
 impl SettingId {

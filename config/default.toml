@@ -42,6 +42,13 @@ command_timeout = "10s"
 mutating_surface_enabled = false
 max_request_bytes = 16384
 io_timeout = "5s"
+# Not io_timeout, and not a smaller number. A playback body is drained by a media
+# element, which stops reading once its buffer is full and does not read again
+# until the buffer drains. Bounded at io_timeout, that healthy client was treated
+# as a stalled one: the assembly was cancelled, the socket closed, and the
+# browser played the few seconds it had buffered and rewound. This is the budget
+# for "the client is gone", so it must outlast any client-side buffer.
+playback_stall_timeout = "60s"
 # The accept loop handles connections serially. That is a property of the
 # implementation, not a configurable limit, so it is documented here rather than
 # promoted to a setting that implies a limiter which does not exist.
@@ -120,13 +127,17 @@ decoder = "ffmpeg"
 decode_timeout = "2s"
 
 [camera.livekit]
-cli_path = "lk"
-cli_version = "2.4.14"
 queue_items = 8
 max_lag = "2s"
 max_access_unit_bytes = 2097152
-ipc_write_timeout = "2s"
 shutdown_timeout = "5s"
 reconnect_initial = "250ms"
 reconnect_maximum = "30s"
 reconnect_stable_reset = "30s"
+# Live publication decodes and lets LiveKit re-encode (ADR 012), so a decoder
+# is required for live viewing. Recording never uses it.
+decoder = "ffmpeg"
+# Ceiling on published picture height; 0 means publish at the camera's own
+# resolution. This is the largest CPU lever on the live path -- a 4K camera in
+# a browser tile costs several times what 720p costs and shows no more.
+max_publish_height = 0

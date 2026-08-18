@@ -4,11 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+# Internal to this workspace; never published to a registry.
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
+livekit.workspace = true
 livekit-api.workspace = true
 serde.workspace = true
 surveillance-common = { path = "../common" }
@@ -16,3 +19,8 @@ surveillance-media = { path = "../media" }
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+# Only to build the signal-client status codes the retry classification keys
+# off; nothing in the library takes an HTTP dependency.
+http.workspace = true

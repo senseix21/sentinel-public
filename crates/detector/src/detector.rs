@@ -471,6 +471,7 @@ impl DetectionHealth {
                 received: 0,
                 rejected_full: 0,
                 dropped_oldest: 0,
+                dropped_undecodable: 0,
                 dropped_on_close: 0,
                 consumer_open: false,
                 producer_open: false,

@@ -14,7 +14,8 @@ use surveillance_config::{
     value::SettingValue,
 };
 use surveillance_database::PostgresRecordingRepository;
-use surveillance_livekit::token::DevelopmentTokenService;
+use surveillance_detector::inference::compiled_backend;
+use surveillance_livekit::{config::LiveKitSettings, token::DevelopmentTokenService};
 use surveillance_storage::recordings::{
     PlaybackPlan, RecordingCursor, RecordingResultLimit, RecordingSearch, RecordingTimeRange,
 };
@@ -28,13 +29,828 @@ use crate::camera_supervisor::{
     CameraHealthRegistry, CameraStatusSnapshot, CameraSupervisorHandle, PipelineState,
     SupervisorRequestError,
 };
+use surveillance_auth::{
+    clock::{Clock, SystemClock},
+    principal::{CameraScope, Principal, PrincipalId, PrincipalKind, Role},
+    token::{IssuedToken, TokenId},
+    verify::{HashParams, Verifier},
+};
+use surveillance_database::{
+    access_audit::ANONYMOUS_ACTOR, AccessAuditRecord, AuditCategory, AuditOutcome, ExportExtent,
+    PostgresAccessAuditRepository, PostgresAuthRepository, RepositoryErrorCategory,
+};
+
 use crate::{
-    authorize::{authorize, Action, Denied, RequestContext},
+    authenticate::{
+        AuthMetrics, PresentedCredentials, RequestAuthenticator, SecurityContext, SecurityOwner,
+    },
+    authorize::{authorize, Action, Authorized, Denied, MutatingSurface, RequestContext},
     metadata_writer::MetadataWriterHandle,
     phase4_metrics::Phase4Metrics,
     playback::PlaybackAssembler,
     settings_service::{ConfigurationMetricsView, SettingsService},
+    trust_boundary::{
+        TrustBoundary, AUTHENTICATED_PRINCIPAL_HEADER, FORWARDED_FOR_HEADER, PROOF_HEADER,
+    },
 };
+
+/// Renders the P8.7 authentication and authorization series.
+///
+/// Cardinality is bounded by construction: the failure label comes from a
+/// seven-variant enum and the denial label from a five-variant one. A principal
+/// identifier or token identifier is deliberately never a label — it would be
+/// unbounded, and it would put an identity into every scrape and dashboard.
+fn render_auth_metrics(output: &mut String, auth: Option<&AuthMetrics>) {
+    use std::fmt::Write as _;
+
+    // Rendered as zeros when no identity store is configured, never omitted.
+    // An absent series makes `rate()` empty rather than 0, so an alert built on
+    // it silently never fires — worse than a series that reads zero.
+    //
+    // Found by running the server: with no database, `/metrics` exported no
+    // security series at all, including `surveillance_authz_decision_total` and
+    // `surveillance_proxy_proof_total`, which count global facts that have
+    // nothing to do with whether an identity store exists.
+    let succeeded = auth.map_or(0, AuthMetrics::succeeded);
+    let asserted = auth.map_or(0, AuthMetrics::asserted);
+    let unavailable = auth.map_or(0, AuthMetrics::unavailable);
+    let failures = auth.map_or_else(AuthMetrics::zeroed_failures, AuthMetrics::failures);
+
+    output.push_str(
+        "# HELP surveillance_auth_success_total Credentials accepted.\n\
+         # TYPE surveillance_auth_success_total counter\n",
+    );
+    let _ = writeln!(output, "surveillance_auth_success_total {succeeded}");
+
+    // A strict subset of the successes above: those that arrived as a proxy
+    // assertion rather than a bearer token this server verified itself. The
+    // difference between the two series is what tells an operator whether the
+    // browser path is in use, and whether it is in use when it should not be.
+    output.push_str(
+        "# HELP surveillance_auth_proxy_asserted_total Successes asserted by the trusted proxy.\n\
+         # TYPE surveillance_auth_proxy_asserted_total counter\n",
+    );
+    let _ = writeln!(output, "surveillance_auth_proxy_asserted_total {asserted}");
+
+    output.push_str(
+        "# HELP surveillance_auth_failure_total Credentials refused, by reason.\n\
+         # TYPE surveillance_auth_failure_total counter\n",
+    );
+    for (reason, count) in failures {
+        let _ = writeln!(
+            output,
+            "surveillance_auth_failure_total{{reason=\"{reason}\"}} {count}"
+        );
+    }
+
+    output.push_str(
+        "# HELP surveillance_auth_unavailable_total Identity store could not be consulted.\n\
+         # TYPE surveillance_auth_unavailable_total counter\n",
+    );
+    let _ = writeln!(output, "surveillance_auth_unavailable_total {unavailable}");
+
+    output.push_str(
+        "# HELP surveillance_authz_decision_total Authorization decisions, by outcome.\n\
+         # TYPE surveillance_authz_decision_total counter\n",
+    );
+    for (outcome, count) in crate::authorize::decision_counts() {
+        let _ = writeln!(
+            output,
+            "surveillance_authz_decision_total{{outcome=\"{outcome}\"}} {count}"
+        );
+    }
+
+    output.push_str(
+        "# HELP surveillance_proxy_proof_total Proof-of-origin outcomes, by result.\n\
+         # TYPE surveillance_proxy_proof_total counter\n",
+    );
+    for (outcome, count) in crate::trust_boundary::proof_counts() {
+        let _ = writeln!(
+            output,
+            "surveillance_proxy_proof_total{{outcome=\"{outcome}\"}} {count}"
+        );
+    }
+}
+
+/// The request's identity plus where its audit rows go.
+///
+/// Bundled because they always travel together: an authorization decision that
+/// is not recorded is exactly what P8.6 exists to prevent.
+pub(crate) struct Guard<'a> {
+    context: RequestContext,
+    audit: Option<&'a PostgresAccessAuditRepository>,
+}
+
+impl Guard<'_> {
+    pub(crate) const fn context(&self) -> &RequestContext {
+        &self.context
+    }
+}
+
+/// Authorizes and records the decision.
+///
+/// The single place an audit row is written for a protected request, for the
+/// same reason `authorize` is the single place a decision is made: an audit
+/// call per handler is an audit call that gets forgotten in a handler. This was
+/// forgotten wholesale — the audit schema and repository shipped with nothing
+/// writing to them, which running the server revealed as an empty table.
+///
+/// Returns the rendered refusal on `Err`, because every call site immediately
+/// renders one.
+///
+/// The read/write asymmetry is deliberate (see `crates/database/src/access_audit.rs`):
+/// a failed audit write **fails a mutating** operation, so "changed but
+/// unlogged" stays unrepresentable; a failed audit write on a **read** is
+/// counted and the read proceeds, because refusing reads when the audit store
+/// is down turns an audit outage into an observability outage during exactly
+/// the incident that needs both.
+async fn authorize_audited(guard: &Guard<'_>, action: Action) -> Result<Authorized, String> {
+    let mutating = action.is_mutating();
+    let category = audit_category(&action);
+    // Captured before `authorize` consumes the action. A denial row that says
+    // only "denied" tells an incident review that someone was refused but not
+    // what they reached for, which is the part that matters.
+    let label = action.as_str();
+    let camera = camera_of(&action).map(CameraId::as_str).map(str::to_owned);
+    let outcome = authorize(&guard.context, action);
+
+    let (result, reason) = match &outcome {
+        Ok(_) => (AuditOutcome::Granted, None),
+        Err(denied) => (AuditOutcome::Denied, Some(denial_reason(*denied))),
+    };
+
+    if let Some(repository) = guard.audit {
+        let actor = match &outcome {
+            Ok(authorized) => authorized.actor().as_str().to_owned(),
+            Err(_) => guard
+                .context
+                .authentication()
+                .principal()
+                .map_or_else(|| ANONYMOUS_ACTOR.to_owned(), Principal::audit_identity),
+        };
+        let mut record = AccessAuditRecord::new(category, label, &actor, result)
+            .with_client(guard.context.client());
+        if let Some(camera) = camera.as_deref() {
+            record = record.with_camera(camera);
+        }
+        if let Some(reason) = reason {
+            record = record.with_reason(reason);
+        }
+        if let Err(error) = repository.record(&record).await {
+            if mutating {
+                tracing::error!(%error, "audit write failed; the mutating operation was refused");
+                return Err(json_error("503 Service Unavailable", "audit_unavailable"));
+            }
+            tracing::warn!(%error, "audit write failed for a read; the read proceeded");
+        }
+    }
+
+    outcome.map_err(denial_response)
+}
+
+/// Routes `/api/identities`.
+///
+/// This surface exists because P8.6 requires auditing "authorization changes",
+/// and a change nothing can observe cannot be audited. Before this, the only
+/// way to create a principal or a token was raw SQL, which leaves no trail at
+/// all — the audit requirement was vacuous rather than met.
+///
+/// Every mutating route here is `ManageIdentities` (Administrator, and gated by
+/// `MutatingSurface` like any other reconfiguration). The listing is
+/// `ViewIdentities`, which is Administrator but not surface-gated: reading who
+/// has access must not require opening the mutating surface.
+async fn route_identities(
+    method: &str,
+    path: &str,
+    body: &[u8],
+    auth: Option<&PostgresAuthRepository>,
+    guard: &Guard<'_>,
+) -> String {
+    // Deliberately *after* the chokepoint in every arm below, not here. An
+    // early `503` would answer an unauthenticated caller before authorization
+    // ran, telling them whether an identity store is configured and skipping
+    // the chokepoint entirely. That is the same shape as the playback defect:
+    // a return path above the check.
+    let segments: Vec<_> = path.trim_matches('/').split('/').collect();
+
+    match (method, segments.as_slice()) {
+        ("GET", ["api", "identities"]) => {
+            match authorize_audited(guard, Action::ViewIdentities).await {
+                Ok(_authorized) => match auth {
+                    Some(repository) => list_identities(repository).await,
+                    None => json_error("503 Service Unavailable", "identity_store_unavailable"),
+                },
+                Err(response) => response,
+            }
+        }
+        ("POST", ["api", "identities"]) => {
+            match authorize_audited(guard, Action::ManageIdentities).await {
+                Ok(authorized) => match auth {
+                    Some(repository) => create_identity(body, repository, authorized).await,
+                    None => json_error("503 Service Unavailable", "identity_store_unavailable"),
+                },
+                Err(response) => response,
+            }
+        }
+        ("GET", ["api", "identities", id, "tokens"]) => {
+            match authorize_audited(guard, Action::ViewIdentities).await {
+                Ok(_authorized) => match auth {
+                    Some(repository) => list_identity_tokens(id, repository).await,
+                    None => json_error("503 Service Unavailable", "identity_store_unavailable"),
+                },
+                Err(response) => response,
+            }
+        }
+        ("POST", ["api", "identities", id, "tokens"]) => {
+            match authorize_audited(guard, Action::ManageIdentities).await {
+                Ok(authorized) => match auth {
+                    Some(repository) => mint_identity_token(id, body, repository, authorized).await,
+                    None => json_error("503 Service Unavailable", "identity_store_unavailable"),
+                },
+                Err(response) => response,
+            }
+        }
+        ("DELETE", ["api", "identities", id, "tokens", token]) => {
+            match authorize_audited(guard, Action::ManageIdentities).await {
+                Ok(authorized) => match auth {
+                    Some(repository) => {
+                        revoke_identity_token(id, token, repository, authorized).await
+                    }
+                    None => json_error("503 Service Unavailable", "identity_store_unavailable"),
+                },
+                Err(response) => response,
+            }
+        }
+        ("POST", ["api", "identities", id, "disable"]) => {
+            match authorize_audited(guard, Action::ManageIdentities).await {
+                Ok(authorized) => match auth {
+                    Some(repository) => {
+                        set_identity_enabled(id, false, repository, authorized).await
+                    }
+                    None => json_error("503 Service Unavailable", "identity_store_unavailable"),
+                },
+                Err(response) => response,
+            }
+        }
+        ("POST", ["api", "identities", id, "enable"]) => {
+            match authorize_audited(guard, Action::ManageIdentities).await {
+                Ok(authorized) => match auth {
+                    Some(repository) => {
+                        set_identity_enabled(id, true, repository, authorized).await
+                    }
+                    None => json_error("503 Service Unavailable", "identity_store_unavailable"),
+                },
+                Err(response) => response,
+            }
+        }
+        ("GET" | "POST" | "DELETE", _) => json_error("404 Not Found", "not_found"),
+        _ => json_error("405 Method Not Allowed", "method_not_allowed"),
+    }
+}
+
+async fn list_identities(repository: &PostgresAuthRepository) -> String {
+    match repository.list_principals().await {
+        Ok(principals) => {
+            let rendered: Vec<serde_json::Value> = principals
+                .iter()
+                .map(|principal| {
+                    serde_json::json!({
+                        "principal_id": principal.principal_id,
+                        "kind": principal.kind,
+                        "display_name": principal.display_name,
+                        "role": principal.role,
+                        "scope": if principal.scope_all { serde_json::Value::String("all".to_owned()) }
+                                 else { serde_json::json!(principal.cameras) },
+                        "enabled": principal.enabled,
+                        "live_tokens": principal.live_tokens,
+                    })
+                })
+                .collect();
+            json_response("200 OK", &serde_json::Value::Array(rendered))
+        }
+        Err(_) => json_error("503 Service Unavailable", "identity_store_unavailable"),
+    }
+}
+
+async fn list_identity_tokens(id: &str, repository: &PostgresAuthRepository) -> String {
+    let Ok(principal) = PrincipalId::new(id) else {
+        return json_error("400 Bad Request", "invalid_principal_id");
+    };
+    match repository.list_tokens(&principal).await {
+        Ok(tokens) => {
+            let rendered: Vec<serde_json::Value> = tokens
+                .iter()
+                .map(|token| {
+                    serde_json::json!({
+                        // The public half only. Never the secret, which the
+                        // store does not hold in a usable form anyway.
+                        "token_id": token.token_id,
+                        "label": token.label,
+                        "expires_at_unix": token.expires_at_unix,
+                        "revoked_at_unix": token.revoked_at_unix,
+                    })
+                })
+                .collect();
+            json_response("200 OK", &serde_json::Value::Array(rendered))
+        }
+        Err(_) => json_error("503 Service Unavailable", "identity_store_unavailable"),
+    }
+}
+
+/// Creates or replaces a principal.
+///
+/// Takes [`Authorized`] by value, so it cannot run without the chokepoint.
+async fn create_identity(
+    body: &[u8],
+    repository: &PostgresAuthRepository,
+    _authorized: Authorized,
+) -> String {
+    let Ok(request) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return json_error("400 Bad Request", "invalid_body");
+    };
+    let (Some(id), Some(role)) = (
+        request
+            .get("principal_id")
+            .and_then(serde_json::Value::as_str),
+        request.get("role").and_then(serde_json::Value::as_str),
+    ) else {
+        return json_error("400 Bad Request", "missing_field");
+    };
+    let Ok(principal_id) = PrincipalId::new(id) else {
+        return json_error("400 Bad Request", "invalid_principal_id");
+    };
+    let Ok(role) = Role::parse(role) else {
+        return json_error("400 Bad Request", "invalid_role");
+    };
+    let kind = match request.get("kind").and_then(serde_json::Value::as_str) {
+        None | Some("human") => PrincipalKind::Human,
+        Some("service") => PrincipalKind::Service,
+        Some(_) => return json_error("400 Bad Request", "invalid_kind"),
+    };
+    let display_name = request
+        .get("display_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(id);
+
+    // Absent `cameras` means every camera; an explicit list — including an
+    // empty one — means exactly that list. An empty scope is legal and is how a
+    // principal is held without camera access.
+    let scope = match request.get("cameras") {
+        None => CameraScope::All,
+        Some(serde_json::Value::Array(entries)) => {
+            let mut cameras = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let Some(name) = entry.as_str() else {
+                    return json_error("400 Bad Request", "invalid_camera_id");
+                };
+                let Ok(camera) = CameraId::new(name) else {
+                    return json_error("400 Bad Request", "invalid_camera_id");
+                };
+                cameras.push(camera);
+            }
+            match CameraScope::only(cameras) {
+                Ok(scope) => scope,
+                Err(_) => return json_error("400 Bad Request", "scope_too_large"),
+            }
+        }
+        Some(_) => return json_error("400 Bad Request", "invalid_scope"),
+    };
+
+    let enabled = request
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+
+    let Ok(principal) = Principal::new(principal_id, kind, display_name, role, scope, enabled)
+    else {
+        return json_error("400 Bad Request", "invalid_display_name");
+    };
+
+    match repository.upsert_principal(&principal).await {
+        Ok(()) => json_response(
+            "201 Created",
+            &serde_json::json!({ "principal_id": principal.id().as_str() }),
+        ),
+        // A scope naming a camera that does not exist violates the foreign key.
+        // That is the caller's mistake, not an outage, and reporting it as
+        // "store unavailable" sends an operator to the database runbook for a
+        // typo. Found live: creating a principal scoped to an unknown camera
+        // answered 503.
+        Err(error) if error.category() == RepositoryErrorCategory::Constraint => {
+            json_error("400 Bad Request", "unknown_camera_in_scope")
+        }
+        Err(_) => json_error("503 Service Unavailable", "identity_store_unavailable"),
+    }
+}
+
+/// Mints one token and returns it exactly once.
+async fn mint_identity_token(
+    id: &str,
+    body: &[u8],
+    repository: &PostgresAuthRepository,
+    _authorized: Authorized,
+) -> String {
+    let Ok(principal) = PrincipalId::new(id) else {
+        return json_error("400 Bad Request", "invalid_principal_id");
+    };
+    match repository.principal_exists(&principal).await {
+        Ok(true) => {}
+        Ok(false) => return json_error("404 Not Found", "principal_not_found"),
+        Err(_) => return json_error("503 Service Unavailable", "identity_store_unavailable"),
+    }
+
+    let request: serde_json::Value = serde_json::from_slice(body).unwrap_or(serde_json::json!({}));
+    let lifetime_days = request
+        .get("lifetime_days")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(90);
+    if lifetime_days <= 0 || lifetime_days > 3_650 {
+        return json_error("400 Bad Request", "invalid_lifetime");
+    }
+    let label = request.get("label").and_then(serde_json::Value::as_str);
+
+    let expires_at = SystemClock
+        .now()
+        .saturating_add_seconds(lifetime_days.saturating_mul(24 * 60 * 60));
+    let Ok(token) = IssuedToken::generate(expires_at) else {
+        return json_error("503 Service Unavailable", "entropy_unavailable");
+    };
+    let Ok(verifier) = Verifier::new(HashParams::default()) else {
+        return json_error("500 Internal Server Error", "verifier_unavailable");
+    };
+    let Ok(hash) = verifier.hash(token.secret()) else {
+        return json_error("500 Internal Server Error", "hashing_failed");
+    };
+
+    match repository
+        .insert_token(&token, &principal, &hash, label)
+        .await
+    {
+        // The plaintext appears here and nowhere else, ever. The store holds
+        // only the Argon2id hash, so this response is not recoverable later.
+        Ok(()) => json_response(
+            "201 Created",
+            &serde_json::json!({
+                "token_id": token.id().as_str(),
+                "token": token.render().expose(),
+                "expires_at_unix": expires_at.as_unix_seconds(),
+            }),
+        ),
+        Err(_) => json_error("503 Service Unavailable", "identity_store_unavailable"),
+    }
+}
+
+async fn revoke_identity_token(
+    id: &str,
+    token: &str,
+    repository: &PostgresAuthRepository,
+    _authorized: Authorized,
+) -> String {
+    let Ok(_principal) = PrincipalId::new(id) else {
+        return json_error("400 Bad Request", "invalid_principal_id");
+    };
+    let Ok(token_id) = TokenId::new(token) else {
+        return json_error("400 Bad Request", "invalid_token_id");
+    };
+    match repository.revoke_token(&token_id, SystemClock.now()).await {
+        Ok(true) => response("204 No Content", "application/json", ""),
+        // Already revoked, or no such token. Reported the same way so this
+        // endpoint cannot be used to probe which identifiers exist.
+        Ok(false) => json_error("404 Not Found", "token_not_found"),
+        Err(_) => json_error("503 Service Unavailable", "identity_store_unavailable"),
+    }
+}
+
+async fn set_identity_enabled(
+    id: &str,
+    enabled: bool,
+    repository: &PostgresAuthRepository,
+    _authorized: Authorized,
+) -> String {
+    let Ok(principal) = PrincipalId::new(id) else {
+        return json_error("400 Bad Request", "invalid_principal_id");
+    };
+    match repository.set_principal_enabled(&principal, enabled).await {
+        Ok(true) => json_response(
+            "200 OK",
+            &serde_json::json!({ "principal_id": id, "enabled": enabled }),
+        ),
+        Ok(false) => json_error("404 Not Found", "principal_not_found"),
+        Err(_) => json_error("503 Service Unavailable", "identity_store_unavailable"),
+    }
+}
+
+/// Records what a playback request actually handed over.
+///
+/// Separate from [`authorize_audited`] because the interesting fields — how
+/// many bytes and over which range — are only known after streaming, and the
+/// authorization row is written before it. Two rows per export is the honest
+/// shape: one says who was allowed, one says what left.
+async fn record_export(
+    guard: &Guard<'_>,
+    camera: &CameraId,
+    exported: Option<Exported>,
+    result: &io::Result<Exported>,
+) {
+    let Some(repository) = guard.audit else {
+        return;
+    };
+    // The schema refuses an export row without a complete extent, so a request
+    // that never named a valid range is recorded as a plain authorization
+    // failure rather than with a fabricated range.
+    let Some(extent) = exported.and_then(Exported::extent) else {
+        return;
+    };
+
+    let actor = guard
+        .context
+        .authentication()
+        .principal()
+        .map_or_else(|| ANONYMOUS_ACTOR.to_owned(), Principal::audit_identity);
+    let outcome = if result.is_ok() {
+        AuditOutcome::Succeeded
+    } else {
+        AuditOutcome::Failed
+    };
+    let record = AccessAuditRecord::export(&actor, camera.as_str(), outcome, extent)
+        .with_client(guard.context.client());
+
+    if let Err(error) = repository.record(&record).await {
+        // The footage has already left; refusing now would change nothing and
+        // the connection is finished. Loud, and counted by the caller's own
+        // failure metric.
+        tracing::error!(
+            %error,
+            camera = camera.as_str(),
+            bytes = exported.map_or(0, Exported::bytes),
+            "export audit write failed; footage left the system unrecorded"
+        );
+    }
+}
+
+/// Which audit category an authorization *decision* belongs to.
+///
+/// `ExportRecording` maps to `Authorization`, not `Export`. The `export`
+/// category is reserved for the row that carries the extent — who, which
+/// camera, which range, how many bytes — and the schema refuses an export row
+/// without all of it. Categorising the decision row as `export` made every
+/// playback request violate `access_audit_export_fields_together`; because an
+/// export is a read, the failure was logged and swallowed, so the request
+/// succeeded and produced no audit row at all. Found live by requesting
+/// playback and getting an empty table.
+const fn audit_category(action: &Action) -> AuditCategory {
+    match action {
+        // Both, so "show me everything that touched identities" is one query.
+        Action::ManageIdentities | Action::ViewIdentities => AuditCategory::Identity,
+        Action::StartCamera(_)
+        | Action::StopCamera(_)
+        | Action::AddCamera
+        | Action::RemoveCamera(_) => AuditCategory::Camera,
+        _ => AuditCategory::Authorization,
+    }
+}
+
+/// The camera an action names, for the audit row's own column.
+const fn camera_of(action: &Action) -> Option<&CameraId> {
+    match action.scope() {
+        crate::authorize::ActionScope::Camera(camera) => Some(camera),
+        crate::authorize::ActionScope::Global => None,
+    }
+}
+
+/// A bounded reason label. `&'static str` so request text can never reach the
+/// audit column.
+const fn denial_reason(denied: Denied) -> &'static str {
+    match denied {
+        Denied::SurfaceDisabled => "surface_disabled",
+        Denied::Unauthenticated(failure) => failure.as_str(),
+        Denied::Unauthorized => "unauthorized",
+        Denied::NotInScope => "not_in_scope",
+        Denied::ShuttingDown => "shutting_down",
+    }
+}
+
+/// Establishes who is calling, from a parsed request head.
+///
+/// Shared by [`route_with_recordings`] and by the playback short-circuit in
+/// [`handle_client`]. Playback streams a response body, so it cannot go through
+/// the string-returning router — and a second path into the handlers is exactly
+/// how an endpoint ends up unauthenticated. It did: before this function
+/// existed, `GET /api/cameras/{id}/recordings/playback` never reached the
+/// chokepoint at all, which made the most sensitive endpoint in the system —
+/// the one that streams actual footage — the only unauthenticated one.
+///
+/// Returns `None` when an identity store is configured but unreachable. That is
+/// an outage and the caller renders `503`, never `401`.
+async fn establish_context(
+    head: &str,
+    peer: Option<std::net::IpAddr>,
+    security: &SecurityContext<'_>,
+    surface: MutatingSurface,
+) -> Option<RequestContext> {
+    let resolved = security.boundary.resolve(
+        peer,
+        header_value(head, FORWARDED_FOR_HEADER).as_deref(),
+        header_value(head, PROOF_HEADER).as_deref(),
+    );
+    // The asserted-principal header is read out of the request unconditionally
+    // but handed to `from_outcome`, which discards it unless `resolved` proves
+    // the request came from the configured proxy. Reading it here and deciding
+    // there keeps the decision in one place; the value never reaches
+    // `authenticate` without its proof.
+    let authentication = security
+        .authenticate(
+            PresentedCredentials::from_outcome(
+                resolved.outcome(),
+                header_value(head, "authorization").as_deref(),
+                header_value(head, AUTHENTICATED_PRINCIPAL_HEADER).as_deref(),
+            ),
+            peer,
+        )
+        .await
+        .ok()?;
+    Some(RequestContext::new(
+        peer,
+        resolved.client(),
+        authentication,
+        surface,
+        security.shutting_down,
+    ))
+}
+
+/// Splits a raw request into its head, for header reading.
+fn request_head(request: &[u8]) -> Option<&str> {
+    let header_end = find_header_end(request)?;
+    std::str::from_utf8(&request[..header_end]).ok()
+}
+
+/// Reads one request header, case-insensitively.
+///
+/// The hand-rolled parser elsewhere in this module reads the request line; this
+/// reads a named header from the same head. Returns the first occurrence:
+/// duplicate `Authorization` headers are a smuggling smell, and taking the
+/// first means an appended one cannot override an earlier one.
+fn header_value(head: &str, name: &str) -> Option<String> {
+    head.lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .find(|(field, _)| field.trim().eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim().to_owned())
+}
+
+/// Which optional surfaces this deployment actually wired in.
+///
+/// Every field is read from whether the corresponding collaborator was passed
+/// to the router, not from configuration intent. A surface that is configured
+/// but failed to construct reports `false`, which is the useful answer: it says
+/// what the API will actually do, not what someone meant it to do.
+#[derive(Clone, Copy, Debug, Serialize)]
+// Five independent yes/no facts about one deployment, serialised by name. The
+// excessive-bools lint guards against positional confusion at call sites; there
+// is one call site and it names every field, and the JSON keys are the whole
+// point of the shape.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "five independent surfaces, serialised by name at the single call site"
+)]
+struct SurfaceAvailability {
+    recording_index: bool,
+    viewer_tokens: bool,
+    settings: bool,
+    identities: bool,
+    access_audit: bool,
+}
+
+/// Describes what this deployment can and cannot do.
+///
+/// This endpoint exists for one reason above the others: **detection results
+/// are a fixture**, and nothing in a `DetectionSet` reveals that. A UI built
+/// against correctly-shaped, correctly-timestamped fake detections will show a
+/// person count that looks entirely real. Making the fixture a machine-readable
+/// field means a client can refuse to render it, instead of relying on whoever
+/// builds the client having read the documentation.
+///
+/// The playback fields serve the same purpose for a subtler lie: the stream is
+/// assembled on demand and segment-aligned, so a frame-accurate scrubber is not
+/// something the server can honour.
+///
+/// `authorized` is unused beyond proving the chokepoint was passed — the type
+/// has no public constructor, so requiring it here is what makes an
+/// unauthenticated call to this handler fail to compile.
+/// Authorizes and renders `GET /api/system`.
+///
+/// Split out only to keep `route_with_recordings` under the line limit; the
+/// authorization shape is identical to every other read.
+async fn route_system(surfaces: SurfaceAvailability, guard: &Guard<'_>) -> String {
+    match authorize_audited(guard, Action::ViewSystemCapabilities).await {
+        Ok(authorized) => system_capabilities(surfaces, &authorized),
+        Err(response) => response,
+    }
+}
+
+fn system_capabilities(surfaces: SurfaceAvailability, _authorized: &Authorized) -> String {
+    // Derived by asking the compiled implementation, not by naming it here. A
+    // hardcoded string would keep saying "fake" after a real model landed, or —
+    // worse — could be edited to say "production" without anything changing.
+    let detection = match compiled_backend() {
+        Ok(descriptor) => DetectionCapability {
+            model_name: descriptor.model_name().to_owned(),
+            model_version: descriptor.model_version().to_owned(),
+            is_production_model: descriptor.is_production(),
+            results_are_fixture: !descriptor.is_production(),
+        },
+        // Unknown is reported as unknown, and still as a fixture. Defaulting to
+        // "production" would be the one unrecoverable mistake this endpoint
+        // exists to prevent.
+        Err(_) => DetectionCapability {
+            model_name: "unknown".to_owned(),
+            model_version: "unknown".to_owned(),
+            is_production_model: false,
+            results_are_fixture: true,
+        },
+    };
+    json_response(
+        "200 OK",
+        &SystemCapabilities {
+            detection,
+            playback: PlaybackCapability {
+                accuracy: "segment-aligned",
+                seekable: false,
+                transport: "chunked-stream",
+            },
+            surfaces,
+        },
+    )
+}
+
+#[derive(Serialize)]
+struct SystemCapabilities {
+    detection: DetectionCapability,
+    playback: PlaybackCapability,
+    surfaces: SurfaceAvailability,
+}
+
+#[derive(Serialize)]
+struct DetectionCapability {
+    model_name: String,
+    model_version: String,
+    is_production_model: bool,
+    /// The field a client is expected to branch on. Named for what it means to
+    /// a consumer rather than for the implementation behind it.
+    results_are_fixture: bool,
+}
+
+#[derive(Serialize)]
+struct PlaybackCapability {
+    /// `segment-aligned`: a request is served from whole segments, so the media
+    /// returned may begin before, and end after, the requested instant.
+    accuracy: &'static str,
+    /// Always `false`. The endpoint answers `Accept-Ranges: none` to match.
+    seekable: bool,
+    transport: &'static str,
+}
+
+/// Renders a refusal.
+///
+/// The status codes carry meaning that the threat model depends on:
+///
+/// - `SurfaceDisabled` is `404` so a deployment that has not opted in does not
+///   advertise the endpoint;
+/// - `NotInScope` is `404` so a scoped principal cannot enumerate cameras by
+///   distinguishing "forbidden" from "absent";
+/// - `Unauthenticated` is `401` with a constant body, so the specific
+///   [`AuthFailure`](surveillance_auth::verify::AuthFailure) — expired, revoked,
+///   unknown — stays in the audit trail and out of the response.
+fn denial_response(denied: Denied) -> String {
+    match denied {
+        Denied::SurfaceDisabled | Denied::NotInScope => json_error("404 Not Found", "not_found"),
+        Denied::Unauthenticated(_) => json_error("401 Unauthorized", "unauthenticated"),
+        Denied::Unauthorized => json_error("403 Forbidden", "unauthorized"),
+        Denied::ShuttingDown => json_error("503 Service Unavailable", "shutting_down"),
+    }
+}
+
+/// The camera snapshots this principal is scoped to see.
+///
+/// Filtering the *listing* matters as much as refusing a direct read: an
+/// unfiltered list hands a scoped operator the estate inventory that
+/// [`Denied::NotInScope`]'s `404` is there to withhold.
+fn visible_snapshots(
+    registry: &CameraHealthRegistry,
+    context: &RequestContext,
+) -> Vec<CameraStatusSnapshot> {
+    let snapshots = registry.snapshots();
+    let Some(principal) = context.authentication().principal() else {
+        return Vec::new();
+    };
+    if principal.scope().is_all() {
+        return snapshots;
+    }
+    snapshots
+        .into_iter()
+        .filter(|snapshot| principal.scope().permits(&snapshot.camera_id))
+        .collect()
+}
 
 /// Fallbacks used only when no settings service is present.
 ///
@@ -43,6 +859,27 @@ use crate::{
 /// changing behavior.
 const DEFAULT_MAX_REQUEST_BYTES: usize = 16 * 1024;
 const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_PLAYBACK_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The operator dashboard, compiled into the binary.
+///
+/// `include_str!` rather than a served directory: there is one artifact to ship,
+/// nothing to path-traverse, and the page cannot drift from the API it was
+/// written against — a mismatch would be a build failure, not a broken screen.
+const DASHBOARD: &str = include_str!("../ui/dashboard.html");
+
+/// The `LiveKit` browser SDK, compiled into the binary for the same reasons.
+///
+/// Vendored rather than fetched from a CDN: the dashboard makes no external
+/// request, so a live player cannot depend on one either. Serving it as its own
+/// same-origin asset instead of inlining it into the page keeps the HTML
+/// readable and keeps half a megabyte off every page load — the dashboard
+/// fetches it on the first "Watch live" press, not at boot. It is `no-store`
+/// like everything else here, so an upgrade cannot leave a browser running the
+/// previous SDK against the current server.
+///
+/// Provenance, version, and hash are recorded in `ui/vendor/README.md`.
+const LIVEKIT_CLIENT: &str = include_str!("../ui/vendor/livekit-client.umd.js");
 
 /// Reads the request bounds for this request.
 ///
@@ -68,6 +905,78 @@ async fn request_bounds(settings: Option<&SettingsService>) -> (usize, Duration)
     (bytes, timeout)
 }
 
+/// Reads how long a playback body may make no progress before it is abandoned.
+///
+/// Deliberately not [`request_bounds`]'s `api.io_timeout`. That one bounds a
+/// request or a JSON response, where a client that goes quiet for five seconds
+/// really has gone away. A playback body is drained by a media element, which
+/// stops reading the moment its buffer is full and does not read again until the
+/// buffer drains — behaviour every browser has. Bounding it at `api.io_timeout`
+/// cancelled the assembly under any paced reader, and the client, which had been
+/// handed only the few seconds it managed to buffer before the socket closed,
+/// treated that as the whole recording and rewound to its start.
+///
+/// Read per request for the same reason `api.io_timeout` is: it is `Immediate`.
+async fn playback_stall_timeout(settings: Option<&SettingsService>) -> Duration {
+    let Some(service) = settings else {
+        return DEFAULT_PLAYBACK_STALL_TIMEOUT;
+    };
+    match service
+        .effective_value(SettingId::ApiPlaybackStallTimeout, None)
+        .await
+    {
+        Some(SettingValue::Duration(value)) => value,
+        _ => DEFAULT_PLAYBACK_STALL_TIMEOUT,
+    }
+}
+
+/// The deployment-wide template a camera created through the API is built from.
+///
+/// Neither half is a per-camera fact. Every camera on a unit records beneath the
+/// same root, and a unit publishes to one `LiveKit` deployment, so the endpoint,
+/// credentials, namespace, adapter, and queue tuning are identical for every
+/// camera that publishes at all. What varies per camera is one bit: whether it
+/// publishes.
+///
+/// That is why this arrives from the process owner rather than from a request
+/// body. `LiveKitSettings` carries an API secret, and `POST /api/cameras` must
+/// never be a route by which a caller supplies one, learns one, or substitutes
+/// an endpoint of their choosing.
+pub struct CameraDefaults {
+    recording_root: PathBuf,
+    livekit: Option<LiveKitSettings>,
+}
+
+impl CameraDefaults {
+    /// Builds the template. `livekit` is `None` when the deployment publishes
+    /// nowhere, which makes [`Self::publishes_live`] false and every request to
+    /// enable publication a rejection rather than a silent no-op.
+    #[must_use]
+    pub const fn new(recording_root: PathBuf, livekit: Option<LiveKitSettings>) -> Self {
+        Self {
+            recording_root,
+            livekit,
+        }
+    }
+
+    #[must_use]
+    pub fn recording_root(&self) -> &std::path::Path {
+        &self.recording_root
+    }
+
+    /// Whether this deployment publishes to `LiveKit` at all.
+    #[must_use]
+    pub const fn publishes_live(&self) -> bool {
+        self.livekit.is_some()
+    }
+
+    /// A copy of the deployment template for one camera. Private: the secret it
+    /// carries stays inside this module, and the only caller is the add path.
+    fn livekit(&self) -> Option<LiveKitSettings> {
+        self.livekit.clone()
+    }
+}
+
 /// Runs one bounded sequential loopback adapter until requested shutdown.
 ///
 /// Listener/client failure is returned to its process owner and never sends a
@@ -83,7 +992,7 @@ async fn request_bounds(settings: Option<&SettingsService>) -> (usize, Duration)
 )]
 pub async fn serve_health(
     address: SocketAddr,
-    recording_root: PathBuf,
+    camera_defaults: CameraDefaults,
     registry: CameraHealthRegistry,
     supervisor: CameraSupervisorHandle,
     recordings: Option<PostgresRecordingRepository>,
@@ -92,6 +1001,9 @@ pub async fn serve_health(
     phase4: Option<Phase4Metrics>,
     viewer_tokens: Option<DevelopmentTokenService>,
     settings: Option<Arc<SettingsService>>,
+    security: Option<Arc<SecurityOwner>>,
+    access_audit: Option<PostgresAccessAuditRepository>,
+    identities: Option<Arc<PostgresAuthRepository>>,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     if !address.ip().is_loopback() {
@@ -111,7 +1023,11 @@ pub async fn serve_health(
             }
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
-                if let Err(error) = Box::pin(handle_client(stream, &recording_root, &registry, &supervisor, recordings.as_ref(), playback.as_ref(), metadata.as_ref(), phase4.as_ref(), viewer_tokens.as_ref(), settings.as_deref(), Some(peer.ip()))).await {
+                // Read fresh per request: a mutation that arrives after the
+                // drain begins must be refused, not admitted because the
+                // listener started before the signal.
+                let draining = *shutdown.borrow();
+                if let Err(error) = Box::pin(handle_client(stream, &camera_defaults, &registry, &supervisor, recordings.as_ref(), playback.as_ref(), metadata.as_ref(), phase4.as_ref(), viewer_tokens.as_ref(), settings.as_deref(), Some(peer.ip()), security.as_deref(), access_audit.as_ref(), identities.as_deref(), draining)).await {
                     tracing::debug!(%peer, %error, "API client request discarded");
                 }
             }
@@ -125,7 +1041,7 @@ pub async fn serve_health(
 )]
 async fn handle_client(
     mut stream: TcpStream,
-    recording_root: &std::path::Path,
+    camera_defaults: &CameraDefaults,
     registry: &CameraHealthRegistry,
     supervisor: &CameraSupervisorHandle,
     recordings: Option<&PostgresRecordingRepository>,
@@ -135,26 +1051,84 @@ async fn handle_client(
     viewer_tokens: Option<&DevelopmentTokenService>,
     settings: Option<&SettingsService>,
     peer: Option<std::net::IpAddr>,
+    security: Option<&SecurityOwner>,
+    access_audit: Option<&PostgresAccessAuditRepository>,
+    identities: Option<&PostgresAuthRepository>,
+    shutting_down: bool,
 ) -> io::Result<()> {
     let (max_request_bytes, io_timeout) = request_bounds(settings).await;
     let request = read_request(&mut stream, max_request_bytes, io_timeout).await?;
     if let (Some(repository), Some(assembler), Some((camera_id, query))) =
         (recordings, playback, playback_target(&request))
     {
-        return Box::pin(stream_playback(
+        // Playback streams a response body, so it cannot go through the
+        // string-returning router — but it still has to reach the chokepoint.
+        // It streams actual footage, which makes it the endpoint that least
+        // tolerates being missed.
+        let default_security = SecurityOwner::loopback_development();
+        let owner = security.unwrap_or(&default_security);
+        let context = match request_head(&request) {
+            Some(head) => {
+                establish_context(
+                    head,
+                    peer,
+                    &owner.context(shutting_down),
+                    settings.map_or(MutatingSurface::Disabled, SettingsService::surface),
+                )
+                .await
+            }
+            None => None,
+        };
+        let Some(context) = context else {
+            return write_response(
+                &mut stream,
+                io_timeout,
+                &json_error("503 Service Unavailable", "identity_store_unavailable"),
+            )
+            .await;
+        };
+        // `ExportRecording`, not `ViewRecordings`: this is the only path by
+        // which media leaves the system, so calling it a "view" would be a
+        // fiction — the client can save whatever it is streamed. The role stays
+        // Viewer (see `Action::required_role`); what the stronger action buys
+        // is the export audit row below, which the threat model (B7) names as
+        // the only available control on insider export.
+        let guard = Guard {
+            context,
+            audit: access_audit,
+        };
+        if let Err(response) =
+            authorize_audited(&guard, Action::ExportRecording(camera_id.clone())).await
+        {
+            return write_response(&mut stream, io_timeout, &response).await;
+        }
+        let exported = Box::pin(stream_playback(
             &mut stream,
-            camera_id,
+            camera_id.clone(),
             query,
             repository,
             assembler,
             phase4,
-            io_timeout,
+            playback_stall_timeout(settings).await,
         ))
         .await;
+
+        // Written after streaming, because the byte count is only known then.
+        // A failure mid-stream still produces a row: partial footage left the
+        // system, and an audit trail that recorded only clean successes would
+        // be exactly the one an incident cannot use.
+        record_export(
+            &guard,
+            &camera_id,
+            exported.as_ref().ok().copied(),
+            &exported,
+        )
+        .await;
+        return exported.map(|_| ());
     }
     let response = route_with_recordings(
         &request,
-        recording_root,
+        camera_defaults,
         registry,
         supervisor,
         recordings,
@@ -163,8 +1137,20 @@ async fn handle_client(
         viewer_tokens,
         settings,
         peer,
+        security.map(|owner| owner.context(shutting_down)).as_ref(),
+        access_audit,
+        identities,
     )
     .await;
+    write_response(&mut stream, io_timeout, &response).await
+}
+
+/// Writes a rendered response under the configured I/O timeout.
+async fn write_response(
+    stream: &mut TcpStream,
+    io_timeout: std::time::Duration,
+    response: &str,
+) -> io::Result<()> {
     tokio::time::timeout(io_timeout, stream.write_all(response.as_bytes()))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "API response timed out"))??;
@@ -194,6 +1180,36 @@ fn playback_target(request: &[u8]) -> Option<(CameraId, &str)> {
         .map(|camera_id| (camera_id, query))
 }
 
+/// The response headers for a playback stream.
+///
+/// Extracted so the honesty of this response is testable without a database,
+/// an assembler, and a socket. What it must say, and why:
+///
+/// - `Accept-Ranges: none` is the machine-readable half of what
+///   `X-Playback-Accuracy` says in prose. The body is assembled on demand and
+///   streamed chunked, so there is no addressable byte range to seek into. A
+///   client offering a scrubber is promising something this endpoint cannot
+///   do; saying so in a standard header means a browser media element will not
+///   try, rather than failing obscurely mid-seek.
+/// - `X-Playback-Accuracy: segment-aligned` because the boundaries come from
+///   whole segments and their keyframes, not from the requested instants. The
+///   requested instants are echoed back so a caller can see the difference
+///   between what it asked for and what the segment index could honour.
+/// - No `Content-Length`: the length is not known until the last segment has
+///   been read, which is after the response has to start.
+fn playback_headers(start: impl std::fmt::Display, end: impl std::fmt::Display) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: video/mp4\r\n\
+         Transfer-Encoding: chunked\r\n\
+         Accept-Ranges: none\r\n\
+         X-Playback-Accuracy: segment-aligned\r\n\
+         X-Requested-Start: {start}\r\n\
+         X-Requested-End: {end}\r\n\
+         Connection: close\r\n\r\n"
+    )
+}
+
 async fn stream_playback(
     stream: &mut TcpStream,
     camera_id: CameraId,
@@ -202,7 +1218,7 @@ async fn stream_playback(
     assembler: &PlaybackAssembler,
     metrics: Option<&Phase4Metrics>,
     io_timeout: Duration,
-) -> io::Result<()> {
+) -> io::Result<Exported> {
     let parameters: std::collections::BTreeMap<_, _> =
         url::form_urlencoded::parse(query.as_bytes())
             .into_owned()
@@ -213,7 +1229,8 @@ async fn stream_playback(
         }
         return stream
             .write_all(json_error("400 Bad Request", "invalid_recording_range").as_bytes())
-            .await;
+            .await
+            .map(|()| Exported::refused());
     };
     let search = RecordingSearch::new(
         camera_id,
@@ -229,7 +1246,8 @@ async fn stream_playback(
             .write_all(
                 json_error("503 Service Unavailable", "recording_index_unavailable").as_bytes(),
             )
-            .await;
+            .await
+            .map(|()| Exported::refused());
     };
     if let Some(metrics) = metrics {
         metrics.query(rows.len());
@@ -237,7 +1255,8 @@ async fn stream_playback(
     let Ok(plan) = PlaybackPlan::new(range, rows) else {
         return stream
             .write_all(json_error("409 Conflict", "recording_range_not_contiguous").as_bytes())
-            .await;
+            .await
+            .map(|()| Exported::refused());
     };
     let Ok(mut playback) = assembler.start(&plan).await else {
         if let Some(metrics) = metrics {
@@ -245,21 +1264,26 @@ async fn stream_playback(
         }
         return stream
             .write_all(json_error("409 Conflict", "recording_media_unavailable").as_bytes())
-            .await;
+            .await
+            .map(|()| Exported::refused());
     };
     if let Some(metrics) = metrics {
         metrics.playback_started();
     }
-    let headers = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nTransfer-Encoding: chunked\r\nX-Playback-Accuracy: segment-aligned\r\nX-Requested-Start: {start}\r\nX-Requested-End: {end}\r\nConnection: close\r\n\r\n"
-    );
-    stream.write_all(headers.as_bytes()).await?;
+    stream
+        .write_all(playback_headers(start, end).as_bytes())
+        .await?;
     let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    // Counted for the export audit row. Media bytes only: the chunked-encoding
+    // framing and the headers are transport, not footage, and an audit row that
+    // inflated them would misstate what left.
+    let mut exported_bytes: u64 = 0;
     loop {
         let read = playback.stdout_mut().read(&mut buffer).await?;
         if read == 0 {
             break;
         }
+        exported_bytes = exported_bytes.saturating_add(read as u64);
         let chunk_header = format!("{read:x}\r\n");
         let write = async {
             stream.write_all(chunk_header.as_bytes()).await?;
@@ -274,6 +1298,9 @@ async fn stream_playback(
                 metrics.playback_cancelled();
                 metrics.playback_closed();
             }
+            // The client got part of the footage before stalling. The audit
+            // row must say so: reporting zero would understate what left, and
+            // reporting success would overstate it.
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "playback client stalled",
@@ -291,14 +1318,77 @@ async fn stream_playback(
         metrics.playback_completed();
         metrics.playback_closed();
     }
-    stream.write_all(b"0\r\n\r\n").await
+    stream
+        .write_all(b"0\r\n\r\n")
+        .await
+        .map(|()| Exported::delivered(start, end, exported_bytes))
 }
+
+/// What a playback request actually handed over.
+///
+/// Returned so the caller can write a truthful export audit row. A refused or
+/// failed request still produces a row — "someone asked for this footage and did
+/// not get it" is as audit-relevant as a success, and omitting it would let a
+/// probe for what exists leave no trace.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Exported {
+    range: Option<(jiff::Timestamp, jiff::Timestamp)>,
+    bytes: u64,
+}
+
+impl Exported {
+    const fn refused() -> Self {
+        Self {
+            range: None,
+            bytes: 0,
+        }
+    }
+
+    const fn delivered(start: jiff::Timestamp, end: jiff::Timestamp, bytes: u64) -> Self {
+        Self {
+            range: Some((start, end)),
+            bytes,
+        }
+    }
+
+    /// The audit extent, when a range was actually parsed and served.
+    ///
+    /// `None` means the request never named a valid range, so there is no
+    /// extent to record — the schema refuses a partially-filled export row, and
+    /// inventing a range to satisfy it would be fabricated metadata.
+    fn extent(self) -> Option<ExportExtent> {
+        let (start, end) = self.range?;
+        Some(ExportExtent {
+            range_start: chrono::DateTime::from_timestamp(start.as_second(), 0)?,
+            range_end: chrono::DateTime::from_timestamp(end.as_second(), 0)?,
+            byte_count: i64::try_from(self.bytes).unwrap_or(i64::MAX),
+        })
+    }
+
+    const fn bytes(self) -> u64 {
+        self.bytes
+    }
+}
+
+/// The query parameters naming a recording time range.
+///
+/// Named once because they are read here, in [`recording_search`], and written
+/// by the dashboard — three places, two languages, and nothing in the build
+/// checks that the third agrees. It did not: the page sent `from`/`to`, so every
+/// search answered `missing_recording_range` whatever range was asked for. These
+/// constants let a test assert the shipped page against the names actually read,
+/// which is the only joint that catches a rename on either side.
+const RANGE_START: &str = "start";
+const RANGE_END: &str = "end";
 
 fn parse_range(
     parameters: &std::collections::BTreeMap<String, String>,
 ) -> Option<(jiff::Timestamp, jiff::Timestamp, RecordingTimeRange)> {
-    let start = parameters.get("start")?.parse::<jiff::Timestamp>().ok()?;
-    let end = parameters.get("end")?.parse::<jiff::Timestamp>().ok()?;
+    let start = parameters
+        .get(RANGE_START)?
+        .parse::<jiff::Timestamp>()
+        .ok()?;
+    let end = parameters.get(RANGE_END)?.parse::<jiff::Timestamp>().ok()?;
     let range = RecordingTimeRange::new(
         std::time::SystemTime::from(start),
         std::time::SystemTime::from(end),
@@ -375,21 +1465,38 @@ fn content_length(headers: &[u8]) -> io::Result<usize> {
     Ok(0)
 }
 
+/// The deployment template the routing tests run against.
+///
+/// No `LiveKit`, which is the honest default for a test that never starts one:
+/// it makes `publishes_live()` false, so a camera added without the field is
+/// created without publication and one added with `true` is refused. The tests
+/// that exercise publication build their own template.
+#[cfg(test)]
+fn test_defaults(recording_root: &str) -> CameraDefaults {
+    CameraDefaults::new(PathBuf::from(recording_root), None)
+}
+
 #[cfg(test)]
 async fn route(
     request: &[u8],
-    recording_root: &std::path::Path,
+    camera_defaults: &CameraDefaults,
     registry: &CameraHealthRegistry,
     supervisor: &CameraSupervisorHandle,
 ) -> String {
     route_with_recordings(
         request,
-        recording_root,
+        camera_defaults,
         registry,
         supervisor,
         None,
         None,
         None,
+        None,
+        None,
+        // A real accepted connection always has a peer address, and since
+        // ADR 009 the development identity is granted only to a loopback one.
+        // Passing `None` here would test a request shape that cannot occur.
+        Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         None,
         None,
         None,
@@ -401,7 +1508,7 @@ async fn route(
 #[cfg(test)]
 async fn route_with_settings(
     request: &[u8],
-    recording_root: &std::path::Path,
+    camera_defaults: &CameraDefaults,
     registry: &CameraHealthRegistry,
     supervisor: &CameraSupervisorHandle,
     settings: &SettingsService,
@@ -409,7 +1516,7 @@ async fn route_with_settings(
 ) -> String {
     route_with_recordings(
         request,
-        recording_root,
+        camera_defaults,
         registry,
         supervisor,
         None,
@@ -418,6 +1525,9 @@ async fn route_with_settings(
         None,
         Some(settings),
         peer,
+        None,
+        None,
+        None,
     )
     .await
 }
@@ -426,9 +1536,14 @@ async fn route_with_settings(
     clippy::too_many_arguments,
     reason = "API adapter receives explicit independently owned boundaries"
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one match is the route table; splitting it would hide which paths \
+              exist and which of them reach the authorization chokepoint"
+)]
 async fn route_with_recordings(
     request: &[u8],
-    recording_root: &std::path::Path,
+    camera_defaults: &CameraDefaults,
     registry: &CameraHealthRegistry,
     supervisor: &CameraSupervisorHandle,
     recordings: Option<&PostgresRecordingRepository>,
@@ -437,6 +1552,9 @@ async fn route_with_recordings(
     viewer_tokens: Option<&DevelopmentTokenService>,
     settings: Option<&SettingsService>,
     peer: Option<std::net::IpAddr>,
+    security: Option<&SecurityContext<'_>>,
+    access_audit: Option<&PostgresAccessAuditRepository>,
+    identities: Option<&PostgresAuthRepository>,
 ) -> String {
     let Some(header_end) = find_header_end(request) else {
         return json_error("400 Bad Request", "invalid_request");
@@ -461,7 +1579,59 @@ async fn route_with_recordings(
         ("GET", "/metrics", Some(service)) => Some(service.metrics_view().await),
         _ => None,
     };
+
+    // Establish who is calling exactly once, before dispatch. Doing it per
+    // handler would mean an Argon2id verification per handler, and would make
+    // "every protected route authenticates" a matter of review rather than of
+    // structure.
+    //
+    // `/live`, `/ready`, and `/metrics` are reached below without an
+    // `Authorized`, which is the whole of ADR 009 Decision 2: they are the
+    // three unauthenticated endpoints, all constant or aggregate, and none
+    // names a recording or a time range.
+    let default_security = SecurityContext {
+        boundary: &TrustBoundary::Loopback,
+        authenticator: None,
+        shutting_down: false,
+    };
+    let security = security.unwrap_or(&default_security);
+    // Read once, before dispatch, so `/metrics` renders a consistent view.
+    let auth_metrics = security.authenticator.map(RequestAuthenticator::metrics);
+    let Some(context) = establish_context(
+        head,
+        peer,
+        security,
+        settings.map_or(MutatingSurface::Disabled, SettingsService::surface),
+    )
+    .await
+    else {
+        return json_error("503 Service Unavailable", "identity_store_unavailable");
+    };
+    let guard = Guard {
+        context,
+        audit: access_audit,
+    };
+
     match (method, path) {
+        // The dashboard shell, served without an `Authorized` for the same
+        // reason as the three below it (ADR 009 Decision 2): it is a
+        // compile-time constant, byte-identical for every caller, and names no
+        // camera, no principal, and no time range. It carries no data — every
+        // value it displays arrives later through an authenticated call.
+        //
+        // It must also be reachable by a caller this system will refuse, or an
+        // unprovisioned person would meet a raw JSON `401` instead of the
+        // screen that explains signing in again cannot help them.
+        ("GET", "/" | "/ui") => response("200 OK", "text/html; charset=utf-8", DASHBOARD),
+        // The player's SDK, on the same terms as the shell above: a
+        // compile-time constant, byte-identical for every caller, naming
+        // nothing. It is inert without a viewer token, and a viewer token is
+        // issued only through an authenticated, camera-scoped call.
+        ("GET", "/ui/livekit-client.js") => response(
+            "200 OK",
+            "application/javascript; charset=utf-8",
+            LIVEKIT_CLIENT,
+        ),
         ("GET", "/live") => response("200 OK", "text/plain; charset=utf-8", "live\n"),
         ("GET", "/ready") => {
             readiness_response(&registry.snapshots(), recordings, metadata, phase4).await
@@ -476,23 +1646,49 @@ async fn route_with_recordings(
                 phase4,
                 Some(&supervisor.event_bus()),
                 configuration_view.as_ref(),
+                auth_metrics.as_deref(),
             ),
         ),
-        ("GET", "/api/cameras") => json_response("200 OK", &camera_list(&registry.snapshots())),
-        ("POST", "/api/cameras") => add_camera(body, recording_root, supervisor).await,
+        ("GET", "/api/cameras") => match authorize_audited(&guard, Action::ListCameras).await {
+            // The listing is filtered to what this principal may see, so a
+            // scoped operator cannot enumerate the estate by listing it.
+            Ok(_authorized) => json_response(
+                "200 OK",
+                &camera_list(&visible_snapshots(registry, guard.context())),
+            ),
+            Err(response) => response,
+        },
+        ("POST", "/api/cameras") => match authorize_audited(&guard, Action::AddCamera).await {
+            Ok(authorized) => add_camera(body, camera_defaults, supervisor, authorized).await,
+            Err(response) => response,
+        },
+        ("GET", "/api/system") => {
+            let surfaces = SurfaceAvailability {
+                recording_index: recordings.is_some(),
+                viewer_tokens: viewer_tokens.is_some(),
+                settings: settings.is_some(),
+                identities: identities.is_some(),
+                access_audit: access_audit.is_some(),
+            };
+            route_system(surfaces, &guard).await
+        }
         (_, path) if path == "/api/settings" || path.starts_with("/api/settings/") => {
-            route_settings(method, path, body, settings, peer).await
+            route_settings(method, path, body, settings, &guard).await
+        }
+        (_, path) if path == "/api/identities" || path.starts_with("/api/identities/") => {
+            route_identities(method, path, body, identities, &guard).await
         }
         _ => {
             route_camera(
                 method,
                 path,
                 query,
-                recording_root,
+                camera_defaults,
                 registry,
                 supervisor,
                 recordings,
                 viewer_tokens,
+                &guard,
             )
             .await
         }
@@ -511,7 +1707,7 @@ async fn route_settings(
     path: &str,
     body: &[u8],
     settings: Option<&SettingsService>,
-    peer: Option<std::net::IpAddr>,
+    guard: &Guard<'_>,
 ) -> String {
     let Some(service) = settings else {
         return json_error("503 Service Unavailable", "settings_unavailable");
@@ -520,13 +1716,21 @@ async fn route_settings(
         .strip_prefix("/api/settings/")
         .filter(|key| !key.is_empty());
 
+    // Reads are authorized too (ADR 009 Decision 2): effective configuration
+    // names storage roots and retention, which is not public information.
     match (method, key) {
-        ("GET", None) => settings_list(service).await,
-        ("GET", Some(key)) => match SettingId::from_key(key) {
-            Some(id) => settings_detail(service, id).await,
-            None => json_error("404 Not Found", "unknown_setting"),
+        ("GET", None) => match authorize_audited(guard, Action::ViewSettings).await {
+            Ok(_authorized) => settings_list(service).await,
+            Err(response) => response,
         },
-        ("PUT", None) => apply_settings_update(body, service, peer).await,
+        ("GET", Some(key)) => match authorize_audited(guard, Action::ViewSettings).await {
+            Ok(_authorized) => match SettingId::from_key(key) {
+                Some(id) => settings_detail(service, id).await,
+                None => json_error("404 Not Found", "unknown_setting"),
+            },
+            Err(response) => response,
+        },
+        ("PUT", None) => apply_settings_update(body, service, guard).await,
         _ => json_error("405 Method Not Allowed", "method_not_allowed"),
     }
 }
@@ -538,15 +1742,11 @@ async fn route_settings(
 async fn apply_settings_update(
     body: &[u8],
     service: &SettingsService,
-    peer: Option<std::net::IpAddr>,
+    guard: &Guard<'_>,
 ) -> String {
-    let context = RequestContext::new(peer, service.surface(), false);
-    let authorized = match authorize(&context, Action::UpdateGlobalSettings) {
+    let authorized = match authorize_audited(guard, Action::UpdateGlobalSettings).await {
         Ok(authorized) => authorized,
-        // A disabled surface answers exactly as an unknown path does.
-        Err(Denied::SurfaceDisabled) => return json_error("404 Not Found", "not_found"),
-        Err(Denied::Unauthorized) => return json_error("403 Forbidden", "unauthorized"),
-        Err(Denied::ShuttingDown) => return json_error("503 Service Unavailable", "shutting_down"),
+        Err(response) => return response,
     };
 
     let Ok(text) = std::str::from_utf8(body) else {
@@ -697,11 +1897,12 @@ async fn route_camera(
     method: &str,
     path: &str,
     query: &str,
-    recording_root: &std::path::Path,
+    camera_defaults: &CameraDefaults,
     registry: &CameraHealthRegistry,
     supervisor: &CameraSupervisorHandle,
     recordings: Option<&PostgresRecordingRepository>,
     viewer_tokens: Option<&DevelopmentTokenService>,
+    guard: &Guard<'_>,
 ) -> String {
     let segments: Vec<_> = path.trim_matches('/').split('/').collect();
     if segments.len() < 3 || segments[0] != "api" || segments[1] != "cameras" {
@@ -710,16 +1911,46 @@ async fn route_camera(
     let Ok(camera_id) = CameraId::new(segments[2]) else {
         return json_error("400 Bad Request", "invalid_camera_id");
     };
+    // Every arm below authorizes before touching a repository or the
+    // supervisor, so an out-of-scope camera cannot be probed for existence
+    // through a timing or error-shape difference.
     if method == "GET" && segments.as_slice() == ["api", "cameras", segments[2], "recordings"] {
-        return recording_search(camera_id, query, recording_root, recordings).await;
+        return match authorize_audited(guard, Action::ViewRecordings(camera_id.clone())).await {
+            Ok(_authorized) => {
+                recording_search(
+                    camera_id,
+                    query,
+                    camera_defaults.recording_root(),
+                    recordings,
+                )
+                .await
+            }
+            Err(response) => response,
+        };
     }
     if method == "GET" && segments.len() == 5 && segments[3] == "recordings" {
         let Ok(recording_id) = surveillance_common::types::RecordingId::new(segments[4]) else {
             return json_error("400 Bad Request", "invalid_recording_id");
         };
-        return recording_detail(camera_id, recording_id, recording_root, recordings).await;
+        return match authorize_audited(guard, Action::ViewRecordings(camera_id.clone())).await {
+            Ok(_authorized) => {
+                recording_detail(
+                    camera_id,
+                    recording_id,
+                    camera_defaults.recording_root(),
+                    recordings,
+                )
+                .await
+            }
+            Err(response) => response,
+        };
     }
     if method == "POST" && segments.as_slice() == ["api", "cameras", segments[2], "viewer-token"] {
+        if let Err(response) =
+            authorize_audited(guard, Action::IssueViewerToken(camera_id.clone())).await
+        {
+            return response;
+        }
         if registry.snapshot(&camera_id).is_none() {
             return json_error("404 Not Found", "camera_not_found");
         }
@@ -743,22 +1974,33 @@ async fn route_camera(
             Err(_) => json_error("503 Service Unavailable", "livekit_token_issue_failed"),
         };
     }
-    match (method, segments.as_slice()) {
+    let action = match (method, segments.as_slice()) {
         ("GET", ["api", "cameras", _] | ["api", "cameras", _, "health"]) => {
-            registry.snapshot(&camera_id).map_or_else(
-                || json_error("404 Not Found", "camera_not_found"),
-                |snapshot| json_response("200 OK", &CameraResponse::from(&snapshot)),
-            )
+            Action::ViewCamera(camera_id.clone())
         }
-        ("POST", ["api", "cameras", _, "start"]) => {
-            operation_response(supervisor.start(camera_id).await, "200 OK")
-        }
-        ("POST", ["api", "cameras", _, "stop"]) => {
-            operation_response(supervisor.stop(camera_id).await, "200 OK")
-        }
-        ("DELETE", ["api", "cameras", _]) => {
+        ("POST", ["api", "cameras", _, "start"]) => Action::StartCamera(camera_id.clone()),
+        ("POST", ["api", "cameras", _, "stop"]) => Action::StopCamera(camera_id.clone()),
+        ("DELETE", ["api", "cameras", _]) => Action::RemoveCamera(camera_id.clone()),
+        _ => return json_error("404 Not Found", "not_found"),
+    };
+    let authorized = match authorize_audited(guard, action).await {
+        Ok(authorized) => authorized,
+        Err(response) => return response,
+    };
+
+    match authorized.action() {
+        Action::ViewCamera(_) => registry.snapshot(&camera_id).map_or_else(
+            || json_error("404 Not Found", "camera_not_found"),
+            |snapshot| json_response("200 OK", &CameraResponse::from(&snapshot)),
+        ),
+        Action::StartCamera(_) => operation_response(supervisor.start(camera_id).await, "200 OK"),
+        Action::StopCamera(_) => operation_response(supervisor.stop(camera_id).await, "200 OK"),
+        Action::RemoveCamera(_) => {
             operation_response(supervisor.remove(camera_id).await, "204 No Content")
         }
+        // Unreachable: `action` was built from the match above, which produces
+        // exactly these four variants. Answering 404 rather than panicking
+        // keeps the request path free of a panic if that ever stops holding.
         _ => json_error("404 Not Found", "not_found"),
     }
 }
@@ -805,7 +2047,7 @@ async fn recording_search(
         url::form_urlencoded::parse(query.as_bytes())
             .into_owned()
             .collect();
-    let (Some(start), Some(end)) = (parameters.get("start"), parameters.get("end")) else {
+    let (Some(start), Some(end)) = (parameters.get(RANGE_START), parameters.get(RANGE_END)) else {
         return json_error("400 Bad Request", "missing_recording_range");
     };
     let Ok(start) = start.parse::<jiff::Timestamp>() else {
@@ -964,16 +2206,46 @@ struct AddCameraRequest {
     height: u32,
     #[serde(default = "default_detection_enabled")]
     detection_enabled: bool,
+    /// Whether this camera publishes to the deployment's `LiveKit`.
+    ///
+    /// Absent means "whatever this deployment does": publish when `LiveKit` is
+    /// configured, and do not when it is not. Before this field existed the
+    /// answer was always *no*, so every camera added through the API was
+    /// silently created unable to publish while the bootstrap camera published
+    /// — a fleet that could not be watched, with nothing anywhere saying why.
+    ///
+    /// It carries no endpoint and no credential. Those are deployment facts
+    /// held in [`CameraDefaults`]; this is the one bit that is per-camera.
+    live_publication_enabled: Option<bool>,
 }
 
 const fn default_detection_enabled() -> bool {
     true
 }
 
+/// Whether a request asks for this camera to publish.
+///
+/// Split out because the interesting case is the one nobody writes down: an
+/// absent field. Defaulting it to `false` is what produced a fleet of cameras
+/// that could not be watched, and defaulting it to `true` would make a
+/// deployment with no `LiveKit` reject every add. Following the deployment is the
+/// only answer that is right in both.
+const fn wants_live_publication(requested: Option<bool>, deployment_publishes: bool) -> bool {
+    match requested {
+        Some(explicit) => explicit,
+        None => deployment_publishes,
+    }
+}
+
+/// Adds a camera.
+///
+/// Takes [`Authorized`] by value, so it cannot run without the chokepoint
+/// having granted this specific action.
 async fn add_camera(
     body: &[u8],
-    recording_root: &std::path::Path,
+    defaults: &CameraDefaults,
     supervisor: &CameraSupervisorHandle,
+    _authorized: Authorized,
 ) -> String {
     let Ok(request) = serde_json::from_slice::<AddCameraRequest>(body) else {
         return json_error("400 Bad Request", "invalid_camera_configuration");
@@ -989,9 +2261,20 @@ async fn add_camera(
         credentials,
         request.width,
         request.height,
-        recording_root.to_path_buf(),
+        defaults.recording_root().to_path_buf(),
     );
     settings.detection_enabled = request.detection_enabled;
+    if wants_live_publication(request.live_publication_enabled, defaults.publishes_live()) {
+        // Refused rather than ignored. Accepting the camera without publication
+        // would answer 201 to a request that asked for something this
+        // deployment cannot do, and the operator would find out by watching a
+        // tile stay dark. An absent field never reaches here without LiveKit,
+        // so only an explicit `true` can be rejected this way.
+        let Some(livekit) = defaults.livekit() else {
+            return json_error("400 Bad Request", "live_publication_not_configured");
+        };
+        settings.livekit = Some(livekit);
+    }
     let Ok(config) = OneCameraConfig::validate(settings) else {
         return json_error("400 Bad Request", "invalid_camera_configuration");
     };
@@ -1050,6 +2333,13 @@ struct CameraResponse {
     recorder_rejected: u64,
     live_queue_depth: Option<usize>,
     live_queue_capacity: Option<usize>,
+    /// Access units the distributor offered this camera's live consumer.
+    ///
+    /// The denominator for `live_published_access_units`. Publication health
+    /// can read as healthy while almost nothing reaches a subscriber, and the
+    /// two numbers side by side are what make that visible without scraping
+    /// `/metrics`.
+    live_offered: u64,
     live_dropped: u64,
     detection_enabled: bool,
     detection_state: Option<String>,
@@ -1066,6 +2356,12 @@ struct CameraResponse {
     live_publication_timestamp_authority: Option<&'static str>,
     live_published_access_units: u64,
     live_published_bytes: u64,
+    /// Access units the publisher offered the transport and it declined.
+    ///
+    /// Not a failure: the session is intact and the next access unit may well
+    /// be published. It is media a subscriber did not receive, which is
+    /// otherwise invisible from a healthy-looking publication state.
+    live_publication_adapter_drops: u64,
 }
 
 impl From<&CameraStatusSnapshot> for CameraResponse {
@@ -1113,6 +2409,10 @@ impl From<&CameraStatusSnapshot> for CameraResponse {
                 .health
                 .as_ref()
                 .map(|value| value.live_queue.capacity),
+            live_offered: snapshot
+                .health
+                .as_ref()
+                .map_or(0, |value| value.live_queue.received),
             live_dropped: snapshot
                 .health
                 .as_ref()
@@ -1179,6 +2479,10 @@ impl From<&CameraStatusSnapshot> for CameraResponse {
                 .health
                 .as_ref()
                 .map_or(0, |value| value.publication.counters.bytes),
+            live_publication_adapter_drops: snapshot
+                .health
+                .as_ref()
+                .map_or(0, |value| value.publication.counters.adapter_drops),
         }
     }
 }
@@ -1317,8 +2621,10 @@ fn render_metrics(
     phase4: Option<&Phase4Metrics>,
     event_bus: Option<&surveillance_events::bus::EventBus>,
     configuration: Option<&ConfigurationMetricsView>,
+    auth: Option<&AuthMetrics>,
 ) -> String {
     let mut output = String::with_capacity(snapshots.len().saturating_mul(1_024));
+    render_auth_metrics(&mut output, auth);
     if let Some(configuration) = configuration {
         render_configuration_metrics(&mut output, configuration);
     }
@@ -1765,6 +3071,16 @@ fn render_metrics(
                 surveillance_livekit::adapter::TimestampAuthority::Media
             )),
         );
+        // A gauge, not a total, and deliberately not in the array below: it
+        // goes down. Zero here with a connected state is the viewer-gated
+        // publisher idling on purpose, which is the only way to tell that
+        // apart from a publisher that has quietly stopped producing media.
+        metric(
+            &mut output,
+            "surveillance_livekit_viewers",
+            camera,
+            publication.counters.adapter_viewers,
+        );
         for (name, value) in [
             (
                 "surveillance_livekit_connection_attempts_total",
@@ -1799,8 +3115,46 @@ fn render_metrics(
                 publication.counters.stale_drops,
             ),
             (
+                // Resynchronisations forced by the media timeline itself. A
+                // reconnecting camera supplies a new RTP base, so this rising
+                // once per reconnect is expected; rising while the camera holds
+                // one session is a source whose timestamps cannot be trusted for
+                // pacing. Before this counter existed the forward-jump case was
+                // invisible: the publisher slept out the jump and stopped
+                // draining the live lane while still reporting `Publishing`.
+                "surveillance_livekit_timestamp_discontinuities_total",
+                publication.counters.timestamp_discontinuities,
+            ),
+            (
                 "surveillance_livekit_media_rejections_total",
                 publication.counters.media_rejections,
+            ),
+            (
+                // Access units the publisher offered to the transport and the
+                // transport declined. Against
+                // `surveillance_livekit_access_units_total` this is the
+                // difference between offering media and publishing it: a
+                // publisher can report itself healthy while a subscriber sees
+                // nothing, and this counter is where that shows up.
+                "surveillance_livekit_adapter_drops_total",
+                publication.counters.adapter_drops,
+            ),
+            (
+                // Media the adapter produced from what it was offered. For a
+                // transcoding adapter these are decoded pictures handed to the
+                // encoder, so this over the offered total — `access_units` plus
+                // `adapter_drops`, since `access_units` counts only what was
+                // published — is the fraction of the stream a subscriber saw.
+                // Expect zero whenever `surveillance_livekit_viewers` is zero.
+                "surveillance_livekit_published_frames_total",
+                publication.counters.adapter_media_produced,
+            ),
+            (
+                // Machinery the adapter restarted without failing the session.
+                // Climbing here while the state stays connected is a degraded
+                // live view that reports itself healthy.
+                "surveillance_livekit_adapter_restarts_total",
+                publication.counters.adapter_restarts,
             ),
             (
                 "surveillance_livekit_send_failures_total",
@@ -1859,6 +3213,7 @@ fn queue_metrics(
         ("received_total", queue.received),
         ("rejected_full_total", queue.rejected_full),
         ("dropped_oldest_total", queue.dropped_oldest),
+        ("dropped_undecodable_total", queue.dropped_undecodable),
         ("dropped_on_close_total", queue.dropped_on_close),
     ] {
         let _ = writeln!(output, "surveillance_media_queue_{suffix}{{camera_id=\"{camera}\",consumer=\"{consumer}\"}} {value}");
@@ -1920,21 +3275,30 @@ fn json_error(status: &str, error: &str) -> String {
 }
 
 fn response(status: &str, content_type: &str, body: &str) -> String {
-    format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+    // `no-store` on every response this helper builds. The JSON here is
+    // per-principal and describes footage, so it does not belong in a shared or
+    // on-disk browser cache; and the dashboard is a compile-time constant that
+    // changes on upgrade, where a cached copy means an operator reading a stale
+    // interface with no way to know it. Found by upgrading the page underneath
+    // a running browser, which kept serving the previous one.
+    format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}", body.len())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_recording_cursor, encode_recording_cursor, parse_range, route, route_with_settings,
-        serve_health,
+        decode_recording_cursor, encode_recording_cursor, handle_client, parse_range, route,
+        route_with_settings, serve_health, test_defaults, CameraDefaults, SecurityOwner, DASHBOARD,
+        LIVEKIT_CLIENT, RANGE_END, RANGE_START,
     };
     use crate::authorize::{authorize_call_count, MutatingSurface};
     use crate::camera_supervisor::{CameraSupervisor, PipelineState};
     use crate::settings_service::SettingsService;
+    use crate::trust_boundary::TrustBoundary;
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
         num::NonZeroUsize,
+        path::PathBuf,
         sync::Arc,
         time::Duration,
     };
@@ -2009,6 +3373,35 @@ mod tests {
         assert_eq!(timeout, super::DEFAULT_IO_TIMEOUT);
         assert_eq!(bytes, 16 * 1024, "the previous MAX_REQUEST_BYTES");
         assert_eq!(timeout, Duration::from_secs(5), "the previous IO_TIMEOUT");
+        let stall = super::playback_stall_timeout(Some(&service)).await;
+        assert_eq!(stall, super::DEFAULT_PLAYBACK_STALL_TIMEOUT);
+    }
+
+    /// The playback body must not be bounded by `api.io_timeout`.
+    ///
+    /// It was, and the effect was not a slow stream but a wrong one: a media
+    /// element stops reading once its buffer is full, the five-second budget
+    /// expired against that perfectly healthy client, the assembler was
+    /// cancelled and the socket closed, and the browser treated the few seconds
+    /// it had buffered as the entire recording — observed in the dashboard as
+    /// playback that ran for about three seconds and rewound, on a run of 12
+    /// segments covering six minutes. This asserts the two budgets are read
+    /// separately and that the playback one is the larger; it does not assert
+    /// the number, which `crates/config/src/defaults.rs` documents as a guess.
+    #[tokio::test]
+    async fn playback_is_not_bounded_by_the_json_response_timeout() {
+        let service = settings_service(MutatingSurface::Disabled);
+        let (_, io_timeout) = super::request_bounds(Some(&service)).await;
+        let stall = super::playback_stall_timeout(Some(&service)).await;
+        assert!(
+            stall > io_timeout,
+            "a paced media reader must outlast api.io_timeout ({io_timeout:?}), got {stall:?}"
+        );
+        assert_eq!(
+            super::playback_stall_timeout(None).await,
+            super::DEFAULT_PLAYBACK_STALL_TIMEOUT,
+            "the no-settings fallback must not silently drop back to the JSON budget"
+        );
     }
 
     /// `api.max_request_bytes` and `api.io_timeout` are the two settings
@@ -2027,6 +3420,11 @@ mod tests {
             SettingValue::Duration(Duration::from_secs(11)),
         )
         .unwrap_or_else(|error| panic!("test entry: {error}"));
+        file.insert(
+            SettingKey::unscoped(SettingId::ApiPlaybackStallTimeout),
+            SettingValue::Duration(Duration::from_secs(123)),
+        )
+        .unwrap_or_else(|error| panic!("test entry: {error}"));
 
         let mut cache_path = std::env::temp_dir();
         cache_path.push(format!("surveillance-bounds-cache-{}", std::process::id()));
@@ -2043,6 +3441,10 @@ mod tests {
         let (bytes, timeout) = super::request_bounds(Some(&service)).await;
         assert_eq!(bytes, 4_096);
         assert_eq!(timeout, Duration::from_secs(11));
+        assert_eq!(
+            super::playback_stall_timeout(Some(&service)).await,
+            Duration::from_secs(123)
+        );
     }
 
     /// `docs/phase-7/contracts.md` §6. Without this the counters increment but
@@ -2056,7 +3458,7 @@ mod tests {
 
         let response = route_with_settings(
             get("/metrics").as_bytes(),
-            std::path::Path::new("target/phase7-tests"),
+            &test_defaults("target/phase7-tests"),
             &handle.health_registry(),
             &handle,
             &service,
@@ -2114,7 +3516,7 @@ mod tests {
         for path in ["/api/settings", "/api/settings/camera.rtsp.password"] {
             let response = route_with_settings(
                 get(path).as_bytes(),
-                std::path::Path::new("target/phase7-tests"),
+                &test_defaults("target/phase7-tests"),
                 &handle.health_registry(),
                 &handle,
                 &service,
@@ -2144,7 +3546,7 @@ mod tests {
                 r#"{"changes":{"retention.batch_files":"25"}}"#,
             )
             .as_bytes(),
-            std::path::Path::new("target/phase7-tests"),
+            &test_defaults("target/phase7-tests"),
             &handle.health_registry(),
             &handle,
             &service,
@@ -2163,7 +3565,7 @@ mod tests {
         // Reads stay available: observing configuration carries no write risk.
         let read = route_with_settings(
             get("/api/settings").as_bytes(),
-            std::path::Path::new("target/phase7-tests"),
+            &test_defaults("target/phase7-tests"),
             &handle.health_registry(),
             &handle,
             &service,
@@ -2188,15 +3590,19 @@ mod tests {
                 r#"{"changes":{"retention.batch_files":"25"}}"#,
             )
             .as_bytes(),
-            std::path::Path::new("target/phase7-tests"),
+            &test_defaults("target/phase7-tests"),
             &handle.health_registry(),
             &handle,
             &service,
             Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))),
         )
         .await;
+        // ADR 009 changed the code, not the control: a caller with no
+        // credential is *unauthenticated*, so `401` is the accurate answer.
+        // Phase 7 said `403` because peer address was the only identity
+        // signal there was. The refusal itself is what this test guards.
         assert!(
-            response.starts_with("HTTP/1.1 403"),
+            response.starts_with("HTTP/1.1 401"),
             "a remote caller must be refused: {response}"
         );
 
@@ -2223,7 +3629,7 @@ mod tests {
         ] {
             let _ = route_with_settings(
                 put("/api/settings", body).as_bytes(),
-                std::path::Path::new("target/phase7-tests"),
+                &test_defaults("target/phase7-tests"),
                 &handle.health_registry(),
                 &handle,
                 &service,
@@ -2243,7 +3649,7 @@ mod tests {
         // read does not.
         let read = route_with_settings(
             get("/api/settings").as_bytes(),
-            std::path::Path::new("target/phase7-tests"),
+            &test_defaults("target/phase7-tests"),
             &handle.health_registry(),
             &handle,
             &service,
@@ -2259,6 +3665,1360 @@ mod tests {
         let _ = task.await;
     }
 
+    /// The playback stream reaches the chokepoint.
+    ///
+    /// This drives `handle_client` over a real socket rather than entering at
+    /// `route_with_recordings`, because the playback path short-circuits
+    /// *above* the router. The chokepoint test enters below that branch and so
+    /// was structurally incapable of seeing it — which is how this endpoint,
+    /// the one that streams actual footage, was the only unauthenticated one.
+    ///
+    /// A regression here is not "a test went red". It is footage served to
+    /// anyone who can reach the socket.
+    #[tokio::test]
+    async fn the_playback_stream_reaches_the_chokepoint() {
+        use super::{handle_client, PlaybackAssembler, PostgresRecordingRepository};
+        use std::num::NonZeroU32;
+        use tokio::io::AsyncReadExt as _;
+
+        let (supervisor, handle) = supervisor();
+        let task = tokio::spawn(supervisor.run());
+        let service = settings_service(MutatingSurface::Enabled);
+
+        // Lazy: neither needs the database to be reachable, and the request is
+        // refused before either is consulted.
+        let database = surveillance_database::DatabaseConfig::new(
+            "postgres://localhost/surveillance-phase8-test",
+            NonZeroU32::new(1).expect("one is non-zero"),
+            std::time::Duration::from_secs(1),
+        )
+        .expect("test database configuration is valid");
+        let recordings = PostgresRecordingRepository::connect_lazy(&database);
+        let assembler = PlaybackAssembler::new(
+            std::path::PathBuf::from("target/phase8-tests"),
+            std::path::PathBuf::from("ffmpeg"),
+            std::time::Duration::from_secs(5),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener binds");
+        let address = listener.local_addr().expect("listener has an address");
+
+        let registry = handle.health_registry();
+        let served = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("a client connects");
+            // No `SecurityOwner`, and a non-loopback peer, so the development
+            // identity does not apply and nothing is authenticated.
+            let _ = handle_client(
+                stream,
+                &test_defaults("target/phase8-tests"),
+                &registry,
+                &handle,
+                Some(&recordings),
+                Some(&assembler),
+                None,
+                None,
+                None,
+                Some(&service),
+                Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await;
+            handle
+        });
+
+        let mut client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("client connects");
+        let request = "GET /api/cameras/camera-01/recordings/playback?start=2026-01-01T00:00:00Z\
+                       &end=2026-01-01T00:01:00Z HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        tokio::io::AsyncWriteExt::write_all(&mut client, request.as_bytes())
+            .await
+            .expect("request is written");
+
+        let mut response = String::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_string(&mut response),
+        )
+        .await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "unauthenticated playback must be refused, got: {response}"
+        );
+        // And specifically not media: a body of footage here would mean the
+        // refusal happened after the stream had already started.
+        assert!(
+            !response.contains("video/"),
+            "footage was served to an unauthenticated caller: {response}"
+        );
+
+        let handle = served.await.expect("the server task completes");
+        let _ = handle.shutdown().await;
+        let _ = task.await;
+    }
+
+    /// Builds a security owner whose boundary trusts one proxy address.
+    ///
+    /// Holds three principals the proxy may assert: `alice`, an administrator
+    /// over every camera; `bob`, a viewer scoped to `camera-01` alone; and
+    /// `carol`, an administrator who has been suspended.
+    fn proxy_security(peer: IpAddr, proof: &str) -> SecurityOwner {
+        let boundary = TrustBoundary::reverse_proxy(
+            vec![peer],
+            surveillance_common::secret::Secret::new(proof.to_owned()),
+        )
+        .expect("the test boundary is well formed");
+        SecurityOwner::new(boundary, Some(identity_store()))
+    }
+
+    /// The same identity store behind a *loopback* boundary.
+    ///
+    /// Distinct from [`SecurityOwner::loopback_development`], which has no
+    /// store at all and therefore grants the development identity. Here there
+    /// is a store, so nothing is granted for free — which is what makes it
+    /// possible to see whether the asserted header was consulted.
+    fn loopback_security() -> SecurityOwner {
+        SecurityOwner::new(TrustBoundary::Loopback, Some(identity_store()))
+    }
+
+    fn identity_store() -> Arc<dyn crate::authenticate::RequestAuthenticator> {
+        use crate::authenticate::{Authenticator, VerifyConcurrency};
+        use surveillance_auth::{
+            clock::SystemClock,
+            principal::{CameraScope, Principal, PrincipalId, PrincipalKind, Role},
+            store::InMemoryTokenStore,
+            verify::{HashParams, Verifier},
+        };
+        use surveillance_common::types::CameraId;
+
+        let store = InMemoryTokenStore::new();
+        let insert = |id: &str, name: &str, role, scope, enabled| {
+            store.insert_principal(
+                Principal::new(
+                    PrincipalId::new(id).expect("valid principal id"),
+                    PrincipalKind::Human,
+                    name,
+                    role,
+                    scope,
+                    enabled,
+                )
+                .expect("principal is valid"),
+            );
+        };
+        insert(
+            "alice",
+            "Alice",
+            Role::Administrator,
+            CameraScope::All,
+            true,
+        );
+        insert(
+            "bob",
+            "Bob",
+            Role::Viewer,
+            CameraScope::only([CameraId::new("camera-01").expect("valid camera id")])
+                .expect("a one-camera scope is within bounds"),
+            true,
+        );
+        insert(
+            "carol",
+            "Carol",
+            Role::Administrator,
+            CameraScope::All,
+            false,
+        );
+
+        // Cheap parameters: this test is about who is trusted, not about how
+        // expensive hashing is, and no hashing happens on the asserted path.
+        let params = HashParams::new(64, 1, 1).expect("cheap test parameters are valid");
+        let verifier = Arc::new(Verifier::new(params).expect("verifier builds"));
+        let authenticator = Authenticator::new(
+            store,
+            SystemClock,
+            verifier,
+            VerifyConcurrency::from_budget(params, 1024 * 1024),
+        );
+        Arc::new(authenticator)
+    }
+
+    /// Drives one request through a real socket and returns the raw response.
+    ///
+    /// Entering at the socket rather than at a routing function is the whole
+    /// point: the defects this phase found all lived *above* the seam the tests
+    /// entered at, so a test that cannot see `handle_client` cannot see them.
+    async fn requests_through_socket(
+        security: SecurityOwner,
+        peer: IpAddr,
+        requests: &[String],
+    ) -> Vec<String> {
+        use tokio::io::AsyncReadExt as _;
+
+        let (supervisor, handle) = supervisor();
+        let task = tokio::spawn(supervisor.run());
+        let mut responses = Vec::with_capacity(requests.len());
+
+        for request in requests {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("test listener binds");
+            let address = listener.local_addr().expect("listener has an address");
+            let registry = handle.health_registry();
+
+            // Joined rather than spawned so `security` may be borrowed: it is
+            // the subject of these tests and must be the same owner throughout.
+            let serve = async {
+                let (stream, _) = listener.accept().await.expect("a client connects");
+                let _ = handle_client(
+                    stream,
+                    &test_defaults("target/phase8-tests"),
+                    &registry,
+                    &handle,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(peer),
+                    Some(&security),
+                    None,
+                    None,
+                    false,
+                )
+                .await;
+            };
+            let client_side = async {
+                let mut client = tokio::net::TcpStream::connect(address)
+                    .await
+                    .expect("client connects");
+                tokio::io::AsyncWriteExt::write_all(&mut client, request.as_bytes())
+                    .await
+                    .expect("request is written");
+                let mut response = String::new();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    client.read_to_string(&mut response),
+                )
+                .await;
+                response
+            };
+            let ((), response) = tokio::join!(serve, client_side);
+            responses.push(response);
+        }
+
+        let _ = handle.shutdown().await;
+        let _ = task.await;
+        responses
+    }
+
+    /// One request, for the common case.
+    async fn request_through_socket(
+        security: SecurityOwner,
+        peer: IpAddr,
+        request: &str,
+    ) -> String {
+        requests_through_socket(security, peer, &[request.to_owned()])
+            .await
+            .pop()
+            .unwrap_or_default()
+    }
+
+    const PROXY_PEER: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7));
+    const PROXY_PROOF: &str = "0123456789abcdef0123456789abcdef";
+
+    /// The property the whole proxy-authentication design rests on.
+    ///
+    /// The asserted-principal header is worth exactly as much as the proof of
+    /// origin beside it. Without the proof it must be *discarded*, not merely
+    /// distrusted later, because anything that can reach the socket can set a
+    /// header. If this test fails, naming a principal is enough to become one.
+    #[tokio::test]
+    async fn an_asserted_principal_without_proof_of_origin_is_ignored() {
+        let security = proxy_security(PROXY_PEER, PROXY_PROOF);
+        let response = request_through_socket(
+            security,
+            PROXY_PEER,
+            "GET /api/cameras HTTP/1.1\r\nHost: localhost\r\n\
+             X-Authenticated-Principal: alice\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "an unproved assertion authenticated a caller: {response}"
+        );
+    }
+
+    /// The same request from an address that is not the configured proxy.
+    ///
+    /// Distinct from the case above: here the proof header is *correct*, and
+    /// the only thing wrong is where the connection came from. Both halves of
+    /// the proof have to hold independently.
+    #[tokio::test]
+    async fn a_correct_proof_from_the_wrong_peer_does_not_authenticate() {
+        let security = proxy_security(PROXY_PEER, PROXY_PROOF);
+        let response = request_through_socket(
+            security,
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)),
+            &format!(
+                "GET /api/cameras HTTP/1.1\r\nHost: localhost\r\n\
+                 X-Forwarded-Proof: {PROXY_PROOF}\r\n\
+                 X-Authenticated-Principal: alice\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "a request from an unlisted peer was authenticated: {response}"
+        );
+    }
+
+    /// A wrong proof secret from the right peer, for the same reason reversed.
+    #[tokio::test]
+    async fn a_wrong_proof_from_the_right_peer_does_not_authenticate() {
+        let security = proxy_security(PROXY_PEER, PROXY_PROOF);
+        let response = request_through_socket(
+            security,
+            PROXY_PEER,
+            "GET /api/cameras HTTP/1.1\r\nHost: localhost\r\n\
+             X-Forwarded-Proof: fedcba9876543210fedcba9876543210\r\n\
+             X-Authenticated-Principal: alice\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "a mismatched proof was accepted: {response}"
+        );
+    }
+
+    /// The path actually working, so the tests above are proving a restriction
+    /// rather than an endpoint that refuses everything.
+    #[tokio::test]
+    async fn a_proved_proxy_assertion_authenticates_the_named_principal() {
+        let security = proxy_security(PROXY_PEER, PROXY_PROOF);
+        let response = request_through_socket(
+            security,
+            PROXY_PEER,
+            &format!(
+                "GET /api/cameras HTTP/1.1\r\nHost: localhost\r\n\
+                 X-Forwarded-Proof: {PROXY_PROOF}\r\n\
+                 X-Authenticated-Principal: alice\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "a proved assertion was refused: {response}"
+        );
+    }
+
+    /// A proxy that authenticates somebody this system has never heard of.
+    ///
+    /// Refused rather than admitted with a default role: the proxy proves
+    /// *that* it authenticated someone, never *what they may do*. Roles and
+    /// camera scope stay in the database on this side of the boundary.
+    #[tokio::test]
+    async fn a_proved_assertion_for_an_unknown_principal_is_refused() {
+        let security = proxy_security(PROXY_PEER, PROXY_PROOF);
+        let response = request_through_socket(
+            security,
+            PROXY_PEER,
+            &format!(
+                "GET /api/cameras HTTP/1.1\r\nHost: localhost\r\n\
+                 X-Forwarded-Proof: {PROXY_PROOF}\r\n\
+                 X-Authenticated-Principal: mallory\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "an unknown principal was admitted by proxy assertion: {response}"
+        );
+    }
+
+    /// Under a loopback boundary the header must never be consulted at all.
+    ///
+    /// There is no proxy here, so `ProofOutcome::NotConfigured` — which
+    /// deliberately does not prove origin — must drop the assertion. The store
+    /// holds `alice`, so if the header *were* consulted the request would
+    /// succeed; a 401 is the only outcome that proves it was not.
+    #[tokio::test]
+    async fn a_loopback_deployment_never_reads_an_asserted_principal() {
+        let response = request_through_socket(
+            loopback_security(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "GET /api/cameras HTTP/1.1\r\nHost: localhost\r\n\
+             X-Authenticated-Principal: alice\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "a loopback deployment honoured an asserted principal: {response}"
+        );
+    }
+
+    /// And the development posture itself still works: no store, no header,
+    /// loopback caller, granted as the conspicuous development identity.
+    ///
+    /// Paired with the test above so a regression cannot be "fixed" by making
+    /// loopback refuse everything.
+    #[tokio::test]
+    async fn a_loopback_deployment_without_a_store_keeps_the_development_identity() {
+        let response = request_through_socket(
+            SecurityOwner::loopback_development(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "GET /api/cameras HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "the loopback development posture regressed: {response}"
+        );
+    }
+
+    /// `/api/system` must report detection as a fixture.
+    ///
+    /// The single most dangerous thing a UI could do with this system is render
+    /// a person count, because the fake detections are correctly shaped and
+    /// correctly timestamped and look entirely real. This field is what lets a
+    /// client refuse to.
+    #[tokio::test]
+    async fn the_capabilities_endpoint_reports_detection_as_a_fixture() {
+        let response = request_through_socket(
+            SecurityOwner::loopback_development(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "GET /api/system HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "the capabilities endpoint did not answer: {response}"
+        );
+        assert!(
+            response.contains("\"results_are_fixture\":true"),
+            "detection was not reported as a fixture: {response}"
+        );
+        assert!(
+            response.contains("\"is_production_model\":false"),
+            "a non-production model was not declared as such: {response}"
+        );
+        // And the playback honesty, in the same place.
+        assert!(
+            response.contains("\"seekable\":false"),
+            "playback was not declared unseekable: {response}"
+        );
+    }
+
+    /// A camera you may not see and a camera that does not exist must be
+    /// **byte-identical** in the response.
+    ///
+    /// Not merely "both are 404". If the two differ in any byte — a different
+    /// error code, a different message, a different header, a different length
+    /// — then the difference is an oracle: a viewer scoped to one camera can
+    /// enumerate the rest of the installation by asking about each in turn and
+    /// watching which answer comes back. That is a floor plan of a building
+    /// under surveillance, handed out to someone entitled to one camera.
+    ///
+    /// This is why the UI can never say "you lack access to camera-07": the
+    /// server has taken care not to tell it that camera-07 exists.
+    #[tokio::test]
+    async fn an_out_of_scope_camera_is_indistinguishable_from_one_that_does_not_exist() {
+        let security = proxy_security(PROXY_PEER, PROXY_PROOF);
+        // Alice creates camera-02. Bob is scoped to camera-01 alone, so
+        // camera-02 exists but is not his; camera-99 was never created.
+        let body = br#"{"camera_id":"camera-02","rtsp_endpoint":"rtsp://127.0.0.1:19222/camera-02","width":640,"height":360}"#;
+        let create = format!(
+            "POST /api/cameras HTTP/1.1\r\nHost: localhost\r\n\
+             X-Forwarded-Proof: {PROXY_PROOF}\r\n\
+             X-Authenticated-Principal: alice\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        );
+        let ask = |camera: &str| {
+            format!(
+                "GET /api/cameras/{camera} HTTP/1.1\r\nHost: localhost\r\n\
+                 X-Forwarded-Proof: {PROXY_PROOF}\r\n\
+                 X-Authenticated-Principal: bob\r\n\r\n"
+            )
+        };
+
+        let responses = requests_through_socket(
+            security,
+            PROXY_PEER,
+            &[create, ask("camera-02"), ask("camera-99")],
+        )
+        .await;
+
+        assert!(
+            responses[0].starts_with("HTTP/1.1 20"),
+            "the administrator could not create the camera: {}",
+            responses[0]
+        );
+        assert_eq!(
+            responses[1], responses[2],
+            "an out-of-scope camera is distinguishable from an absent one:\n\
+             out of scope: {}\nabsent:       {}",
+            responses[1], responses[2]
+        );
+        assert!(
+            responses[1].starts_with("HTTP/1.1 404"),
+            "neither answer was a plain 404: {}",
+            responses[1]
+        );
+        assert!(
+            !responses[1].contains("camera-02"),
+            "the response names the camera the caller may not see: {}",
+            responses[1]
+        );
+    }
+
+    /// A suspended principal the proxy still authenticates.
+    ///
+    /// The proxy has no way to know the identity store disabled somebody, so
+    /// this must be caught on this side of the boundary. If it is not, then
+    /// revoking access means editing proxy configuration, and this system's
+    /// own suspension control is decorative.
+    #[tokio::test]
+    async fn a_suspended_principal_is_refused_even_when_the_proxy_asserts_them() {
+        let security = proxy_security(PROXY_PEER, PROXY_PROOF);
+        let response = request_through_socket(
+            security,
+            PROXY_PEER,
+            &format!(
+                "GET /api/cameras HTTP/1.1\r\nHost: localhost\r\n\
+                 X-Forwarded-Proof: {PROXY_PROOF}\r\n\
+                 X-Authenticated-Principal: carol\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "a suspended principal was admitted by proxy assertion: {response}"
+        );
+    }
+
+    /// Playback must declare itself unseekable in the response itself.
+    ///
+    /// `X-Playback-Accuracy: segment-aligned` was prose; a browser does not
+    /// read prose. `Accept-Ranges: none` is the same statement in a form the
+    /// HTTP stack acts on, and it is what stops a client from rendering a
+    /// scrubber over a stream that cannot honour a seek.
+    #[test]
+    fn the_playback_response_declares_itself_unseekable() {
+        let headers = super::playback_headers("2026-01-01T00:00:00Z", "2026-01-01T00:01:00Z");
+        assert!(
+            headers.contains("Accept-Ranges: none\r\n"),
+            "playback did not refuse range requests: {headers}"
+        );
+        assert!(
+            headers.contains("X-Playback-Accuracy: segment-aligned\r\n"),
+            "playback did not declare its accuracy: {headers}"
+        );
+        assert!(
+            !headers.contains("Content-Length"),
+            "a chunked stream must not claim a length: {headers}"
+        );
+    }
+
+    /// The capabilities endpoint must describe the backend that is actually
+    /// compiled in, not a string somebody remembered to update.
+    ///
+    /// A hardcoded `"fake"` would keep saying `fake` after a real model landed,
+    /// and — worse — could be edited to say `production` without a single line
+    /// of inference changing. Asking the implementation is the only version of
+    /// this that stays true by construction.
+    #[test]
+    fn the_compiled_backend_matches_what_the_pipeline_builds() {
+        use surveillance_detector::inference::{
+            compiled_backend, DeterministicFakeInference, InferenceDescriptor, PersonInference as _,
+        };
+
+        let built = DeterministicFakeInference::new().expect("the fixture backend builds");
+        let reported = compiled_backend().expect("the compiled backend is describable");
+        assert_eq!(
+            reported,
+            InferenceDescriptor::of(&built),
+            "the reported backend is not the one the pipeline builds"
+        );
+        assert!(
+            !built.is_production_model(),
+            "the fixture claims to be a production model"
+        );
+        assert!(
+            !reported.is_production(),
+            "the capabilities endpoint would report a fixture as production"
+        );
+    }
+
+    /// The capabilities endpoint is authenticated like every other read.
+    #[tokio::test]
+    async fn the_capabilities_endpoint_reaches_the_chokepoint() {
+        let security = proxy_security(PROXY_PEER, PROXY_PROOF);
+        let response = request_through_socket(
+            security,
+            PROXY_PEER,
+            "GET /api/system HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 401"),
+            "the capabilities endpoint answered an anonymous caller: {response}"
+        );
+    }
+
+    /// No authorization decision may claim the `export` category.
+    ///
+    /// `access_audit` refuses an `export` row that lacks range and byte count,
+    /// and a decision row cannot have them — the bytes are not known until
+    /// after streaming. Mapping `ExportRecording` to `export` therefore made
+    /// every playback request fail its audit write; because an export is a
+    /// read, the failure was logged and swallowed and the request still
+    /// succeeded, so the only symptom was an empty table.
+    ///
+    /// This asserts the invariant directly, so the mapping cannot drift back.
+    #[test]
+    fn no_authorization_decision_is_categorised_as_an_export() {
+        use super::{Action, AuditCategory, CameraId};
+        let camera = CameraId::new("camera-01").expect("valid");
+        let every = [
+            Action::ListCameras,
+            Action::ViewCamera(camera.clone()),
+            Action::ViewRecordings(camera.clone()),
+            Action::IssueViewerToken(camera.clone()),
+            Action::ExportRecording(camera.clone()),
+            Action::ViewSettings,
+            Action::ViewIdentities,
+            Action::StartCamera(camera.clone()),
+            Action::StopCamera(camera.clone()),
+            Action::AddCamera,
+            Action::RemoveCamera(camera.clone()),
+            Action::UpdateGlobalSettings,
+            Action::UpdateCameraSettings(camera),
+            Action::ManageIdentities,
+        ];
+        for action in every {
+            assert_ne!(
+                super::audit_category(&action),
+                AuditCategory::Export,
+                "{} would write an export row with no extent, which the schema refuses",
+                action.as_str()
+            );
+        }
+    }
+
+    /// The export row itself carries a complete extent, or is not written.
+    #[test]
+    fn an_export_row_is_only_built_from_a_delivered_range() {
+        // Refused: no range was ever parsed, so there is nothing truthful to
+        // record and no row is produced. Inventing a range to satisfy the
+        // schema would be fabricated metadata.
+        assert!(super::Exported::refused().extent().is_none());
+
+        let start = "2026-01-01T00:00:00Z"
+            .parse::<jiff::Timestamp>()
+            .expect("valid");
+        let end = "2026-01-01T00:01:00Z"
+            .parse::<jiff::Timestamp>()
+            .expect("valid");
+        let extent = super::Exported::delivered(start, end, 4_096)
+            .extent()
+            .expect("a delivered range yields an extent");
+        assert_eq!(extent.byte_count, 4_096);
+        assert!(extent.range_end >= extent.range_start);
+    }
+
+    /// P8.7: the new security series are bounded and name no identity.
+    #[test]
+    fn security_metrics_have_bounded_cardinality_and_leak_no_identity() {
+        let metrics = crate::authenticate::AuthMetrics::default();
+        let mut rendered = String::new();
+        super::render_auth_metrics(&mut rendered, Some(&metrics));
+
+        // The no-identity-store deployment must still export every series.
+        // Running the server is what caught this: `None` here previously meant
+        // the whole security block was omitted.
+        let mut without_store = String::new();
+        super::render_auth_metrics(&mut without_store, None);
+        for series in [
+            "surveillance_auth_success_total",
+            "surveillance_auth_failure_total",
+            "surveillance_auth_unavailable_total",
+            "surveillance_authz_decision_total",
+            "surveillance_proxy_proof_total",
+            "surveillance_auth_proxy_asserted_total",
+        ] {
+            assert!(
+                without_store.contains(series),
+                "{series} is omitted when no identity store is configured"
+            );
+        }
+
+        // One line per enum variant, and the variants are fixed. Nothing here
+        // scales with the number of principals, tokens, cameras, or requests.
+        // Eight since the proxy-asserted path added `unknown_principal`: a
+        // proxy that authenticated somebody this system does not hold.
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|line| line.starts_with("surveillance_auth_failure_total{"))
+                .count(),
+            8
+        );
+        assert!(
+            rendered.contains("surveillance_auth_failure_total{reason=\"unknown_principal\"}"),
+            "the proxy-asserted failure reason is not exported: {rendered}"
+        );
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|line| line.starts_with("surveillance_authz_decision_total{"))
+                .count(),
+            6
+        );
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|line| line.starts_with("surveillance_proxy_proof_total{"))
+                .count(),
+            6
+        );
+
+        // The only label key in the security series is a fixed one. A
+        // principal, token, or camera label would be unbounded cardinality and
+        // would put an identity into every scrape and dashboard.
+        for line in rendered.lines().filter(|line| line.contains('{')) {
+            let Some((_, labels)) = line.split_once('{') else {
+                continue;
+            };
+            assert!(
+                labels.starts_with("reason=") || labels.starts_with("outcome="),
+                "unexpected label in security series: {line}"
+            );
+        }
+        // `principal_disabled` and `unknown_token` are bounded *reason* values
+        // and belong here. What must never appear is an actual identity: the
+        // `principal:<kind>:<id>` audit form, or a token identifier.
+        assert!(
+            !rendered.contains("principal:"),
+            "an audit identity reached a metric label"
+        );
+        assert!(
+            !rendered.contains(surveillance_auth::token::TOKEN_PREFIX),
+            "a token reached a metric label"
+        );
+
+        // Every alert expression in docs/phase-8/alerts.yml names one of these.
+        for series in [
+            "surveillance_auth_failure_total",
+            "surveillance_auth_unavailable_total",
+            "surveillance_authz_decision_total",
+            "surveillance_proxy_proof_total",
+        ] {
+            assert!(rendered.contains(series), "{series} is not exported");
+        }
+    }
+
+    /// The P8.3 acceptance test: every protected route reaches the chokepoint.
+    ///
+    /// The Phase 7 version covered the three mutating settings requests. This
+    /// covers the whole protected surface, so a route added without a check
+    /// fails here rather than shipping.
+    ///
+    /// It works by refusing the request at the chokepoint — no credential, and
+    /// a non-loopback peer so the development identity does not apply — and
+    /// asserting the refusal. A handler reached without `authorize` would
+    /// answer `200`, `201`, `404 camera_not_found`, or `503`, none of which is
+    /// an authorization refusal.
+    #[tokio::test]
+    async fn every_protected_route_reaches_the_chokepoint() {
+        let (supervisor, handle) = supervisor();
+        let task = tokio::spawn(supervisor.run());
+        let service = settings_service(MutatingSurface::Enabled);
+        let remote = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+
+        // (method, path, body). Every route under /api.
+        let protected: Vec<(&str, &str, &str)> = vec![
+            ("GET", "/api/cameras", ""),
+            ("POST", "/api/cameras", r#"{"camera_id":"camera-01"}"#),
+            ("GET", "/api/cameras/camera-01", ""),
+            ("GET", "/api/cameras/camera-01/health", ""),
+            ("GET", "/api/cameras/camera-01/recordings", ""),
+            ("GET", "/api/cameras/camera-01/recordings/rec-01", ""),
+            ("POST", "/api/cameras/camera-01/viewer-token", ""),
+            ("POST", "/api/cameras/camera-01/start", ""),
+            ("POST", "/api/cameras/camera-01/stop", ""),
+            ("DELETE", "/api/cameras/camera-01", ""),
+            ("GET", "/api/settings", ""),
+            ("GET", "/api/settings/retention.batch_files", ""),
+            (
+                "PUT",
+                "/api/settings",
+                r#"{"changes":{"retention.batch_files":"25"}}"#,
+            ),
+            // P8.6 identity surface. These reach the chokepoint even with no
+            // identity store configured: an early "store unavailable" would
+            // answer before authorization ran and tell an anonymous caller
+            // whether a store exists.
+            ("GET", "/api/identities", ""),
+            (
+                "POST",
+                "/api/identities",
+                r#"{"principal_id":"x","role":"viewer"}"#,
+            ),
+            ("GET", "/api/identities/operator/tokens", ""),
+            ("POST", "/api/identities/operator/tokens", "{}"),
+            (
+                "DELETE",
+                "/api/identities/operator/tokens/0123456789abcdef",
+                "",
+            ),
+            ("POST", "/api/identities/operator/disable", ""),
+            ("POST", "/api/identities/operator/enable", ""),
+            // P8 capabilities. It exposes no footage and no identity, but it
+            // does describe the deployment's shape, which is reconnaissance.
+            ("GET", "/api/system", ""),
+        ];
+
+        let before = authorize_call_count();
+        for (method, path, body) in &protected {
+            let request = format!(
+                "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let response = route_with_settings(
+                request.as_bytes(),
+                &test_defaults("target/phase8-tests"),
+                &handle.health_registry(),
+                &handle,
+                &service,
+                Some(remote),
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 401")
+                    || response.starts_with("HTTP/1.1 403")
+                    || response.starts_with("HTTP/1.1 404 "),
+                "{method} {path} did not reach the chokepoint: {response}"
+            );
+        }
+        assert!(
+            authorize_call_count() >= before + protected.len() as u64,
+            "each protected route must call authorize exactly once or more"
+        );
+
+        // The unauthenticated endpoints of ADR 009 Decision 2 stay open. The
+        // dashboard shell joins them on the same test: a constant response that
+        // names nothing. Everything it later displays is fetched through a
+        // route in the table above.
+        for path in ["/live", "/ready", "/metrics", "/", "/ui"] {
+            let response = route_with_settings(
+                get(path).as_bytes(),
+                &test_defaults("target/phase8-tests"),
+                &handle.health_registry(),
+                &handle,
+                &service,
+                Some(remote),
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.1 503"),
+                "{path} must not require a credential: {response}"
+            );
+        }
+
+        let _ = handle.shutdown().await;
+        let _ = task.await;
+    }
+
+    // ---------------------------------------------------------------------
+    // The operator dashboard.
+    //
+    // These are assertions about the shipped bytes, not about the interface.
+    // There is no JavaScript engine in this workspace, so nothing below
+    // executes the page, and none of it is evidence that a screen renders
+    // correctly. What it does catch is the small set of edits that would make
+    // the interface lie — each of which is a plausible, well-intentioned
+    // change that no compiler would object to.
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_dashboard_is_served_at_the_root() {
+        let (supervisor, handle) = supervisor();
+        let task = tokio::spawn(supervisor.run());
+        let service = settings_service(MutatingSurface::Enabled);
+
+        for path in ["/", "/ui"] {
+            let response = route_with_settings(
+                get(path).as_bytes(),
+                &test_defaults("target/phase8-tests"),
+                &handle.health_registry(),
+                &handle,
+                &service,
+                None,
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 200 OK"),
+                "{path}: {response}"
+            );
+            assert!(
+                response.contains("Content-Type: text/html; charset=utf-8"),
+                "{path} must be served as HTML"
+            );
+            assert!(
+                response.contains("<title>SENTINEL Surveillance System</title>"),
+                "{path} did not return the dashboard"
+            );
+        }
+
+        let _ = handle.shutdown().await;
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn no_response_may_be_cached_by_a_browser() {
+        // An operator reading a cached dashboard after an upgrade has no way to
+        // tell. The same header keeps per-principal JSON out of a shared cache.
+        let (supervisor, handle) = supervisor();
+        let task = tokio::spawn(supervisor.run());
+        let service = settings_service(MutatingSurface::Enabled);
+
+        for path in ["/", "/ui", "/live", "/api/cameras"] {
+            let response = route_with_settings(
+                get(path).as_bytes(),
+                &test_defaults("target/phase8-tests"),
+                &handle.health_registry(),
+                &handle,
+                &service,
+                None,
+            )
+            .await;
+            assert!(
+                response.contains("Cache-Control: no-store"),
+                "{path} must not be cacheable: {response}"
+            );
+        }
+
+        let _ = handle.shutdown().await;
+        let _ = task.await;
+    }
+
+    #[test]
+    fn the_dashboard_fetches_nothing_from_outside_this_server() {
+        // The deployment target is a self-hosted unit that may sit on a
+        // segmented network. A CDN script or webfont would fail closed in
+        // exactly the environment this product is for, and would also hand a
+        // third party a request per operator per page load.
+        for forbidden in ["http://", "https://", "src=\"//", "href=\"//", "@import"] {
+            assert!(
+                !DASHBOARD.contains(forbidden),
+                "the dashboard must be self-contained; found {forbidden}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_live_player_sdk_is_served_as_the_bytes_that_were_vendored() {
+        // The page cannot reach a CDN, so the SDK ships inside the binary. That
+        // moves the trust question from "is the CDN honest today" to "are these
+        // the bytes that were reviewed" — which is answerable, and answered
+        // here against the digest recorded in `ui/vendor/README.md`. An edit to
+        // the bundle without an edit to its provenance fails this test.
+        use sha2::{Digest, Sha256};
+
+        let readme = include_str!("../ui/vendor/README.md");
+        let recorded = readme
+            .lines()
+            .find_map(|line| line.strip_prefix("- SHA-256: `"))
+            .and_then(|rest| rest.strip_suffix('`'))
+            .expect("ui/vendor/README.md must record the bundle digest");
+        let actual = format!("{:x}", Sha256::digest(LIVEKIT_CLIENT.as_bytes()));
+        assert_eq!(
+            recorded, actual,
+            "the vendored LiveKit SDK does not match its recorded provenance"
+        );
+
+        let (supervisor, handle) = supervisor();
+        let task = tokio::spawn(supervisor.run());
+        let service = settings_service(MutatingSurface::Enabled);
+
+        let response = route_with_settings(
+            get("/ui/livekit-client.js").as_bytes(),
+            &test_defaults("target/phase8-tests"),
+            &handle.health_registry(),
+            &handle,
+            &service,
+            None,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(
+            response.contains("Content-Type: application/javascript; charset=utf-8"),
+            "the SDK must be served as JavaScript"
+        );
+        assert!(
+            response.ends_with(LIVEKIT_CLIENT),
+            "the SDK must be served unmodified"
+        );
+
+        let _ = handle.shutdown().await;
+        let _ = task.await;
+    }
+
+    #[test]
+    fn the_live_player_loads_its_sdk_only_from_this_server() {
+        // The one script this page fetches at runtime. Root-relative, so it is
+        // this server or nothing — which is the same promise as the test above
+        // about CDNs, restated for the one asset that is loaded dynamically and
+        // therefore invisible to a scan of the markup.
+        assert!(
+            DASHBOARD.contains("script.src = \"/ui/livekit-client.js\""),
+            "the live player must load the SDK from this server"
+        );
+        assert_eq!(
+            DASHBOARD.matches(".src = ").count(),
+            1,
+            "a second dynamically loaded script needs the same scrutiny as the first"
+        );
+    }
+
+    #[test]
+    fn a_viewer_token_is_never_rendered_on_the_page() {
+        // A viewer token grants live footage of a physical space to whoever
+        // holds it. It was previously printed into the page as JSON, where it
+        // survived in any screenshot or shoulder-glance. It is now used to
+        // connect and never displayed: exactly one mention, and it is the
+        // connect call.
+        assert_eq!(
+            DASHBOARD.matches("access.token").count(),
+            1,
+            "the viewer token must be used once, to connect, and never shown"
+        );
+        assert!(
+            DASHBOARD.contains("room.connect(access.endpoint, access.token)"),
+            "the single use of the token must be the connect call"
+        );
+        assert!(
+            !DASHBOARD.contains("esc(access.token)"),
+            "the viewer token must never be written into the DOM"
+        );
+    }
+
+    #[test]
+    fn live_video_starts_only_on_an_explicit_press() {
+        // The same rule as recorded playback, for a different reason: joining a
+        // room issues a viewer token and subscribes a real consumer to the
+        // publisher. Rendering a camera page must not do either. The element
+        // therefore ships hidden and empty, and `startLive` runs only from the
+        // button.
+        let (_, rest) = DASHBOARD
+            .split_once("<video id=\"live\"")
+            .expect("the dashboard must have a live player");
+        let (tag, _) = rest.split_once('>').unwrap_or((rest, ""));
+        assert!(
+            !tag.contains("autoplay") && !tag.contains("src="),
+            "the live element must hold no stream until pressed: {tag}"
+        );
+        assert!(
+            tag.contains("hidden"),
+            "the live element must stay hidden until a track is attached: {tag}"
+        );
+        // `muted` is what lets `play()` succeed without a second gesture. This
+        // publisher carries no audio, so muting removes nothing.
+        assert!(
+            tag.contains("muted"),
+            "the live element must be muted: {tag}"
+        );
+        assert!(
+            DASHBOARD.contains("data-act=\"watch-live\""),
+            "there must be a press that starts live viewing"
+        );
+        assert_eq!(
+            DASHBOARD.matches("await startLive(").count(),
+            1,
+            "live viewing must have exactly one entry point, the button"
+        );
+    }
+
+    #[test]
+    fn every_live_session_is_torn_down_before_the_view_it_lives_in_is_replaced() {
+        // `render` replaces the whole view, so every element a track is attached
+        // to stops existing. Without an explicit teardown the peer connections
+        // and the subscriptions survive the navigation, and the server keeps
+        // counting viewers who left. Caught by watching the subscriber count
+        // climb while clicking between screens.
+        //
+        // This assertion used to read `if (live.room) await stopLive();`, which
+        // was the whole of the property when the player owned at most one room.
+        // The live grid owns one room per watched camera, so that literal would
+        // now pass while every tile but one leaked. What follows is the property
+        // the literal stood for, stated directly and over all sessions: the
+        // teardown happens, it covers every room, and it completes before the
+        // view is replaced.
+        let handler = DASHBOARD
+            .split_once("window.addEventListener(\"hashchange\"")
+            .expect("the dashboard must tear down on navigation")
+            .1;
+        let stop = handler
+            .find("await stopAllLive();")
+            .expect("navigating away must disconnect every live room");
+        let render = handler
+            .find("await render();")
+            .expect("navigating must re-render the view");
+        assert!(
+            stop < render,
+            "every live room must be disconnected before the view is replaced"
+        );
+
+        let teardown = DASHBOARD
+            .split_once("async function stopAllLive()")
+            .expect("there must be a teardown covering every live room")
+            .1
+            .split_once("\n}")
+            .expect("stopAllLive must be a single function")
+            .0;
+        assert!(
+            teardown.contains("live.rooms.keys()") && teardown.contains("await stopLive("),
+            "stopAllLive must disconnect every room it owns, not one: {teardown}"
+        );
+    }
+
+    #[test]
+    fn watch_all_only_targets_tiles_that_offer_a_watch_button() {
+        // A tile whose camera does not publish to LiveKit renders no watch
+        // button. "Watch all" must respect that: joining a room for a camera the
+        // same screen says cannot be watched issues a viewer token and writes an
+        // audit row for a subscription that can never carry a track.
+        assert!(
+            DASHBOARD.contains(r#"querySelectorAll("[data-live-tile][data-live-watchable]")"#),
+            "watch-all must filter on the watchable marker, not every tile"
+        );
+        assert!(
+            DASHBOARD.contains(r#"const watchable = canWatch ? " data-live-watchable" : "";"#),
+            "the watchable marker must be derived from the same flag as the button"
+        );
+    }
+
+    #[test]
+    fn the_dashboard_separates_an_unreadable_fleet_from_an_empty_one() {
+        // A 401 or a dead server answers with no camera list at all. Rendering
+        // "0 / 0 - no cameras configured" from that turns a failed request into a
+        // fleet fact the page does not have. Every count is gated on `readable`.
+        assert!(
+            DASHBOARD.contains("readable: state.fleetError === null"),
+            "fleetCounts must carry whether the fleet was actually read"
+        );
+        for gated in [
+            "the fleet could not be read",
+            "The fleet could not be read, so there is nothing to show here.",
+            "The fleet could not be read, so there are no tiles to show.",
+            "fleet not readable",
+            "The capability report could not be read",
+        ] {
+            assert!(
+                DASHBOARD.contains(gated),
+                "the page must be able to say it could not read the fleet: {gated}"
+            );
+        }
+        assert!(
+            DASHBOARD.contains("if (counts.readable) pushTrend(\"cameras\", counts.connected);"),
+            "a failed read is a gap in the trend series, not a sample of zero"
+        );
+    }
+
+    #[test]
+    fn the_dashboard_never_handles_a_credential() {
+        // ADR 009 Decision 6: the reverse proxy authenticates. This page has
+        // no login form, stores no token, and constructs no `Authorization`
+        // header — so there is nothing here for an XSS to steal, on a system
+        // that streams footage of a physical space.
+        for forbidden in [
+            "localStorage",
+            "sessionStorage",
+            "document.cookie",
+            "Authorization",
+            "Bearer ",
+            "<form",
+            "type=\"password\"",
+        ] {
+            assert!(
+                !DASHBOARD.contains(forbidden),
+                "the dashboard must hold no credential; found {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_camera_is_never_explained_as_a_permission_problem() {
+        // The server answers `404` for a camera that does not exist and for one
+        // outside the caller's scope, byte for byte, so that a scoped viewer
+        // cannot enumerate the estate. A UI that offers "you may not have
+        // access" as the explanation rebuilds the oracle the server removed.
+        let (_, after) = DASHBOARD
+            .split_once("function missingCamera(")
+            .expect("the dashboard must render a missing camera through one function");
+        let (body, _) = after
+            .split_once("\n}")
+            .expect("missingCamera must be a single function");
+        let body = body.to_lowercase();
+        for leak in [
+            "permission",
+            "access",
+            "allowed",
+            "scope",
+            "authoris",
+            "authoriz",
+        ] {
+            assert!(
+                !body.contains(leak),
+                "a missing camera must not be explained as a permission problem; found {leak}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dashboard_offers_no_playback_scrubber() {
+        // Playback answers `Accept-Ranges: none` and is chunked: a seek cannot
+        // be served, and the total length is unknown until the last segment is
+        // read. `controls` is all it would take to draw a scrubber and a
+        // duration over a stream that can honour neither.
+        for element in DASHBOARD.match_indices("<video") {
+            let (_, rest) = DASHBOARD.split_at(element.0);
+            let (tag, _) = rest.split_once('>').unwrap_or((rest, ""));
+            assert!(
+                !tag.contains("controls"),
+                "the playback element must not carry native controls: {tag}"
+            );
+        }
+        assert!(
+            DASHBOARD.contains("<video"),
+            "this test is worthless if the dashboard has no player"
+        );
+    }
+
+    #[test]
+    fn playback_starts_only_on_an_explicit_press() {
+        // Not only the browser's autoplay rule. Every playback writes an export
+        // audit row naming the operator, the camera, the exact range, and the
+        // byte count; those rows should record deliberate viewings, not page
+        // renders. `autoplay` or `preload` would make rendering the screen the
+        // act being audited.
+        //
+        // Anchored on the recorded-playback element by id. The live element is
+        // a second `<video>` on a different screen with different rules — it
+        // carries no `src`, is fed by WebRTC, and is covered separately below.
+        let (_, rest) = DASHBOARD
+            .split_once("<video id=\"v\"")
+            .expect("the dashboard must have a playback player");
+        let (tag, _) = rest.split_once('>').unwrap_or((rest, ""));
+        assert!(
+            !tag.contains("autoplay"),
+            "the player must not autoplay: {tag}"
+        );
+        assert!(
+            tag.contains("preload=\"none\""),
+            "the player must fetch nothing until pressed: {tag}"
+        );
+        assert!(
+            DASHBOARD.contains("data-act=\"play\""),
+            "there must be a press that starts playback"
+        );
+    }
+
+    #[test]
+    fn a_playback_range_is_asked_for_with_recorded_timestamps() {
+        // Segment times are recorded to microseconds. Rebuilding a boundary
+        // from `Date.parse` silently truncates to milliseconds, and asking for
+        // `...011Z` when the footage starts at `...011609Z` puts the request in
+        // front of the first frame — which the server refuses as a gap. Found
+        // against a live webcam, where every "play this run" answered 409.
+        // `utc()` rebuilds a timestamp for display, which is fine and lossy.
+        // What must never be lossy is the value sent back as a range, so every
+        // playback boundary is checked to come from a recorded field.
+        let mut boundaries = 0;
+        for occurrence in DASHBOARD.match_indices("data-start=") {
+            let (_, rest) = DASHBOARD.split_at(occurrence.0);
+            let (binding, _) = rest.split_once('>').unwrap_or((rest, ""));
+            assert!(
+                binding.contains("started_at") || binding.contains("startedAt"),
+                "a playback boundary must come from a recorded timestamp: {binding}"
+            );
+            assert!(
+                binding.contains("ended_at") || binding.contains("endedAt"),
+                "a playback boundary must come from a recorded timestamp: {binding}"
+            );
+            boundaries += 1;
+        }
+        assert!(
+            boundaries >= 2,
+            "expected the segment and the run boundaries"
+        );
+    }
+
+    #[test]
+    fn a_range_with_a_gap_is_never_offered_as_one_stream() {
+        // The server answers `409 recording_range_not_contiguous` rather than
+        // joining across missing footage, because the joined video would play
+        // continuously and would not be continuous. Found by running this
+        // against a live webcam: the UI asked anyway and rendered a dead
+        // `<video>` with no explanation, which is indistinguishable from
+        // footage that does not exist.
+        assert!(
+            DASHBOARD.contains("function contiguousRuns("),
+            "the dashboard must split a range into contiguous runs"
+        );
+        let (_, rest) = DASHBOARD
+            .split_once("function playerPanel(")
+            .expect("the dashboard must have a player panel");
+        let (body, _) = rest
+            .split_once("\n}")
+            .expect("playerPanel must be a single function");
+        let gap_check = body
+            .find("runs.length > 1")
+            .expect("playerPanel must detect a gap before building a URL");
+        let url_build = body
+            .find("recordings/playback")
+            .expect("playerPanel must build a playback URL");
+        assert!(
+            gap_check < url_build,
+            "the gap must be detected before a playback URL is offered"
+        );
+    }
+
+    #[test]
+    fn detection_counts_are_withheld_when_capabilities_are_unknown() {
+        // The dangerous edit is not adding a count deliberately; it is
+        // simplifying this expression to `state.system && ...`, which reads
+        // identically and shows fixture-derived numbers whenever `/api/system`
+        // fails to load. Fixture detections are shaped and timed like real
+        // ones, so nothing downstream would notice.
+        assert!(
+            DASHBOARD.contains("!state.system || state.system.detection.results_are_fixture"),
+            "detection must be treated as a fixture until proven otherwise"
+        );
+        let fixture_check = DASHBOARD
+            .find("results_are_fixture")
+            .expect("the dashboard must consult the fixture flag");
+        for count in [
+            "camera.detection_inferred",
+            "camera.detections_published",
+            "camera.detection_dropped",
+        ] {
+            for occurrence in DASHBOARD.match_indices(count) {
+                assert!(
+                    occurrence.0 > fixture_check,
+                    "{count} is rendered before the fixture flag is consulted"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_setting_detail_reports_stored_and_effective_separately() {
         let (supervisor, handle) = supervisor();
@@ -2267,7 +5027,7 @@ mod tests {
 
         let response = route_with_settings(
             get("/api/settings/retention.interval").as_bytes(),
-            std::path::Path::new("target/phase7-tests"),
+            &test_defaults("target/phase7-tests"),
             &handle.health_registry(),
             &handle,
             &service,
@@ -2295,7 +5055,7 @@ mod tests {
 
         let response = route_with_settings(
             get("/api/settings/retention.max_agee").as_bytes(),
-            std::path::Path::new("target/phase7-tests"),
+            &test_defaults("target/phase7-tests"),
             &handle.health_registry(),
             &handle,
             &service,
@@ -2320,7 +5080,7 @@ mod tests {
                 r#"{"changes":{"server.health_bind":"0.0.0.0:80"}}"#,
             )
             .as_bytes(),
-            std::path::Path::new("target/phase7-tests"),
+            &test_defaults("target/phase7-tests"),
             &handle.health_registry(),
             &handle,
             &service,
@@ -2346,7 +5106,7 @@ mod tests {
                 r#"{"changes":{"storage.watermark_warning":"99"}}"#,
             )
             .as_bytes(),
-            std::path::Path::new("target/phase7-tests"),
+            &test_defaults("target/phase7-tests"),
             &handle.health_registry(),
             &handle,
             &service,
@@ -2407,7 +5167,7 @@ mod tests {
         );
         let response = route(
             request.as_bytes(),
-            std::path::Path::new("target/phase3-tests"),
+            &test_defaults("target/phase3-tests"),
             &handle.health_registry(),
             &handle,
         )
@@ -2415,7 +5175,7 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 201"));
         let response = route(
             b"GET /api/cameras/camera-21 HTTP/1.1\r\n\r\n",
-            std::path::Path::new("target/phase3-tests"),
+            &test_defaults("target/phase3-tests"),
             &handle.health_registry(),
             &handle,
         )
@@ -2428,7 +5188,7 @@ mod tests {
 
         let invalid = route(
             b"POST /api/cameras/../start HTTP/1.1\r\n\r\n",
-            std::path::Path::new("target/phase3-tests"),
+            &test_defaults("target/phase3-tests"),
             &handle.health_registry(),
             &handle,
         )
@@ -2473,9 +5233,12 @@ mod tests {
             .unwrap_or_else(|error| panic!("test address: {error}"));
         assert!(serve_health(
             public_address,
-            "target/phase3-tests".into(),
+            CameraDefaults::new("target/phase3-tests".into(), None),
             handle.health_registry(),
             handle.clone(),
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -2499,5 +5262,377 @@ mod tests {
             .unwrap_or_else(|error| panic!("shutdown: {error}"));
         task.await
             .unwrap_or_else(|error| panic!("supervisor task: {error}"));
+    }
+
+    /// A deployment `LiveKit` template, parameterised on the one field that
+    /// decides whether `OneCameraConfig::validate` accepts it.
+    ///
+    /// The endpoint is the lever these tests pull because stamping the template
+    /// onto a camera is otherwise unobservable through the API: publication
+    /// state is reported from a running pipeline's health, and a unit test
+    /// starts no pipeline and no `LiveKit` server. A template that cannot
+    /// validate turns "was this attached?" into a status code.
+    fn livekit_template(endpoint: &str) -> super::LiveKitSettings {
+        super::LiveKitSettings {
+            decoder_program: "ffmpeg".to_owned(),
+            max_publish_height: 0,
+            endpoint: endpoint.to_owned(),
+            api_key: "devkey".to_owned(),
+            api_secret: "development-secret-of-at-least-32-bytes".to_owned(),
+            deployment_namespace: "surveillance".to_owned(),
+            queue_items: 8,
+            max_lag: Duration::from_secs(2),
+            max_access_unit_bytes: 2 * 1024 * 1024,
+            shutdown_timeout: Duration::from_secs(5),
+            reconnect_initial: Duration::from_millis(250),
+            reconnect_maximum: Duration::from_secs(30),
+            reconnect_stable_reset: Duration::from_secs(60),
+        }
+    }
+
+    fn publishing_defaults(endpoint: &str) -> CameraDefaults {
+        CameraDefaults::new(
+            PathBuf::from("target/phase9-tests"),
+            Some(livekit_template(endpoint)),
+        )
+    }
+
+    fn add_camera_request(camera_id: &str, extra: &str) -> String {
+        let body = format!(
+            r#"{{"camera_id":"{camera_id}","rtsp_endpoint":"rtsp://127.0.0.1:19301/{camera_id}","width":640,"height":360{extra}}}"#
+        );
+        format!(
+            "POST /api/cameras HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The truth table for the field nobody sets.
+    ///
+    /// An absent field is the common case — the dashboard omits it, and so does
+    /// every hand-written `curl`. Before this existed the answer was a hard
+    /// `false`, which is why a fleet added through the API could not be watched.
+    #[test]
+    fn an_absent_publication_field_follows_the_deployment() {
+        assert!(super::wants_live_publication(None, true));
+        assert!(!super::wants_live_publication(None, false));
+        // An explicit choice is never overridden by the deployment, in either
+        // direction: a deployment that publishes must still be able to hold one
+        // camera back, and asking to publish where nothing can is an error the
+        // caller has to be told about rather than a silently downgraded add.
+        assert!(super::wants_live_publication(Some(true), true));
+        assert!(super::wants_live_publication(Some(true), false));
+        assert!(!super::wants_live_publication(Some(false), true));
+        assert!(!super::wants_live_publication(Some(false), false));
+    }
+
+    #[tokio::test]
+    async fn a_camera_added_through_the_api_publishes_when_the_deployment_does() {
+        let (supervisor, handle) = supervisor();
+        let task = tokio::spawn(supervisor.run());
+
+        // A usable deployment template: the camera is accepted with publication
+        // attached. This is the case that did not exist before — every camera
+        // added here was created unable to publish, whatever the deployment did.
+        let response = route(
+            add_camera_request("camera-31", "").as_bytes(),
+            &publishing_defaults("ws://127.0.0.1:7880"),
+            &handle.health_registry(),
+            &handle,
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 201"),
+            "a camera on a publishing deployment must be accepted: {response}"
+        );
+
+        // The same request against a template that cannot validate is refused,
+        // which is only reachable if the template was attached to this camera.
+        let response = route(
+            add_camera_request("camera-32", "").as_bytes(),
+            &publishing_defaults("not-a-url"),
+            &handle.health_registry(),
+            &handle,
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 400")
+                && response.contains("invalid_camera_configuration"),
+            "an absent field must take the deployment's template, not skip it: {response}"
+        );
+
+        // And declining publication skips the template entirely, so the same
+        // unusable settings no longer stand between the operator and a camera
+        // they never asked to publish.
+        let response = route(
+            add_camera_request("camera-32", r#","live_publication_enabled":false"#).as_bytes(),
+            &publishing_defaults("not-a-url"),
+            &handle.health_registry(),
+            &handle,
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 201"),
+            "declining publication must not consult the template: {response}"
+        );
+
+        handle
+            .shutdown()
+            .await
+            .unwrap_or_else(|error| panic!("shutdown: {error}"));
+        task.await
+            .unwrap_or_else(|error| panic!("supervisor task: {error}"));
+    }
+
+    #[tokio::test]
+    async fn asking_to_publish_where_the_deployment_cannot_is_refused_not_ignored() {
+        let (supervisor, handle) = supervisor();
+        let task = tokio::spawn(supervisor.run());
+
+        let response = route(
+            add_camera_request("camera-33", r#","live_publication_enabled":true"#).as_bytes(),
+            &test_defaults("target/phase9-tests"),
+            &handle.health_registry(),
+            &handle,
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 400")
+                && response.contains("live_publication_not_configured"),
+            "asking for publication a deployment cannot do must be an error: {response}"
+        );
+
+        // Refused, not half-applied. A 201 here would hand back a camera that
+        // silently does less than was asked for, and the operator would find
+        // out by watching a tile stay dark.
+        let response = route(
+            b"GET /api/cameras/camera-33 HTTP/1.1\r\n\r\n",
+            &test_defaults("target/phase9-tests"),
+            &handle.health_registry(),
+            &handle,
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 404"),
+            "the refused camera must not have been created: {response}"
+        );
+
+        handle
+            .shutdown()
+            .await
+            .unwrap_or_else(|error| panic!("shutdown: {error}"));
+        task.await
+            .unwrap_or_else(|error| panic!("supervisor task: {error}"));
+    }
+
+    /// The endpoint and credentials are the deployment's, and this route is not
+    /// a way to supply, substitute, or learn them. `deny_unknown_fields` is what
+    /// enforces it; this pins the consequence so a later field addition cannot
+    /// relax it by accident.
+    #[tokio::test]
+    async fn the_add_route_refuses_a_livekit_endpoint_or_credential() {
+        let (supervisor, handle) = supervisor();
+        let task = tokio::spawn(supervisor.run());
+
+        for smuggled in [
+            r#","livekit_endpoint":"ws://attacker.example/""#,
+            r#","api_secret":"stolen""#,
+            r#","deployment_namespace":"other""#,
+        ] {
+            let response = route(
+                add_camera_request("camera-34", smuggled).as_bytes(),
+                &publishing_defaults("ws://127.0.0.1:7880"),
+                &handle.health_registry(),
+                &handle,
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 400"),
+                "the add route must not accept {smuggled}: {response}"
+            );
+        }
+
+        handle
+            .shutdown()
+            .await
+            .unwrap_or_else(|error| panic!("shutdown: {error}"));
+        task.await
+            .unwrap_or_else(|error| panic!("supervisor task: {error}"));
+    }
+
+    /// The add form and the add route are one contract split across two
+    /// languages, and nothing in the build type-checks the seam. Before this,
+    /// the form posted `{camera_id}` alone against a route that requires four
+    /// fields, so the button could not succeed and said "Camera added." on a
+    /// path it never reached.
+    #[test]
+    fn the_add_camera_form_sends_what_the_add_route_requires() {
+        // Every field `AddCameraRequest` declares without a serde default, in
+        // one literal, so a field added to the route without one fails here
+        // rather than at a button press.
+        assert!(
+            DASHBOARD.contains("{ camera_id: id, rtsp_endpoint: rtsp, width, height }"),
+            "the add form must send every field the route requires"
+        );
+        // No RTSP credential fields, and this is the reason rather than an
+        // oversight: `the_dashboard_never_handles_a_credential` forbids a
+        // password input outright, and a camera that needs one is added through
+        // the API. The form says so instead of failing at the server.
+        assert!(
+            DASHBOARD.contains("This form takes no RTSP username or password"),
+            "the form must say why it cannot add an authenticated camera"
+        );
+        // Omitted unless the operator chooses, because absent means "follow the
+        // deployment" and sending `false` by default is exactly the bug that
+        // left every API-added camera unable to publish.
+        assert!(
+            DASHBOARD
+                .contains(r#"if (publication === "on") request.live_publication_enabled = true;"#)
+                && DASHBOARD.contains(
+                    r#"if (publication === "off") request.live_publication_enabled = false;"#
+                ),
+            "publication must be sent only when explicitly chosen"
+        );
+        assert!(
+            !DASHBOARD.contains("It records but does not publish to LiveKit."),
+            "the page must not still claim a camera added here cannot publish"
+        );
+        // The endpoint and the credential are the deployment's. A field on this
+        // form would make the page a place one could be typed in, read from, or
+        // pointed somewhere else.
+        for absent in ["livekit_endpoint", "api_secret", "deployment_namespace:"] {
+            assert!(
+                !DASHBOARD.contains(absent),
+                "the add form must not carry LiveKit connection details: {absent}"
+            );
+        }
+    }
+
+    /// The dashboard's recording search must name its range the way the route
+    /// reads it.
+    ///
+    /// It did not. The page sent `from`/`to`; [`recording_search`] reads
+    /// `start`/`end` and answers `missing_recording_range` to anything else, so
+    /// every search from the Playback screen failed with a 400 regardless of the
+    /// range asked for. Nothing caught it because the two halves are compiled
+    /// separately — one is Rust, the other is bytes in an `include_str!` — and
+    /// the screen is unreachable without an authenticated session, so no unit
+    /// test and no unauthenticated browser walk ever put them together.
+    ///
+    /// This is that missing joint. It builds the query names from
+    /// [`RANGE_START`] and [`RANGE_END`] — the same constants the two routes
+    /// read — so a rename on the Rust side fails here until the page follows,
+    /// which is the direction the drift actually went.
+    ///
+    /// It cannot instead drive the router and assert the 400: the range is
+    /// parsed after the recording index is required, so a request without
+    /// `SURVEILLANCE_DATABASE_URL` answers `recording_index_unavailable` first
+    /// and never reaches the parameters. The 400 was observed in the fixture,
+    /// under `scripts/phase9/authenticated-ui-fixture.sh`.
+    #[test]
+    fn the_playback_screen_names_the_range_the_way_the_route_reads_it() {
+        for sent in [
+            format!("?{RANGE_START}=${{encodeURIComponent("),
+            format!("&{RANGE_END}=${{encodeURIComponent("),
+        ] {
+            assert!(
+                DASHBOARD.contains(&sent),
+                "the playback screen must name the range the way the route reads it: {sent}"
+            );
+        }
+        assert!(
+            !DASHBOARD.contains("?from=") && !DASHBOARD.contains("&to="),
+            "no request may still carry the from/to names the route refuses"
+        );
+    }
+
+    /// The add-camera form must survive its own screen re-rendering.
+    ///
+    /// The fleet screen repaints on every poll — five seconds — by replacing the
+    /// whole of `#main`. The form's only copy of what had been typed was the DOM
+    /// it replaced, so a camera identifier and an RTSP URL were wiped mid-entry
+    /// and the submit handler read back empty strings. Nobody can type a URL in
+    /// under five seconds, so the form was unusable on the screen it lives on.
+    ///
+    /// Fixed the way the playback filters already worked: bound state, rendered
+    /// back out. This pins both halves, because either alone is still broken —
+    /// state nothing writes to, or a handler that reads the DOM anyway.
+    #[test]
+    fn the_add_camera_form_survives_the_poll_that_repaints_its_screen() {
+        for bound in [
+            r#"data-add="id" value="${esc(add.id)}""#,
+            r#"data-add="rtsp" value="${esc(add.rtsp)}""#,
+            r#"data-add="width""#,
+            r#"data-add="height""#,
+            r#"data-add="live""#,
+        ] {
+            assert!(
+                DASHBOARD.contains(bound),
+                "the add form must render from bound state: {bound}"
+            );
+        }
+        assert!(
+            DASHBOARD.contains("add[node.dataset.add] = node.value;"),
+            "typing must write through to that state, or rendering from it wipes every keystroke"
+        );
+        // And the submit path must not go back to the DOM, which is the thing
+        // being replaced underneath it.
+        assert!(
+            !DASHBOARD.contains("document.getElementById(`add-camera-${name}`)"),
+            "the add handler must read its state, not the elements the poll replaces"
+        );
+        for read in [
+            "add.id.trim()",
+            "add.rtsp.trim()",
+            "const publication = add.live;",
+        ] {
+            assert!(
+                DASHBOARD.contains(read),
+                "the add handler must read the bound state: {read}"
+            );
+        }
+    }
+
+    /// A playing tile must survive the poll that repaints its screen.
+    ///
+    /// The same repaint that ate the add form destroyed every `<video>` on the
+    /// live screen. `reattachLive` re-attached each track to the replacement
+    /// element, which looks correct and is not: a new element starts with a cold
+    /// decoder, reporting `readyState 0` and `videoWidth 0` until it warms. Every
+    /// tile therefore went black for part of every five-second poll. Sampling
+    /// the elements once per second through the fixture showed each tile
+    /// alternating between `640x360@4` and `0x0@0`.
+    ///
+    /// The fix carries the node itself across the swap. This pins that it is the
+    /// node being moved and not the track being re-attached, because the second
+    /// reintroduces the defect while still looking like live video most of the
+    /// time — which is exactly how it survived the first browser walk.
+    #[test]
+    fn a_playing_tile_survives_the_poll_that_repaints_its_screen() {
+        for carried in [
+            "const carried = new Map();",
+            "carried.set(cameraId, video);",
+            "fresh.parentNode.replaceChild(video, fresh);",
+        ] {
+            assert!(
+                DASHBOARD.contains(carried),
+                "the live tiles must be carried across the repaint: {carried}"
+            );
+        }
+        // The carry has to happen around the swap, not after it: once `#main` is
+        // replaced the old nodes are unreachable.
+        let lift = DASHBOARD
+            .find("carried.set(cameraId, video);")
+            .unwrap_or_else(|| panic!("the lift must exist"));
+        let swap = DASHBOARD
+            .find("main.innerHTML = html;")
+            .unwrap_or_else(|| panic!("the swap must exist"));
+        let restore = DASHBOARD
+            .find("fresh.parentNode.replaceChild(video, fresh);")
+            .unwrap_or_else(|| panic!("the restore must exist"));
+        assert!(
+            lift < swap && swap < restore,
+            "the tiles must be lifted before the swap and restored after it"
+        );
     }
 }

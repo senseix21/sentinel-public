@@ -5,14 +5,24 @@ use surveillance_config::{
 };
 use surveillance_database::PostgresSettingsRepository;
 
+use surveillance_auth::{
+    clock::SystemClock,
+    verify::{HashParams, Verifier},
+};
 use surveillance_config::settings::OneCameraConfig;
-use surveillance_database::PostgresRecordingRepository;
+use surveillance_database::{
+    PostgresAccessAuditRepository, PostgresAuthRepository, PostgresRecordingRepository,
+};
 use surveillance_events::bus::EventBus;
 use surveillance_livekit::token::DevelopmentTokenService;
 use surveillance_server::{
+    authenticate::{
+        Authenticator, RequestAuthenticator, SecurityOwner, VerifyConcurrency,
+        DEFAULT_VERIFY_MEMORY_BUDGET_BYTES,
+    },
     authorize::MutatingSurface,
     camera_supervisor::CameraSupervisor,
-    health_http::serve_health,
+    health_http::{serve_health, CameraDefaults},
     metadata_writer::MetadataWriter,
     phase4_metrics::Phase4Metrics,
     playback::PlaybackAssembler,
@@ -24,6 +34,7 @@ use surveillance_server::{
         load_from_environment, load_health_bind_from_environment, load_retention,
         load_supervision_from_environment,
     },
+    security_config::{load_trust_boundary, resolve_bind},
     settings_service::SettingsService,
 };
 use surveillance_storage::{
@@ -47,7 +58,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .try_init()?;
 
     let configuration = load_configuration_layers()?;
-    let config = Arc::new(OneCameraConfig::validate(load_from_environment()?)?);
+    let bootstrap_camera = load_from_environment(&configuration.bootstrap)?;
+    // Kept before validation consumes the settings. `OneCameraConfig` holds a
+    // validated `LiveKitConfig`, which is camera-scoped and cannot be turned
+    // back into the deployment template, so the API's add path would have
+    // nothing to stamp onto a new camera.
+    let livekit_template = bootstrap_camera.livekit.clone();
+    let config = Arc::new(OneCameraConfig::validate(bootstrap_camera)?);
     let health_bind = load_health_bind_from_environment()?;
     let supervision = load_supervision_from_environment()?;
     let database = load_database_from_environment()?;
@@ -78,8 +95,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut retention_owner = None;
     let mut recording_repository = None;
     let mut playback_assembler = None;
-    let metadata_handle = if let Some(database) = database {
-        let repository = PostgresRecordingRepository::connect_lazy(&database);
+    // Borrowed rather than moved: the identity store below needs the same
+    // configuration, and a per-unit PostgreSQL is one database, not two.
+    let metadata_handle = if let Some(database) = database.as_ref() {
+        let repository = PostgresRecordingRepository::connect_lazy(database);
         let mut reconciliation = ReconciliationOwner::new(
             repository.clone(),
             config.layout.clone(),
@@ -213,9 +232,59 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         );
     }
     let settings_service = Some(settings_service);
+
+    // ADR 009: identity, trust boundary, and the rule that unlocks a routable
+    // listener. Built here because it needs the database configuration and the
+    // resolved bind address, and enforced before the listener is created.
+    let trust_boundary = load_trust_boundary(|key| std::env::var(key).ok())?;
+    let (security, has_enabled_principal) = match database.as_ref() {
+        Some(database) => {
+            let repository = PostgresAuthRepository::connect_lazy(database);
+            // A store that cannot be reached reports no principals, which
+            // refuses a routable bind. Failing closed is the correct direction:
+            // binding anyway would fall back to the development identity.
+            let present = repository.has_enabled_principal().await.unwrap_or(false);
+            let verifier = Arc::new(Verifier::new(HashParams::default())?);
+            let concurrency = VerifyConcurrency::from_budget(
+                HashParams::default(),
+                DEFAULT_VERIFY_MEMORY_BUDGET_BYTES,
+            );
+            let authenticator: Arc<dyn RequestAuthenticator> = Arc::new(Authenticator::new(
+                repository,
+                SystemClock,
+                verifier,
+                concurrency,
+            ));
+            (
+                SecurityOwner::new(trust_boundary, Some(authenticator)),
+                present,
+            )
+        }
+        None => (SecurityOwner::new(trust_boundary, None), false),
+    };
+    // Same per-unit database as the identity store and the recording index.
+    let access_audit = database
+        .as_ref()
+        .map(PostgresAccessAuditRepository::connect_lazy);
+    // A second lazy handle to the same per-unit database. The authenticator
+    // owns one for verification; the identity API needs one for administration,
+    // and they have different lifetimes.
+    let identities = database
+        .as_ref()
+        .map(|config| Arc::new(PostgresAuthRepository::connect_lazy(config)));
+    let health_bind = resolve_bind(health_bind, security.boundary(), has_enabled_principal)?;
+    if !security.has_authenticator() {
+        tracing::warn!(
+            "no identity store is configured; the API grants administrator to every loopback \
+             caller as principal:service:loopback-development. This is a development posture \
+             and a routable listener is refused while it holds."
+        );
+    }
+    let security = Some(Arc::new(security));
+
     let mut adapter_task = tokio::spawn(serve_health(
         health_bind,
-        recording_root,
+        CameraDefaults::new(recording_root, livekit_template),
         registry,
         handle.clone(),
         recording_repository,
@@ -224,6 +293,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Some(phase4_metrics),
         viewer_tokens,
         settings_service,
+        security,
+        access_audit,
+        identities,
         adapter_shutdown_rx,
     ));
 

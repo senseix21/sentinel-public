@@ -1,0 +1,280 @@
+# Phase 8 (P8.7): unit tests for the alerting rules.
+#
+# Run with:
+#
+#     promtool test rules docs/phase-8/alerts_test.yml
+#
+# STATUS: NOT EXECUTED. `promtool` is not installed in this environment, so
+# these are written but unvalidated. The *metric names* are verified against a
+# running server's `/metrics`; the *expressions* are not verified at all. Roadmap item "critical alerts are
+# actionable and tested" stays [!] until someone runs the command above and
+# records the output. An alert that has only been written is a belief.
+#
+# Every critical alert has two cases: one that makes it fire, and one under
+# nominal series that must leave it silent. The silent case is the one that
+# catches an expression that fires on everything.
+
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 30s
+
+tests:
+  # ---------------------------------------------------------------- recording
+
+  - interval: 30s
+    name: A camera that stays disconnected fires; a brief blip does not
+    input_series:
+      - series: 'surveillance_camera_connected{camera_id="camera-01"}'
+        values: "0+0x10"
+      - series: 'surveillance_camera_connected{camera_id="camera-02"}'
+        values: "1+0x10"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: CameraDisconnected
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              camera_id: camera-01
+            exp_annotations:
+              summary: "Camera camera-01 has been disconnected for 2 minutes"
+              runbook: docs/phase-8/runbooks/camera-offline.md
+      # The 'for: 2m' must actually hold: at 1m nothing is firing yet.
+      - eval_time: 1m
+        alertname: CameraDisconnected
+        exp_alerts: []
+
+  - interval: 1m
+    name: A flapping camera fires even though it is never down for 2 minutes
+    input_series:
+      - series: 'surveillance_camera_reconnects_total{camera_id="camera-01"}'
+        values: "0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CameraFlapping
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              camera_id: camera-01
+            exp_annotations:
+              summary: "Camera camera-01 reconnected more than 5 times in 15 minutes"
+              runbook: docs/phase-8/runbooks/camera-offline.md
+
+  - interval: 1m
+    name: A steady camera does not fire the flapping alert
+    input_series:
+      - series: 'surveillance_camera_reconnects_total{camera_id="camera-01"}'
+        values: "0+0x20"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: CameraFlapping
+        exp_alerts: []
+
+  - interval: 1m
+    name: A connected camera producing no segments fires
+    input_series:
+      - series: 'surveillance_recorder_segments_completed_total{camera_id="camera-01"}'
+        values: "100+0x20"
+      - series: 'surveillance_camera_connected{camera_id="camera-01"}'
+        values: "1+0x20"
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: RecordingStalled
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              camera_id: camera-01
+            exp_annotations:
+              summary: "Camera camera-01 is connected but has completed no segment in 10 minutes"
+              runbook: docs/phase-8/runbooks/camera-offline.md
+
+  - interval: 1m
+    name: A camera recording normally is silent
+    input_series:
+      - series: 'surveillance_recorder_segments_completed_total{camera_id="camera-01"}'
+        values: "100+2x20"
+      - series: 'surveillance_camera_connected{camera_id="camera-01"}'
+        values: "1+0x20"
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: RecordingStalled
+        exp_alerts: []
+
+  # ------------------------------------------------------------------ storage
+
+  - interval: 1m
+    name: Storage above the critical watermark fires, below it is silent
+    input_series:
+      # 8% free of 100 GB => 92% used, above the 90% critical watermark.
+      - series: "surveillance_storage_free_bytes"
+        values: "8000000000+0x10"
+      - series: "surveillance_storage_total_bytes"
+        values: "100000000000+0x10"
+      - series: "surveillance_storage_pressure"
+        values: "2+0x10"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: StorageCritical
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Storage is above the critical watermark (92%)"
+              runbook: docs/phase-8/runbooks/disk-full.md
+      # Not yet at the exhaustion watermark.
+      - eval_time: 6m
+        alertname: StorageFull
+        exp_alerts: []
+
+  - interval: 1m
+    name: Storage at the exhaustion watermark pages immediately
+    input_series:
+      # StoragePressure::Emergency.
+      - series: "surveillance_storage_pressure"
+        values: "3+0x5"
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: StorageFull
+        exp_alerts:
+          - exp_labels:
+              severity: page
+            exp_annotations:
+              summary: "Storage is at the exhaustion watermark; recording is about to fail"
+              runbook: docs/phase-8/runbooks/disk-full.md
+
+  - interval: 1m
+    name: Nominal storage is silent
+    input_series:
+      - series: "surveillance_storage_free_bytes"
+        values: "45000000000+0x10"
+      - series: "surveillance_storage_total_bytes"
+        values: "100000000000+0x10"
+      - series: "surveillance_storage_pressure"
+        values: "0+0x10"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: StorageCritical
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: StorageFull
+        exp_alerts: []
+
+  # ------------------------------------------------------------- dependencies
+
+  - interval: 1m
+    name: A database outage fires after three minutes
+    input_series:
+      - series: "surveillance_configuration_store_available"
+        values: "0+0x10"
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: DatabaseUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "The recording index has been unreachable for 3 minutes; recording continues"
+              runbook: docs/phase-8/runbooks/database-outage.md
+      - eval_time: 2m
+        alertname: DatabaseUnavailable
+        exp_alerts: []
+
+  - interval: 1m
+    name: A healthy database is silent
+    input_series:
+      - series: "surveillance_configuration_store_available"
+        values: "1+0x10"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: DatabaseUnavailable
+        exp_alerts: []
+
+  # ----------------------------------------------------------------- security
+
+  - interval: 30s
+    name: Sustained credential guessing fires
+    input_series:
+      # 1 failure/s sustained, which is well above the 0.5/s threshold.
+      - series: 'surveillance_auth_failure_total{reason="bad_secret"}'
+        values: "0+30x20"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: AuthenticationFailureSpike
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Sustained credential-guessing rate (1/s over 5 minutes)"
+              runbook: docs/phase-8/runbooks/camera-offline.md
+
+  - interval: 30s
+    name: An operator fat-fingering a token twice does not page anyone
+    input_series:
+      - series: 'surveillance_auth_failure_total{reason="bad_secret"}'
+        values: "0 0 1 1 2 2 2 2 2 2 2 2 2 2 2 2"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: AuthenticationFailureSpike
+        exp_alerts: []
+
+  - interval: 30s
+    name: An expired token does not look like an attack
+    input_series:
+      # `expired` is deliberately excluded from the expression: an expired
+      # token is an operational problem, not a guessing attempt.
+      - series: 'surveillance_auth_failure_total{reason="expired"}'
+        values: "0+30x20"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: AuthenticationFailureSpike
+        exp_alerts: []
+
+  - interval: 30s
+    name: Requests that fail proof of origin fire
+    input_series:
+      - series: 'surveillance_proxy_proof_total{outcome="proof_mismatch"}'
+        values: "0+1x20"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ProxyOriginProofFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Requests are arriving that do not prove they came from the trusted proxy"
+              runbook: docs/phase-8/runbooks/database-outage.md
+
+  - interval: 30s
+    name: Normal proxied traffic is silent
+    input_series:
+      - series: 'surveillance_proxy_proof_total{outcome="proved"}'
+        values: "0+10x20"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ProxyOriginProofFailing
+        exp_alerts: []
+
+  - interval: 30s
+    name: An identity-store outage fires
+    input_series:
+      - series: "surveillance_auth_unavailable_total"
+        values: "0+2x20"
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: IdentityStoreUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "The identity store cannot be consulted; the API is refusing all requests"
+              runbook: docs/phase-8/runbooks/database-outage.md
+
+  - interval: 30s
+    name: A reachable identity store is silent
+    input_series:
+      - series: "surveillance_auth_unavailable_total"
+        values: "0+0x20"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: IdentityStoreUnavailable
+        exp_alerts: []

@@ -43,8 +43,6 @@ const LIVEKIT_URL: &str = "SURVEILLANCE_LIVEKIT_URL";
 const LIVEKIT_API_KEY: &str = "SURVEILLANCE_LIVEKIT_API_KEY";
 const LIVEKIT_API_SECRET: &str = "SURVEILLANCE_LIVEKIT_API_SECRET";
 const LIVEKIT_NAMESPACE: &str = "SURVEILLANCE_LIVEKIT_NAMESPACE";
-const LIVEKIT_CLI: &str = "SURVEILLANCE_LIVEKIT_CLI";
-const LIVEKIT_CLI_VERSION: &str = "SURVEILLANCE_LIVEKIT_CLI_VERSION";
 const DETECTION_ENABLED: &str = "SURVEILLANCE_DETECTION_ENABLED";
 const DETECTION_QUEUE_ITEMS: &str = "SURVEILLANCE_DETECTION_QUEUE_ITEMS";
 const DETECTION_SAMPLE_FPS: &str = "SURVEILLANCE_DETECTION_SAMPLE_FPS";
@@ -203,8 +201,10 @@ pub struct RetentionSettings {
 ///
 /// Returns a typed error for missing, malformed, or incomplete environment
 /// configuration.
-pub fn load_from_environment() -> Result<OneCameraSettings, EnvironmentConfigError> {
-    load_with(|key| std::env::var(key).ok())
+pub fn load_from_environment(
+    resolved: &ResolvedSettings,
+) -> Result<OneCameraSettings, EnvironmentConfigError> {
+    load_with(|key| std::env::var(key).ok(), resolved)
 }
 
 /// Loads the loopback-only Phase 2 health bind address.
@@ -305,6 +305,7 @@ fn load_health_bind_with(
 
 fn load_with(
     lookup: impl Fn(&str) -> Option<String>,
+    resolved: &ResolvedSettings,
 ) -> Result<OneCameraSettings, EnvironmentConfigError> {
     let camera_id = required(&lookup, CAMERA_ID)?;
     let endpoint = required(&lookup, RTSP_URL)?;
@@ -355,16 +356,50 @@ fn load_with(
             api_secret,
             deployment_namespace: lookup(LIVEKIT_NAMESPACE)
                 .unwrap_or_else(|| "surveillance".to_owned()),
-            cli_path: lookup(LIVEKIT_CLI).map_or_else(|| PathBuf::from("lk"), PathBuf::from),
-            cli_version: lookup(LIVEKIT_CLI_VERSION).unwrap_or_else(|| "2.18.2".to_owned()),
-            queue_items: 4,
-            max_lag: Duration::from_millis(500),
-            max_access_unit_bytes: 2 * 1024 * 1024,
-            ipc_write_timeout: Duration::from_millis(250),
-            shutdown_timeout: Duration::from_secs(2),
-            reconnect_initial: Duration::from_millis(250),
-            reconnect_maximum: Duration::from_secs(30),
-            reconnect_stable_reset: Duration::from_secs(30),
+            // These came from literals that shadowed the configuration domain:
+            // `camera.livekit.*` was classified, defaulted, validated, and
+            // audited, but nothing read it, so an operator could persist a
+            // change and watch it do nothing.
+            //
+            // Identity and credentials deliberately stay on the environment
+            // path above: they are secrets.
+            queue_items: bootstrap_count(resolved, SettingId::CameraLiveKitQueueItems, 8),
+            max_lag: bootstrap_duration(resolved, SettingId::CameraLiveKitMaxLag)
+                .unwrap_or_else(|| Duration::from_secs(2)),
+            max_access_unit_bytes: bootstrap_count(
+                resolved,
+                SettingId::CameraLiveKitMaxAccessUnitBytes,
+                2 * 1024 * 1024,
+            ),
+            shutdown_timeout: bootstrap_duration(resolved, SettingId::CameraLiveKitShutdownTimeout)
+                .unwrap_or_else(|| Duration::from_secs(5)),
+            reconnect_initial: bootstrap_duration(
+                resolved,
+                SettingId::CameraLiveKitReconnectInitial,
+            )
+            .unwrap_or_else(|| Duration::from_millis(250)),
+            reconnect_maximum: bootstrap_duration(
+                resolved,
+                SettingId::CameraLiveKitReconnectMaximum,
+            )
+            .unwrap_or_else(|| Duration::from_secs(30)),
+            reconnect_stable_reset: bootstrap_duration(
+                resolved,
+                SettingId::CameraLiveKitReconnectStableReset,
+            )
+            .unwrap_or_else(|| Duration::from_secs(30)),
+            // Live publication transcodes (ADR 012). The decoder shares the
+            // detection path's default binary but is a separate setting: the
+            // two have different lifetimes and a deployment may well point
+            // them at different builds.
+            decoder_program: bootstrap_path(resolved, SettingId::CameraLiveKitDecoder)
+                .map_or_else(|| "ffmpeg".to_owned(), |path| path.display().to_string()),
+            max_publish_height: u32::try_from(bootstrap_count(
+                resolved,
+                SettingId::CameraLiveKitMaxPublishHeight,
+                0,
+            ))
+            .unwrap_or(u32::MAX),
         }),
         _ => return Err(EnvironmentConfigError::IncompleteLiveKitCredentials),
     };
@@ -467,11 +502,59 @@ mod tests {
     };
     use std::{collections::HashMap, time::Duration};
 
+    fn compiled_defaults() -> ResolvedSettings {
+        ResolvedSettings::resolve(vec![defaults::layer()])
+    }
+
+    /// The `LiveKit` publisher's tuning must come from the configuration domain,
+    /// not from literals in this file.
+    ///
+    /// This exists because those literals silently shadowed `camera.livekit.*`
+    /// for its whole life: the settings were classified, defaulted, validated,
+    /// and audited, and the publisher never read one of them. (The literal
+    /// `ipc_write_timeout` was 250 ms against a declared default of 2 s; that
+    /// setting has since been retired with the child-process publisher it
+    /// belonged to.)
+    #[test]
+    fn livekit_tuning_comes_from_configuration_not_literals() {
+        let base = HashMap::from([
+            ("SURVEILLANCE_CAMERA_ID", "camera-01"),
+            ("SURVEILLANCE_RTSP_URL", "rtsp://127.0.0.1/camera"),
+            ("SURVEILLANCE_VIDEO_WIDTH", "640"),
+            ("SURVEILLANCE_VIDEO_HEIGHT", "360"),
+            ("SURVEILLANCE_LIVEKIT_URL", "ws://127.0.0.1:7880"),
+            ("SURVEILLANCE_LIVEKIT_API_KEY", "devkey"),
+            ("SURVEILLANCE_LIVEKIT_API_SECRET", "secret"),
+        ]);
+        let settings = load_with(
+            |key| base.get(key).map(|value| (*value).to_owned()),
+            &compiled_defaults(),
+        )
+        .unwrap_or_else(|error| panic!("settings: {error}"));
+        let livekit = settings.livekit.expect("livekit configured");
+
+        // Every one of these is a value the declared default disagrees with the
+        // old literal about, so a regression to literals fails here.
+        assert_eq!(
+            livekit.queue_items, 8,
+            "queue_items must be configured, not the old 4"
+        );
+        assert_eq!(livekit.max_lag, Duration::from_secs(2));
+        assert_eq!(livekit.shutdown_timeout, Duration::from_secs(5));
+
+        // Identity stays on the environment path.
+        assert_eq!(livekit.endpoint, "ws://127.0.0.1:7880");
+    }
+
     #[test]
     fn requires_deployment_identity_source_and_dimensions() {
         let values = HashMap::<&str, &str>::new();
         assert_eq!(
-            load_with(|key| values.get(key).map(|value| (*value).to_owned())).err(),
+            load_with(
+                |key| values.get(key).map(|value| (*value).to_owned()),
+                &compiled_defaults()
+            )
+            .err(),
             Some(EnvironmentConfigError::Missing("SURVEILLANCE_CAMERA_ID"))
         );
     }
@@ -486,7 +569,11 @@ mod tests {
             ("SURVEILLANCE_RTSP_USERNAME", "operator"),
         ]);
         assert_eq!(
-            load_with(|key| values.get(key).map(|value| (*value).to_owned())).err(),
+            load_with(
+                |key| values.get(key).map(|value| (*value).to_owned()),
+                &compiled_defaults()
+            )
+            .err(),
             Some(EnvironmentConfigError::IncompleteCredentials)
         );
     }
@@ -502,8 +589,11 @@ mod tests {
             ("SURVEILLANCE_DETECTION_QUEUE_ITEMS", "3"),
             ("SURVEILLANCE_DETECTION_SAMPLE_FPS", "7"),
         ]);
-        let settings = load_with(|key| base.get(key).map(|value| (*value).to_owned()))
-            .unwrap_or_else(|error| panic!("settings: {error}"));
+        let settings = load_with(
+            |key| base.get(key).map(|value| (*value).to_owned()),
+            &compiled_defaults(),
+        )
+        .unwrap_or_else(|error| panic!("settings: {error}"));
         assert!(!settings.detection_enabled);
         assert_eq!(settings.detection_queue_items, 3);
         assert_eq!(settings.detection_sample_fps, 7);

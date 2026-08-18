@@ -4,12 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+# Internal to this workspace; never published to a registry.
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
 jiff.workspace = true
+chrono = { workspace = true }
+subtle = { workspace = true }
+surveillance-auth = { path = "../../crates/auth" }
 surveillance-camera = { path = "../../crates/camera" }
 surveillance-common = { path = "../../crates/common" }
 surveillance-config = { path = "../../crates/config" }
@@ -28,4 +33,7 @@ tracing-subscriber.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+# Only to prove the vendored LiveKit browser SDK is byte-for-byte the bundle
+# recorded in `ui/vendor/README.md`. Not used by the server itself.
+sha2 = { workspace = true }
 sqlx.workspace = true

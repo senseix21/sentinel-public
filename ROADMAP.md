@@ -95,7 +95,7 @@ Replace assumptions that determine media topology, resource sizing, and product 
 - [x] Test a deterministic synthetic publisher stop/start, offline boundary, fresh timestamp epoch, and mid-GOP/keyframe join. Production-camera reconnect and the future Rust supervisor remain qualification work.
 - [x] Test Mac webcam -> FFmpeg -> local MediaMTX -> RTSP as the manual development source, including explicit 4:2:2-to-`yuv420p` conversion and downstream copy remux.
 - [~] Create deterministic RTSP fixtures for automated integration tests. Controlled synthetic reconnect/reset, authenticated Retina ingestion, live supervisor publisher stop/start recovery, and accelerated recording fixtures pass; a licensed representative-camera/file fixture remains open.
-- [x] Define and test the first SDK-neutral H.264 access-unit contract: validated depayloaded NALs, explicit marker/timestamp assembly, multi-slice grouping, SPS/PPS and IDR classification, malformed-input rejection, and discontinuity reset. Direct encoded publication is not yet available in a released official LiveKit Rust API.
+- [x] Define and test the first SDK-neutral H.264 access-unit contract: validated depayloaded NALs, explicit marker/timestamp assembly, multi-slice grouping, SPS/PPS and IDR classification, malformed-input rejection, and discontinuity reset. Direct encoded publication *is* available in a released official LiveKit Rust API (`livekit` 0.8, `NativeVideoSource::new_encoded`); the earlier claim that it was not is corrected here. It is implemented and unusable on Apple targets — see ADR 011 Decision 5.
 - [x] Implement bounded RFC 6184 non-interleaved H.264 depayloading for single-NAL, STAP-A, and FU-A payloads, including sequence-wrap/gap handling and an end-to-end RTP-to-access-unit test. Production limits remain a representative-camera configuration input.
 - [x] Define and test SDK-neutral bounded distribution semantics: independent recorder/live queues, recorder backlog preservation with visible rejection, live oldest-item eviction, explicit closure, and queue counters. Async integration and measured byte budgets remain Phase 2 work.
 - [x] Define and test the H.264 fragmented-MP4 segment lifecycle: validated partial/durable paths, consuming open-to-finalizing transitions, durable-file evidence, truthful completion fields, and typed failure records for reconciliation. Filesystem/muxer integration remains Phase 2 work.
@@ -313,17 +313,23 @@ Publish live camera feeds with low latency without coupling LiveKit availability
 - [x] Define publisher connection state, retry policy, queue/drop policy, and subscriber observability.
 - [x] Issue development browser access through subscribe-only LiveKit tokens rather than camera credentials; production authorization remains a Phase 8 gate.
 - [x] Expose per-camera publication state through API/metrics.
+- [x] Replace the `lk` CLI child process with in-process native encoded publication (`livekit` 0.8 `NativeVideoSource::new_encoded` / `capture_encoded_frame`). The child-process boundary is removed, not left in parallel. ADR 011.
+- [!] Run native encoded publication on the development platform. Implemented, and refused at runtime on Apple targets: `webrtc-sys` 0.3.42 builds the first encoder from the negotiated SDP format, which carries no backend tag, so the requested pass-through backend is never selected and VideoToolbox dereferences the pre-encoded payload as a pixel buffer. Measured four times: exactly 9 access units published, then `SIGSEGV` on the `EncoderQueue` thread. Blocked on upstream; ADR 011 Decision 5.
+- [x] Publish live video that a browser actually decodes, by decoding and re-encoding behind a viewer gate (ADR 012). `TranscodePublicationAdapter` implements the same `PublicationAdapter` contract as the pass-through adapter, so the owner, health model, failure categories, backoff, and the one-upstream-connection rule are untouched; `apps/server/src/pipeline.rs` selects it, and `NativePublicationAdapter` is kept rather than deleted so reversal is a one-line constructor change. Nothing decodes while `surveillance_livekit_viewers` is 0.
+- [x] Make the transcode path's own behaviour observable. `PublicationAdapter::observe` returns three numbers the owner cannot derive — viewers, media produced, internal restarts — surfaced as `surveillance_livekit_viewers` (a gauge), `surveillance_livekit_published_frames_total`, and `surveillance_livekit_adapter_restarts_total`. The restart counter earned itself immediately: it exposed one `Overloaded` restart on every subscribe, which was FFmpeg process startup rather than backpressure (ADR 012 Decision 5, amended). Split write budgets fixed it; measured 0 restarts over a 60 s session afterwards.
 
 ### Tests
 
 - [x] Publisher starts/stops without adding an upstream camera connection.
 - [~] LiveKit startup outage and bounded slow writes do not interrupt recorder admission; real server stop/restart while recording remains to be deterministically qualified.
 - [~] Shutdown leaves no publisher process; duplicate-track recovery after real server restart remains unverified.
-- [!] Measure glass-to-glass or a named pipeline boundary at p50/p90/p99 under realistic viewers. The pinned CLI emitted clock-skew evidence, so no latency claim is accepted.
+- [x] A non-retryable adapter failure stops publication once instead of reconnecting forever, and recording continues. Covered by `a_non_retryable_send_failure_stops_publication_instead_of_reconnecting`, and measured live on 2026-08-16: `livekit_connection_attempts_total=1`, `send_failures_total=1`, `state=8` (Stopped), `camera_connection_epochs_total=1`, `recorder_segments_completed_total=8`. Evidence: `docs/phase-5/local-evidence-2026-08-16.md`.
+- [!] Measure glass-to-glass or a named pipeline boundary at p50/p90/p99 under realistic viewers. Still refused, and now for a structural reason rather than an accidental one: the transcode path reports `TimestampAuthority::AdapterClock`, because B-frame reordering makes the frame-to-access-unit mapping unrecoverable and no honest media timestamp survives the decoder. `surveillance_livekit_media_timestamp_authority` reads 0 live. A latency number requires either a viewer-side measurement harness or a path that preserves media timestamps end to end.
 
 ### Exit gate
 
-- [!] H.264 reaches a real LiveKit subscriber, but full subscriber decode, representative High Profile cameras, browsers, and target concurrency remain external/local qualification gates.
+- [~] A real browser subscriber decodes and renders the live stream. Measured 2026-08-17 on the local stack: the dashboard's `<video>` element reports `1280x720`, `readyState` 4, advancing `currentTime`, and 416 frames through `getVideoPlaybackQuality()`. Still open: representative High Profile cameras, browsers other than the Chromium the check ran in, H.265, and target concurrency — every figure here is one camera and one subscriber.
+- [x] Published-versus-source frame rate is lossless under the qualified local workload. On 2026-08-18 the real Mac webcam produced independently probed 450-frame, 30.000 s segments (15.000 FPS), while an attached subscriber saw both `access_units_total` and `published_frames_total` advance 301 frames over the same timestamped 20 s sample (15.05/s), with zero stale drops and live evictions. Controlled 1280x720@15 runs published 926/926, 927/927, and 928/928 frames with 1, 2, and 4 viewers. This closes frame accounting, not time to first picture, browser rendering on representative cameras, or viewer-perceived latency. Evidence: `docs/phase-9/live-publication-qualification-2026-08-18.md`.
 - [~] LiveKit startup failure affects only live viewing; deterministic kill/restart recovery remains open.
 - [!] Latency is not yet accepted: no product objective exists and the CLI sender-report clock-skew warnings invalidate a forwarding-latency claim.
 
@@ -405,37 +411,137 @@ Make operational behavior safely configurable and add derived business behavior 
 
 Close the cross-cutting gaps required to operate the 10-camera system safely and recover it under failure.
 
+Decisions settled in ADR 009 on 2026-08-15: bearer tokens for human and service
+identities, all API reads authenticated with `/live`/`/ready`/`/metrics` open,
+a reverse proxy terminating TLS with proof of origin, a permission-enforced
+secrets file, and RPO one segment / RTO 15 minutes. The **deployment target
+remains unconfirmed**, which blocks items 8 and 9 in part.
+
 ### Instructions
 
-- [ ] Threat-model camera, API, database, filesystem, LiveKit, dashboard, and deployment trust boundaries.
-- [ ] Add authenticated users/service identities and camera-scoped authorization.
-- [ ] Terminate TLS directly or document and enforce a trusted reverse-proxy boundary.
-- [ ] Store secrets outside ordinary configuration responses; define rotation and file permissions.
-- [ ] Add audit logging for configuration, access, camera, recording export, and authorization changes.
-- [ ] Distinguish liveness, readiness, and per-camera degradation.
-- [ ] Export Prometheus-compatible metrics and create dashboards/alerts for critical failure modes.
-- [ ] Package the service for the confirmed Linux target with restart and resource limits.
-- [ ] Write deployment, upgrade, rollback, backup/restore, disk-full, camera-offline, database-outage, and LiveKit-outage runbooks.
-- [ ] Add dependency policy with `cargo audit`/`cargo deny` and document system-library patching.
-- [ ] Fuzz externally supplied parsers and range/configuration inputs where useful.
+- [x] Threat-model camera, API, database, filesystem, LiveKit, dashboard, and deployment trust boundaries. Seven boundaries in `docs/phase-8/threat-model.md`, each naming what crosses, who is trusted, what an attacker in that position can do, and the control. Six accepted risks are recorded with reasons and revisit conditions rather than left implicit.
+- [x] Add authenticated users/service identities and camera-scoped authorization. `crates/auth` owns principals, roles, camera scope, and Argon2id-hashed bearer tokens; `migrations/0003_auth.sql` refuses any non-Argon2id credential and any token without an expiry at the schema level. `authorize` now decides surface → shutdown → authentication → role → camera scope, and out-of-scope answers `404` so scope cannot enumerate the estate. `every_protected_route_reaches_the_chokepoint` covers every entry in the protected-route table, now including `GET /api/system`, and `the_playback_stream_reaches_the_chokepoint` covers the playback stream, which enters above the router and was initially missed. Browser identity is settled by **ADR 009 Decision 6**: the reverse proxy authenticates the human and asserts the principal in `X-Authenticated-Principal`, which is read only after proof of origin holds. The proxy asserts *who*, never what they may do — role and camera scope still come from the local `principals` table, so an asserted principal that is unknown or suspended here is refused. Six socket-level tests drive the real listener; each was verified to fail when its fix is reverted.
+- [x] Terminate TLS directly or document and enforce a trusted reverse-proxy boundary. Reverse proxy per ADR 009 Decision 3, with proof of origin as a peer allowlist **and** a constant-time shared-secret header; the rightmost `X-Forwarded-For` entry is taken, and a failed proof discards the forwarded value rather than defaulting. `HealthBindNotLoopback` now relaxes only when a trust boundary and an enabled principal both exist, enforced as validation in `security_config::resolve_bind`.
+- [x] Store secrets outside ordinary configuration responses; define rotation and file permissions. `crates/config/src/secret_store.rs` refuses a file wider than `0600` and reports the observed mode; per-key environment override; per-camera credentials expressible as `camera.<id>.rtsp_password`, which the Phase 7 environment layer could not express. Ownership enforcement is **not** implemented — it needs a `libc` call that `unsafe_code = "forbid"` rules out — and is recorded as a residual in `docs/phase-8/SPEC.md`.
+- [x] Add audit logging for configuration, access, camera, recording export, and authorization changes. `migrations/0004_access_audit.sql` plus `crates/database/src/access_audit.rs`, written at the chokepoint by `authorize_audited` so every protected request is covered by construction. All five categories now have a route that produces them: configuration from Phase 7's same-transaction trail, access and camera from the chokepoint, **export** because `/recordings/playback` is authorized as `ExportRecording` and followed by a row carrying camera, exact range, and byte count, and **identity** from the new `/api/identities` surface — creating principals and minting or revoking tokens was previously only possible through raw SQL, which no audit could observe. Verified live: correct rows for grants, each denial reason, the full identity lifecycle, and export authorization, with zero silent audit failures. Categories and outcomes are checked by the database; export rows must carry principal, camera, exact range, and byte count together or be refused; sensitive detail is a salted fingerprint, never a value.
+- [x] Distinguish liveness, readiness, and per-camera degradation. Already true from Phases 3–7; unchanged and re-verified.
+- [~] Export Prometheus-compatible metrics and create dashboards/alerts for critical failure modes. `surveillance_auth_*`, `surveillance_authz_*`, and `surveillance_proxy_proof_*` are exported with proven-bounded cardinality and no identity in any label — and the proxy-asserted path adds one series (`surveillance_auth_proxy_asserted_total`) and one failure reason (`unknown_principal`), both asserted present and bounded by `security_metrics_have_bounded_cardinality_and_leak_no_identity`, confirmed live, and always present rather than omitted when no identity store is configured (an absent series would make every alert on it silently never fire). `docs/phase-8/alerts.yml` carries thirteen rules and `alerts_test.yml` a firing and a silent case for each critical one — **but `promtool` is not installed here, so the rule tests have not been executed.** Three Grafana dashboards now exist in `docs/phase-8/dashboards/` (fleet overview, per-camera detail, security), **unrendered** because no Grafana is available. What *is* checked is the failure that is otherwise silent: `scripts/phase8/check-metric-names.py` verifies every metric named by an alert or panel against a running server's `/metrics`, and it runs in the Phase 8 fixture. That check caught seven invented metric names in the first draft of `alerts.yml` — `surveillance_storage_used_ratio`, `surveillance_database_available`, `surveillance_camera_connection_state`, `surveillance_queue_depth`, `surveillance_configuration_stale`, `surveillance_livekit_publication_state`, `surveillance_export_bytes_total` — every one of which would have made its alert silently inert.
+- [!] Package the service for the confirmed Linux target with restart and resource limits. Blocked: no confirmed distribution, unit type, storage layout, or upgrade owner. ADR 009 declines to guess one.
+- [~] Write deployment, upgrade, rollback, backup/restore, disk-full, camera-offline, database-outage, and LiveKit-outage runbooks. The four target-independent runbooks are written in `docs/phase-8/runbooks/`. Deployment, upgrade, rollback, and backup/restore are blocked on the same unconfirmed target. Of the four written, three were exercised and the LiveKit one was not; none was executed by a separate operator following it literally, which is the standard the handoff sets.
+- [x] Add dependency policy with `cargo audit`/`cargo deny` and document system-library patching. `deny.toml`, `.cargo/audit.toml`, and `make audit` in the gate; both pass. `docs/phase-8/dependency-policy.md` documents the FFmpeg/RTSP patching cadence and trigger. RUSTSEC-2023-0071 is ignored with verification that `rsa` is not in the build graph, not with a blanket exclusion.
+- [!] Fuzz externally supplied parsers and range/configuration inputs where useful. Not implemented: `cargo-fuzz` needs a nightly toolchain, and adding one to a gate pinned to stable 1.88 with `unsafe_code = "forbid"` is its own decision. Targets are named and prioritised in `docs/phase-8/dependency-policy.md`. Existing hand-chosen rejection tests are not a substitute and are not reported as one.
+
+### Operator dashboard (not a Phase 8 instruction; recorded because it ships)
+
+- [~] A browser dashboard exists at `GET /` and `GET /ui`:
+  `apps/server/ui/dashboard.html`, one self-contained file compiled in with
+  `include_str!`, no build step and no external request. Screens: fleet rollup,
+  camera detail with lifecycle actions, recording search and playback, settings
+  (read-only), and capabilities. It is unauthenticated for the same reason as
+  `/live`, `/ready`, and `/metrics` — a compile-time constant naming no camera,
+  no principal, and no time range — and it must be reachable by a caller this
+  system refuses, or an unprovisioned person meets a raw `401` instead of the
+  screen saying that signing in again cannot help. Six tests assert properties
+  of the shipped bytes (no external resource, no credential handling, no
+  `controls` on the player, no permission vocabulary in the not-found path,
+  detection counts unreachable until the fixture flag is consulted), each
+  mutation-verified. **Marked `[~]` and not `[x]`: there is no JavaScript
+  engine in this workspace and no browser test, so nothing verifies that a
+  screen renders or that a click works.** Live video, audit log, settings
+  editing, and identity management are deliberately absent — see
+  `docs/phase-8/ui-spec.md` §10 for which server gap blocks each.
+- [~] Driven in a browser against the local webcam loop on 2026-08-15 (webcam →
+  FFmpeg → MediaMTX → Retina → 60 indexed segments across four real gaps →
+  proxied dashboard). Three defects that the byte-level tests could not reach
+  were found and fixed: a silent dead player on a gapped range, a browser-cached
+  dashboard surviving a server upgrade, and playback boundaries truncated from
+  microseconds to milliseconds so that every run playback was refused with `409
+  recording_range_not_contiguous`. Each now has a mutation-verified test.
+  Playback then verified live at full precision (`readyState 4`, 1280×720,
+  advancing), and `seekable` measured as a zero-width range. Still `[~]`: one
+  browser, one camera, one session, no automated browser test, and no
+  multi-camera or concurrent-viewer measurement. Evidence in
+  `docs/phase-8/ui-spec.md` §11.
+- [~] Rebuilt to the reference design as nine screens with honest empty states,
+  and a Live View that owns N concurrent LiveKit rooms rather than one (ADR 010
+  Decisions 4 and 5). Driven in a browser on 2026-08-16 against
+  `scripts/phase9/livekit-load-fixture.sh` with six cameras, and separately
+  against a PostgreSQL-backed server where every `/api` call answers `401`.
+  Defects found and fixed in that walk: the tile footer clipped its watch, stop
+  and fullscreen controls at 5× density; camera identifiers in tables were real
+  links rendered as plain text; the idle overlay kept painting over a decoding
+  video because the user-agent's `[hidden]` rule loses to any class rule that
+  sets `display`; "Watch all" joined rooms for cameras whose own tile offers no
+  watch button; and — the one that mattered — an unreadable fleet rendered as
+  `0 / 0 · no cameras configured` on five surfaces plus a System screen frozen
+  on "Loading capabilities…", all of which asserted fleet facts a refused
+  request never returned. Counts, tables, service rows, the trend series and
+  the capability screen are now gated on whether the read succeeded; two
+  mutation-verified tests lock it. Footer behaviour re-verified at 2×/3×/4×/5×:
+  every footer one line, every control inside its box, the LiveKit words giving
+  up room to a dot and a tooltip at 4× and above. Still `[~]`: one browser, one
+  session, no automated browser test.
+- [~] What N concurrent live tiles cost is now measured, not asserted:
+  `docs/phase-9/live-grid-tiles-2026-08-16.md`. On an i9-9880H host each
+  subscribed 1280×720 30 fps tile costs the browser tree ≈0.17 of one core and
+  the SFU ≈0.046, while `surveillance-server` stayed between 4.5% and 5.9%
+  across zero to six tiles — the subscriber side is the binding constraint and
+  the ingest-once topology holds. **No tile-count claim is made**: only two
+  homogeneous points were run, nothing above six was tried, and five of six
+  tracks came from an `lk --publish-demo` publisher because `AddCameraRequest`
+  carried no LiveKit field at the time of that run. That limitation was removed
+  on 2026-08-16 (see the next item); the measurements above were not re-taken on
+  the newer binary and are unchanged by it.
+- [~] Playback and Settings driven through an authenticated session for the
+  first time, on 2026-08-16:
+  `docs/phase-9/authenticated-ui-2026-08-16.md`. Both screens call `/api/*`,
+  which Phase 8 authenticates, and the dashboard holds no credential by design
+  (ADR 009 Decision 6), so neither had ever been exercised — a proxy proving the
+  trust boundary is the only way to reach them.
+  `scripts/phase9/authenticated-ui-fixture.sh` stands that up and refuses to
+  declare itself ready unless the proxied API answers `200` **and** the direct
+  listener answers `401`. Four defects, three of them in shipped, reviewed code:
+  every Playback search answered `400` because the page sent `from`/`to` while
+  the route reads `start`/`end`; the add-camera form was wiped by the five-second
+  repaint; every live tile went black on every poll because the `<video>` node
+  was destroyed and the track re-attached to a cold one; and `api.io_timeout`
+  cancelled any playback client that paces its reads, which is every browser.
+  The last is fixed with a separate `api.playback_stall_timeout` (default `60s`,
+  documented as a reversible guess, not a measurement) and confirmed by
+  `surveillance_playback_cancelled_total`, not by inference. Verified in that
+  run: a camera added through the form publishes to LiveKit — `AddCameraRequest`
+  now carries `live_publication_enabled` — a playing tile survives five poll
+  cycles as the same DOM node, Playback search returns 12 real segments whose
+  displayed metadata `ffprobe` confirms against the files on disk, and the
+  Settings write path accepts (`200`, generation `0 → 1`), refuses (`400
+  invalid_value`, no generation change) and reverts (`200`, generation `2`).
+  Still `[~]`, and the reason is specific: **playback does not play through
+  inside the running dashboard page in headless Chromium and I could not explain
+  why** — the server completes the stream and a same-page `fetch()` pulls all
+  69.8 MB, yet the page's element stalls at ≈4 s and rewinds, while the same URL
+  in a bare `<video>` on the same origin plays through. Headless main-thread
+  contention is a hypothesis, not a finding. Playback is not to be described as
+  working end to end in the UI until a real browser reproduces it.
 
 ### Failure qualification
 
-- [ ] Camera disconnect and flapping.
-- [ ] Network partition.
-- [ ] Detector and LiveKit process failure.
-- [ ] PostgreSQL outage and recovery.
-- [ ] Disk warning, critical, full, and write error.
-- [ ] Abrupt machine/process restart during segment finalization.
-- [ ] Invalid/expired credentials and unauthorized cross-camera access.
-- [ ] Graceful SIGTERM under active recording and API requests.
+- [~] Camera disconnect and flapping. Runbook written and exercised against synthetic sources; representative cameras remain unavailable.
+- [!] Network partition. Not qualified: needs a multi-host environment that does not exist here.
+- [~] Detector and LiveKit process failure. Detector failure has Phase 6 evidence; the LiveKit runbook is written but **unexercised** — no LiveKit server is available.
+- [x] PostgreSQL outage and recovery. Exercised by stopping and restarting a local PostgreSQL; recording continued, `/ready` degraded, reconciliation restored the index. Restore-from-backup was **not** exercised, because the backup procedure is blocked on the deployment target.
+- [~] Disk warning, critical, full, and write error. Watermarks and retention have Phase 4 evidence and the runbook is written; a genuine disk-exhaustion run on target hardware has not been done.
+- [~] Abrupt machine/process restart during segment finalization. Phase 2 SIGKILL evidence stands; not re-qualified from the operator's side.
+- [x] Invalid/expired credentials and unauthorized cross-camera access. Every `AuthFailure` variant is tested, cross-camera access answers `404`, and the exhaustive role×action matrix passes. The schema-level refusals are qualified against a real database in `scripts/phase8/security-fixture.sh`.
+- [~] Graceful SIGTERM under active recording and API requests. Phase 2/3 shutdown evidence stands, and mutations are now refused while draining while reads continue; the combined case is not separately qualified.
+- [!] Concurrent settings updates, overlapping and non-overlapping. Carried from Phase 7 and **still not tested**. Needs two concurrent writers against one database.
+- [!] A boundary-scoped configuration change during live recording. Carried from Phase 7 and still unqualified.
 
 ### Exit gate
 
-- [ ] An operator can diagnose and recover the defined failures from documented telemetry and runbooks.
-- [ ] Secrets are neither logged nor returned to unauthorized clients.
-- [ ] Upgrade and rollback are demonstrated.
-- [ ] Critical alerts are actionable and tested.
+- [~] An operator can diagnose and recover the defined failures from documented telemetry and runbooks. Four runbooks exist against real telemetry, but none has been followed literally by a separate operator, and four more cannot be written. Not claimed as met.
+- [x] Secrets are neither logged nor returned to unauthorized clients. `Secret<T>` redacts `Debug`/`Display`/`Serialize`; tokens never reach a log, a metric label, or an audit row; the store holds only Argon2id hashes; secret load failures never render the value. Tested in `crates/common`, `crates/auth`, `crates/config`, and `apps/server`.
+- [!] Upgrade and rollback are demonstrated. Blocked on the deployment target.
+- [!] Critical alerts are actionable and tested. Rules and tests are written; `promtool` is absent so nothing has been executed. An alert that has only been written is a belief, not a control.
 
 ---
 

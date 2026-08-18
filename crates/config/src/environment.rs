@@ -166,16 +166,6 @@ pub const LEGACY_ALIASES: &[Alias] = &[
         implied: ImpliedUnit::None,
     },
     Alias {
-        name: "SURVEILLANCE_LIVEKIT_CLI",
-        id: SettingId::CameraLiveKitCliPath,
-        implied: ImpliedUnit::None,
-    },
-    Alias {
-        name: "SURVEILLANCE_LIVEKIT_CLI_VERSION",
-        id: SettingId::CameraLiveKitCliVersion,
-        implied: ImpliedUnit::None,
-    },
-    Alias {
         name: "SURVEILLANCE_DETECTION_ENABLED",
         id: SettingId::CameraDetectionEnabled,
         implied: ImpliedUnit::None,
@@ -493,6 +483,15 @@ mod tests {
     fn every_pre_phase_seven_variable_is_covered() {
         // The variables `apps/server/src/runtime_config.rs` reads today. Losing
         // one silently would break a deployment on upgrade.
+        //
+        // `SURVEILLANCE_LIVEKIT_CLI` and `SURVEILLANCE_LIVEKIT_CLI_VERSION`
+        // were on this list until 2026-08-16. They are absent because the
+        // server no longer reads them: ADR 011 replaced the child-process
+        // publisher they configured, and there is nothing left for them to
+        // name. A deployment that still exports them is unaffected: this layer
+        // looks up the names it knows rather than enumerating the environment,
+        // so a variable it no longer knows is simply not read. The persisted
+        // rows are removed by migration 0005.
         for name in [
             "SURVEILLANCE_RTSP_URL",
             "SURVEILLANCE_RTSP_USERNAME",
@@ -517,8 +516,6 @@ mod tests {
             "SURVEILLANCE_LIVEKIT_API_KEY",
             "SURVEILLANCE_LIVEKIT_API_SECRET",
             "SURVEILLANCE_LIVEKIT_NAMESPACE",
-            "SURVEILLANCE_LIVEKIT_CLI",
-            "SURVEILLANCE_LIVEKIT_CLI_VERSION",
             "SURVEILLANCE_DETECTION_ENABLED",
             "SURVEILLANCE_DETECTION_QUEUE_ITEMS",
             "SURVEILLANCE_DETECTION_SAMPLE_FPS",

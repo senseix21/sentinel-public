@@ -1,0 +1,242 @@
+# Phase 8 (P8.7): Prometheus alerting rules.
+#
+# Roadmap instruction 7 and exit gate "critical alerts are actionable and
+# tested".
+#
+# Two rules this file follows:
+#
+#   1. Every alert names a runbook. An alert an operator cannot act on is a
+#      pager that trains people to ignore pagers.
+#   2. Every alert has a firing test and a silent test in `alerts_test.yml`.
+#      An alert that has only been written is a belief, not a control.
+#
+# STATUS: the tests in alerts_test.yml have NOT been executed. `promtool` is not
+# installed in this environment, so these expressions are unvalidated against a
+# real evaluator. The roadmap item stays [!]. See
+# docs/phase-8/local-evidence-2026-08-15.md.
+#
+# Every metric name below has, however, been checked against the actual output
+# of a running server (`curl /metrics`), not against memory. The first draft of
+# this file invented seven names that do not exist -- surveillance_storage_used_ratio,
+# surveillance_database_available, surveillance_camera_connection_state,
+# surveillance_queue_depth, surveillance_configuration_stale,
+# surveillance_livekit_publication_state, surveillance_export_bytes_total -- and
+# an alert on a series that does not exist never fires. It is silent in exactly
+# the way a working alert is silent.
+#
+# Gauge encodings, which are numeric rather than labelled:
+#   surveillance_camera_pipeline_state  0 Configured 1 Starting 2 Running
+#                                       3 Stopping 4 Stopped 5 Degraded 6 Terminal
+#   surveillance_camera_connected       0 / 1
+#   surveillance_storage_pressure       0 Normal 1 Warning 2 Critical 3 Emergency
+#   surveillance_configuration_freshness 0 Fresh, 1 Stale
+#   surveillance_livekit_state          0 Disabled 1 Starting 2 Connecting
+#                                       3 Publishing 4 Backoff 5 Degraded
+#                                       6 Terminal 7 Stopping 8 Stopped
+
+groups:
+  - name: surveillance-recording
+    interval: 30s
+    rules:
+      - alert: CameraDisconnected
+        # Priority 1 in AGENTS.md is preserving recordings; a disconnected
+        # camera is producing none.
+        expr: surveillance_camera_connected == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Camera {{ $labels.camera_id }} has been disconnected for 2 minutes"
+          runbook: docs/phase-8/runbooks/camera-offline.md
+
+      - alert: CameraFlapping
+        # Distinct from the above on purpose: a camera that reconnects every
+        # 90 seconds never trips a 2-minute disconnect, but is recording
+        # fragments and is the harder fault to spot.
+        expr: increase(surveillance_camera_reconnects_total[15m]) > 5
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Camera {{ $labels.camera_id }} reconnected more than 5 times in 15 minutes"
+          runbook: docs/phase-8/runbooks/camera-offline.md
+
+      - alert: RecordingStalled
+        # A connected camera producing no segments is worse than a disconnected
+        # one, because nothing else looks wrong.
+        expr: |
+          increase(surveillance_recorder_segments_completed_total[10m]) == 0
+          and on(camera_id) surveillance_camera_connected == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Camera {{ $labels.camera_id }} is connected but has completed no segment in 10 minutes"
+          runbook: docs/phase-8/runbooks/camera-offline.md
+
+      - alert: RecorderQueueSaturated
+        expr: surveillance_media_queue_depth{consumer="recorder"} / surveillance_media_queue_capacity{consumer="recorder"} > 0.8
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Recorder queue for {{ $labels.camera_id }} is above 80% for 2 minutes"
+          runbook: docs/phase-8/runbooks/camera-offline.md
+
+  - name: surveillance-storage
+    interval: 30s
+    rules:
+      - alert: StorageCritical
+        # The configured critical watermark. Retention is already deleting;
+        # this says retention is not keeping up.
+        expr: 1 - (surveillance_storage_free_bytes / surveillance_storage_total_bytes) > 0.90
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Storage is above the critical watermark ({{ $value | humanizePercentage }})"
+          runbook: docs/phase-8/runbooks/disk-full.md
+
+      - alert: StorageFull
+        # StoragePressure: 0 Normal, 1 Warning, 2 Critical, 3 Emergency.
+        expr: surveillance_storage_pressure >= 3
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: "Storage is at the exhaustion watermark; recording is about to fail"
+          runbook: docs/phase-8/runbooks/disk-full.md
+
+      - alert: SegmentWriteFailures
+        expr: increase(surveillance_recorder_segments_failed_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Segment write failures on {{ $labels.camera_id }}"
+          runbook: docs/phase-8/runbooks/disk-full.md
+
+  - name: surveillance-dependencies
+    interval: 30s
+    rules:
+      - alert: DatabaseUnavailable
+        # Recording continues without the index (Phase 4), so this is not a
+        # page. It is critical because retrieval and retention degrade.
+        expr: surveillance_configuration_store_available == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The recording index has been unreachable for 3 minutes; recording continues"
+          runbook: docs/phase-8/runbooks/database-outage.md
+
+      - alert: ConfigurationStale
+        # /ready already reports Stale; this makes it noticed.
+        # Freshness gauge: 0 Fresh, 1 Stale.
+        expr: surveillance_configuration_freshness == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Configuration has been served from the last-known-good cache for 15 minutes"
+          runbook: docs/phase-8/runbooks/database-outage.md
+
+      - alert: LiveKitPublicationFailing
+        # Priority 3. Explicitly not critical: live view degrading must not
+        # page someone at 3am when recording is unaffected.
+        # PublicationState: 3 is Publishing. Enabled-but-not-publishing only.
+        expr: surveillance_livekit_enabled == 1 and surveillance_livekit_state != 3
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LiveKit publication for {{ $labels.camera_id }} has been down for 10 minutes"
+          runbook: docs/phase-8/runbooks/livekit-outage.md
+
+      - alert: LiveKitPublishingLessThanOffered
+        # The failure LiveKitPublicationFailing cannot see. State stays 3
+        # (Publishing) and nothing above looks wrong, while the subscriber
+        # receives a fraction of the camera's frames — which is what the
+        # child-process publisher did for the whole of Phase 5.
+        #
+        # Offered is what the distributor handed the live consumer; published
+        # is what reached the transport. Below half is far outside anything a
+        # working publisher does, and the comparison self-silences when the
+        # camera is idle because both rates are then zero.
+        expr: |
+          (
+            sum by (camera_id) (rate(surveillance_livekit_access_units_total[5m]))
+              < 0.5 * sum by (camera_id) (
+                  rate(surveillance_media_queue_received_total{consumer="live"}[5m])
+                )
+          )
+          and on (camera_id) (max by (camera_id) (surveillance_livekit_state) == 3)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LiveKit is publishing under half the frames offered for {{ $labels.camera_id }}"
+          runbook: docs/phase-8/runbooks/livekit-outage.md
+
+  - name: surveillance-security
+    interval: 30s
+    rules:
+      - alert: AuthenticationFailureSpike
+        # The threat model accepts the absence of rate limiting on the strength
+        # of high-entropy tokens plus Argon2id plus *this alert*. If this is
+        # not deployed, that accepted risk is no longer accepted.
+        expr: sum(rate(surveillance_auth_failure_total{reason=~"bad_secret|unknown_token"}[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Sustained credential-guessing rate ({{ $value }}/s over 5 minutes)"
+          runbook: docs/phase-8/runbooks/camera-offline.md
+
+      - alert: ProxyOriginProofFailing
+        # Something is reaching the server without traversing the proxy, or the
+        # proof secret is out of sync. Either way the trust boundary is not
+        # behaving as configured.
+        expr: sum(rate(surveillance_proxy_proof_total{outcome=~"peer_not_allowed|proof_mismatch|proof_missing"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Requests are arriving that do not prove they came from the trusted proxy"
+          runbook: docs/phase-8/runbooks/database-outage.md
+
+      - alert: ProxyAssertsUnprovisionedPrincipals
+        # The proxy authenticated somebody this system does not hold. Usually a
+        # provisioning gap — a user directory and a principals table that have
+        # drifted — and the person on the other end sees a 401 they cannot act
+        # on. Warning rather than critical: nothing is exposed, somebody is
+        # locked out. If it is *not* a provisioning gap, it is a proxy asserting
+        # something its operator did not intend, which is B7 severity.
+        expr: sum(rate(surveillance_auth_failure_total{reason="unknown_principal"}[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The trusted proxy is asserting principals that are not provisioned here"
+          runbook: docs/phase-8/runbooks/database-outage.md
+
+      - alert: IdentityStoreUnavailable
+        # Every API request is being refused 503. Recording is unaffected.
+        expr: increase(surveillance_auth_unavailable_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The identity store cannot be consulted; the API is refusing all requests"
+          runbook: docs/phase-8/runbooks/database-outage.md
+
+      - alert: UnexpectedRecordingExport
+        # Detection, not prevention. The threat model is explicit that an
+        # insider export cannot be prevented, so it must be noticed.
+        expr: increase(surveillance_playback_started_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Recording export occurred; confirm it was expected"
+          runbook: docs/phase-8/runbooks/database-outage.md
