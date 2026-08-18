@@ -145,7 +145,7 @@ for _ in {1..100}; do
 done
 curl -fsS "http://${HEALTH_BIND}/live" >/dev/null || fail "server never became live"
 
-for index in $(seq 2 "${CAMERAS}"); do
+for ((index = 2; index <= CAMERAS; index++)); do
   id="$(printf 'camera-%02d' "${index}")"
   curl -fsS -X POST "http://${HEALTH_BIND}/api/cameras" \
     -H 'content-type: application/json' \
@@ -157,7 +157,7 @@ note "added ${CAMERAS} cameras"
 # Adding a camera registers it; it does not run it. Without this the added
 # cameras never open an RTSP session and never reach the distributor, which is
 # why they were invisible in the server log.
-for index in $(seq 2 "${CAMERAS}"); do
+for ((index = 2; index <= CAMERAS; index++)); do
   id="$(printf 'camera-%02d' "${index}")"
   curl -fsS -X POST "http://${HEALTH_BIND}/api/cameras/${id}/start" \
     > "${LOG_DIR}/start-${id}.log" 2>&1 || fail "could not start ${id}"
