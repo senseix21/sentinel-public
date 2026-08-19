@@ -885,20 +885,6 @@ const HTML: &str = "text/html; charset=utf-8";
 const CSS: &str = "text/css; charset=utf-8";
 const JAVASCRIPT: &str = "application/javascript; charset=utf-8";
 const INDEX_HTML: &str = include_str!("../ui/index.html");
-// Transitional test corpus while the remaining byte-inspection tests are
-// replaced with route and executable JavaScript tests.
-#[cfg(test)]
-const DASHBOARD: &str = concat!(
-    include_str!("../ui/index.html"),
-    include_str!("../ui/js/app.js"),
-    include_str!("../ui/js/api.js"),
-    include_str!("../ui/js/formatting.js"),
-    include_str!("../ui/js/metrics.js"),
-    include_str!("../ui/js/playback.js"),
-    include_str!("../ui/js/router.js"),
-    include_str!("../ui/js/state.js"),
-    include_str!("../ui/js/theme.js"),
-);
 
 /// The `LiveKit` browser SDK, compiled into the binary for the same reasons.
 ///
@@ -949,6 +935,11 @@ const UI_ASSETS: &[UiAsset] = &[
         include_str!("../ui/js/metrics.js"),
     ),
     ui_asset(
+        "/ui/js/livekit.js",
+        JAVASCRIPT,
+        include_str!("../ui/js/livekit.js"),
+    ),
+    ui_asset(
         "/ui/js/playback.js",
         JAVASCRIPT,
         include_str!("../ui/js/playback.js"),
@@ -957,6 +948,51 @@ const UI_ASSETS: &[UiAsset] = &[
         "/ui/js/router.js",
         JAVASCRIPT,
         include_str!("../ui/js/router.js"),
+    ),
+    ui_asset(
+        "/ui/js/screens/cameras.js",
+        JAVASCRIPT,
+        include_str!("../ui/js/screens/cameras.js"),
+    ),
+    ui_asset(
+        "/ui/js/screens/dashboard.js",
+        JAVASCRIPT,
+        include_str!("../ui/js/screens/dashboard.js"),
+    ),
+    ui_asset(
+        "/ui/js/screens/events.js",
+        JAVASCRIPT,
+        include_str!("../ui/js/screens/events.js"),
+    ),
+    ui_asset(
+        "/ui/js/screens/heatmap.js",
+        JAVASCRIPT,
+        include_str!("../ui/js/screens/heatmap.js"),
+    ),
+    ui_asset(
+        "/ui/js/screens/live.js",
+        JAVASCRIPT,
+        include_str!("../ui/js/screens/live.js"),
+    ),
+    ui_asset(
+        "/ui/js/screens/playback.js",
+        JAVASCRIPT,
+        include_str!("../ui/js/screens/playback.js"),
+    ),
+    ui_asset(
+        "/ui/js/screens/settings.js",
+        JAVASCRIPT,
+        include_str!("../ui/js/screens/settings.js"),
+    ),
+    ui_asset(
+        "/ui/js/screens/storage.js",
+        JAVASCRIPT,
+        include_str!("../ui/js/screens/storage.js"),
+    ),
+    ui_asset(
+        "/ui/js/screens/system.js",
+        JAVASCRIPT,
+        include_str!("../ui/js/screens/system.js"),
     ),
     ui_asset(
         "/ui/js/state.js",
@@ -972,6 +1008,11 @@ const UI_ASSETS: &[UiAsset] = &[
         "/ui/js/components/banner.js",
         JAVASCRIPT,
         include_str!("../ui/js/components/banner.js"),
+    ),
+    ui_asset(
+        "/ui/js/components/camera-tile.js",
+        JAVASCRIPT,
+        include_str!("../ui/js/components/camera-tile.js"),
     ),
     ui_asset(
         "/ui/js/components/empty-state.js",
@@ -3396,8 +3437,8 @@ fn response(status: &str, content_type: &str, body: &str) -> String {
 mod tests {
     use super::{
         decode_recording_cursor, encode_recording_cursor, handle_client, parse_range, route,
-        route_with_settings, serve_health, test_defaults, CameraDefaults, SecurityOwner, DASHBOARD,
-        LIVEKIT_CLIENT, RANGE_END, RANGE_START,
+        route_with_settings, serve_health, test_defaults, CameraDefaults, SecurityOwner,
+        LIVEKIT_CLIENT, UI_ASSETS,
     };
     use crate::authorize::{authorize_call_count, MutatingSurface};
     use crate::camera_supervisor::{CameraSupervisor, PipelineState};
@@ -4690,6 +4731,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_embedded_ui_asset_has_a_unique_exact_route() {
+        let mut paths = std::collections::HashSet::new();
+        let (supervisor, handle) = supervisor();
+        let task = tokio::spawn(supervisor.run());
+        let service = settings_service(MutatingSurface::Enabled);
+
+        for asset in UI_ASSETS {
+            assert!(
+                paths.insert(asset.path),
+                "duplicate UI route: {}",
+                asset.path
+            );
+            assert!(asset.path == "/" || asset.path.starts_with("/ui"));
+            let response = route_with_settings(
+                get(asset.path).as_bytes(),
+                &test_defaults("target/ui-asset-tests"),
+                &handle.health_registry(),
+                &handle,
+                &service,
+                None,
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 200 OK"),
+                "{} was not served: {response}",
+                asset.path
+            );
+            assert!(
+                response.contains(&format!("Content-Type: {}", asset.content_type)),
+                "{} had the wrong content type",
+                asset.path
+            );
+            assert!(response.contains("Cache-Control: no-store"));
+            assert!(
+                response.ends_with(asset.body),
+                "{} was not served byte-for-byte",
+                asset.path
+            );
+        }
+
+        for unknown in [
+            "/ui/js/not-shipped.js",
+            "/ui/js/screens/../app.js",
+            "/ui/styles/base.css/extra",
+        ] {
+            let response = route_with_settings(
+                get(unknown).as_bytes(),
+                &test_defaults("target/ui-asset-tests"),
+                &handle.health_registry(),
+                &handle,
+                &service,
+                None,
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 404 Not Found"),
+                "unexpected UI route matched {unknown}: {response}"
+            );
+        }
+
+        let response = route_with_settings(
+            b"POST /ui/js/app.js HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+            &test_defaults("target/ui-asset-tests"),
+            &handle.health_registry(),
+            &handle,
+            &service,
+            None,
+        )
+        .await;
+        assert!(
+            response.starts_with("HTTP/1.1 404 Not Found"),
+            "UI assets must be GET-only: {response}"
+        );
+
+        let _ = handle.shutdown().await;
+        let _ = task.await;
+    }
+
+    #[tokio::test]
     async fn no_response_may_be_cached_by_a_browser() {
         // An operator reading a cached dashboard after an upgrade has no way to
         // tell. The same header keeps per-principal JSON out of a shared cache.
@@ -4715,20 +4835,6 @@ mod tests {
 
         let _ = handle.shutdown().await;
         let _ = task.await;
-    }
-
-    #[test]
-    fn the_dashboard_fetches_nothing_from_outside_this_server() {
-        // The deployment target is a self-hosted unit that may sit on a
-        // segmented network. A CDN script or webfont would fail closed in
-        // exactly the environment this product is for, and would also hand a
-        // third party a request per operator per page load.
-        for forbidden in ["http://", "https://", "src=\"//", "href=\"//", "@import"] {
-            assert!(
-                !DASHBOARD.contains(forbidden),
-                "the dashboard must be self-contained; found {forbidden}"
-            );
-        }
     }
 
     #[tokio::test]
@@ -4777,354 +4883,6 @@ mod tests {
 
         let _ = handle.shutdown().await;
         let _ = task.await;
-    }
-
-    #[test]
-    fn the_live_player_loads_its_sdk_only_from_this_server() {
-        // The one script this page fetches at runtime. Root-relative, so it is
-        // this server or nothing — which is the same promise as the test above
-        // about CDNs, restated for the one asset that is loaded dynamically and
-        // therefore invisible to a scan of the markup.
-        assert!(
-            DASHBOARD.contains("script.src = \"/ui/livekit-client.js\""),
-            "the live player must load the SDK from this server"
-        );
-        assert_eq!(
-            DASHBOARD.matches(".src = ").count(),
-            1,
-            "a second dynamically loaded script needs the same scrutiny as the first"
-        );
-    }
-
-    #[test]
-    fn a_viewer_token_is_never_rendered_on_the_page() {
-        // A viewer token grants live footage of a physical space to whoever
-        // holds it. It was previously printed into the page as JSON, where it
-        // survived in any screenshot or shoulder-glance. It is now used to
-        // connect and never displayed: exactly one mention, and it is the
-        // connect call.
-        assert_eq!(
-            DASHBOARD.matches("access.token").count(),
-            1,
-            "the viewer token must be used once, to connect, and never shown"
-        );
-        assert!(
-            DASHBOARD.contains("room.connect(access.endpoint, access.token)"),
-            "the single use of the token must be the connect call"
-        );
-        assert!(
-            !DASHBOARD.contains("esc(access.token)"),
-            "the viewer token must never be written into the DOM"
-        );
-    }
-
-    #[test]
-    fn live_video_starts_only_on_an_explicit_press() {
-        // The same rule as recorded playback, for a different reason: joining a
-        // room issues a viewer token and subscribes a real consumer to the
-        // publisher. Rendering a camera page must not do either. The element
-        // therefore ships hidden and empty, and `startLive` runs only from the
-        // button.
-        let (_, rest) = DASHBOARD
-            .split_once("<video id=\"live\"")
-            .expect("the dashboard must have a live player");
-        let (tag, _) = rest.split_once('>').unwrap_or((rest, ""));
-        assert!(
-            !tag.contains("autoplay") && !tag.contains("src="),
-            "the live element must hold no stream until pressed: {tag}"
-        );
-        assert!(
-            tag.contains("hidden"),
-            "the live element must stay hidden until a track is attached: {tag}"
-        );
-        // `muted` is what lets `play()` succeed without a second gesture. This
-        // publisher carries no audio, so muting removes nothing.
-        assert!(
-            tag.contains("muted"),
-            "the live element must be muted: {tag}"
-        );
-        assert!(
-            DASHBOARD.contains("data-act=\"watch-live\""),
-            "there must be a press that starts live viewing"
-        );
-        assert_eq!(
-            DASHBOARD.matches("await startLive(").count(),
-            1,
-            "live viewing must have exactly one entry point, the button"
-        );
-    }
-
-    #[test]
-    fn every_live_session_is_torn_down_before_the_view_it_lives_in_is_replaced() {
-        // `render` replaces the whole view, so every element a track is attached
-        // to stops existing. Without an explicit teardown the peer connections
-        // and the subscriptions survive the navigation, and the server keeps
-        // counting viewers who left. Caught by watching the subscriber count
-        // climb while clicking between screens.
-        //
-        // This assertion used to read `if (live.room) await stopLive();`, which
-        // was the whole of the property when the player owned at most one room.
-        // The live grid owns one room per watched camera, so that literal would
-        // now pass while every tile but one leaked. What follows is the property
-        // the literal stood for, stated directly and over all sessions: the
-        // teardown happens, it covers every room, and it completes before the
-        // view is replaced.
-        let handler = DASHBOARD
-            .split_once("window.addEventListener(\"hashchange\"")
-            .expect("the dashboard must tear down on navigation")
-            .1;
-        let stop = handler
-            .find("await stopAllLive();")
-            .expect("navigating away must disconnect every live room");
-        let render = handler
-            .find("await render();")
-            .expect("navigating must re-render the view");
-        assert!(
-            stop < render,
-            "every live room must be disconnected before the view is replaced"
-        );
-
-        let teardown = DASHBOARD
-            .split_once("async function stopAllLive()")
-            .expect("there must be a teardown covering every live room")
-            .1
-            .split_once("\n}")
-            .expect("stopAllLive must be a single function")
-            .0;
-        assert!(
-            teardown.contains("live.rooms.keys()") && teardown.contains("await stopLive("),
-            "stopAllLive must disconnect every room it owns, not one: {teardown}"
-        );
-    }
-
-    #[test]
-    fn watch_all_only_targets_tiles_that_offer_a_watch_button() {
-        // A tile whose camera does not publish to LiveKit renders no watch
-        // button. "Watch all" must respect that: joining a room for a camera the
-        // same screen says cannot be watched issues a viewer token and writes an
-        // audit row for a subscription that can never carry a track.
-        assert!(
-            DASHBOARD.contains(r#"querySelectorAll("[data-live-tile][data-live-watchable]")"#),
-            "watch-all must filter on the watchable marker, not every tile"
-        );
-        assert!(
-            DASHBOARD.contains(r#"const watchable = canWatch ? " data-live-watchable" : "";"#),
-            "the watchable marker must be derived from the same flag as the button"
-        );
-    }
-
-    #[test]
-    fn the_dashboard_separates_an_unreadable_fleet_from_an_empty_one() {
-        // A 401 or a dead server answers with no camera list at all. Rendering
-        // "0 / 0 - no cameras configured" from that turns a failed request into a
-        // fleet fact the page does not have. Every count is gated on `readable`.
-        assert!(
-            DASHBOARD.contains("readable: state.fleetError === null"),
-            "fleetCounts must carry whether the fleet was actually read"
-        );
-        for gated in [
-            "the fleet could not be read",
-            "The fleet could not be read, so there is nothing to show here.",
-            "The fleet could not be read, so there are no tiles to show.",
-            "fleet not readable",
-            "The capability report could not be read",
-        ] {
-            assert!(
-                DASHBOARD.contains(gated),
-                "the page must be able to say it could not read the fleet: {gated}"
-            );
-        }
-        assert!(
-            DASHBOARD.contains("if (counts.readable) pushTrend(\"cameras\", counts.connected);"),
-            "a failed read is a gap in the trend series, not a sample of zero"
-        );
-    }
-
-    #[test]
-    fn the_dashboard_never_handles_a_credential() {
-        // ADR 009 Decision 6: the reverse proxy authenticates. This page has
-        // no login form, stores no token, and constructs no `Authorization`
-        // header — so there is nothing here for an XSS to steal, on a system
-        // that streams footage of a physical space.
-        for forbidden in [
-            "localStorage",
-            "sessionStorage",
-            "document.cookie",
-            "Authorization",
-            "Bearer ",
-            "<form",
-            "type=\"password\"",
-        ] {
-            assert!(
-                !DASHBOARD.contains(forbidden),
-                "the dashboard must hold no credential; found {forbidden}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_missing_camera_is_never_explained_as_a_permission_problem() {
-        // The server answers `404` for a camera that does not exist and for one
-        // outside the caller's scope, byte for byte, so that a scoped viewer
-        // cannot enumerate the estate. A UI that offers "you may not have
-        // access" as the explanation rebuilds the oracle the server removed.
-        let (_, after) = DASHBOARD
-            .split_once("function missingCamera(")
-            .expect("the dashboard must render a missing camera through one function");
-        let (body, _) = after
-            .split_once("\n}")
-            .expect("missingCamera must be a single function");
-        let body = body.to_lowercase();
-        for leak in [
-            "permission",
-            "access",
-            "allowed",
-            "scope",
-            "authoris",
-            "authoriz",
-        ] {
-            assert!(
-                !body.contains(leak),
-                "a missing camera must not be explained as a permission problem; found {leak}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_dashboard_offers_no_playback_scrubber() {
-        // Playback answers `Accept-Ranges: none` and is chunked: a seek cannot
-        // be served, and the total length is unknown until the last segment is
-        // read. `controls` is all it would take to draw a scrubber and a
-        // duration over a stream that can honour neither.
-        for element in DASHBOARD.match_indices("<video") {
-            let (_, rest) = DASHBOARD.split_at(element.0);
-            let (tag, _) = rest.split_once('>').unwrap_or((rest, ""));
-            assert!(
-                !tag.contains("controls"),
-                "the playback element must not carry native controls: {tag}"
-            );
-        }
-        assert!(
-            DASHBOARD.contains("<video"),
-            "this test is worthless if the dashboard has no player"
-        );
-    }
-
-    #[test]
-    fn playback_starts_only_on_an_explicit_press() {
-        // Not only the browser's autoplay rule. Every playback writes an export
-        // audit row naming the operator, the camera, the exact range, and the
-        // byte count; those rows should record deliberate viewings, not page
-        // renders. `autoplay` or `preload` would make rendering the screen the
-        // act being audited.
-        //
-        // Anchored on the recorded-playback element by id. The live element is
-        // a second `<video>` on a different screen with different rules — it
-        // carries no `src`, is fed by WebRTC, and is covered separately below.
-        let (_, rest) = DASHBOARD
-            .split_once("<video id=\"v\"")
-            .expect("the dashboard must have a playback player");
-        let (tag, _) = rest.split_once('>').unwrap_or((rest, ""));
-        assert!(
-            !tag.contains("autoplay"),
-            "the player must not autoplay: {tag}"
-        );
-        assert!(
-            tag.contains("preload=\"none\""),
-            "the player must fetch nothing until pressed: {tag}"
-        );
-        assert!(
-            DASHBOARD.contains("data-act=\"play\""),
-            "there must be a press that starts playback"
-        );
-    }
-
-    #[test]
-    fn a_playback_range_is_asked_for_with_recorded_timestamps() {
-        // Segment times are recorded to microseconds. Rebuilding a boundary
-        // from `Date.parse` silently truncates to milliseconds, and asking for
-        // `...011Z` when the footage starts at `...011609Z` puts the request in
-        // front of the first frame — which the server refuses as a gap. Found
-        // against a live webcam, where every "play this run" answered 409.
-        // `utc()` rebuilds a timestamp for display, which is fine and lossy.
-        // What must never be lossy is the value sent back as a range, so every
-        // playback boundary is checked to come from a recorded field.
-        let mut boundaries = 0;
-        for occurrence in DASHBOARD.match_indices("data-start=") {
-            let (_, rest) = DASHBOARD.split_at(occurrence.0);
-            let (binding, _) = rest.split_once('>').unwrap_or((rest, ""));
-            assert!(
-                binding.contains("started_at") || binding.contains("startedAt"),
-                "a playback boundary must come from a recorded timestamp: {binding}"
-            );
-            assert!(
-                binding.contains("ended_at") || binding.contains("endedAt"),
-                "a playback boundary must come from a recorded timestamp: {binding}"
-            );
-            boundaries += 1;
-        }
-        assert!(
-            boundaries >= 2,
-            "expected the segment and the run boundaries"
-        );
-    }
-
-    #[test]
-    fn a_range_with_a_gap_is_never_offered_as_one_stream() {
-        // The server answers `409 recording_range_not_contiguous` rather than
-        // joining across missing footage, because the joined video would play
-        // continuously and would not be continuous. Found by running this
-        // against a live webcam: the UI asked anyway and rendered a dead
-        // `<video>` with no explanation, which is indistinguishable from
-        // footage that does not exist.
-        assert!(
-            DASHBOARD.contains("function contiguousRuns("),
-            "the dashboard must split a range into contiguous runs"
-        );
-        let (_, rest) = DASHBOARD
-            .split_once("function playerPanel(")
-            .expect("the dashboard must have a player panel");
-        let (body, _) = rest
-            .split_once("\n}")
-            .expect("playerPanel must be a single function");
-        let gap_check = body
-            .find("runs.length > 1")
-            .expect("playerPanel must detect a gap before building a URL");
-        let url_build = body
-            .find("recordings/playback")
-            .expect("playerPanel must build a playback URL");
-        assert!(
-            gap_check < url_build,
-            "the gap must be detected before a playback URL is offered"
-        );
-    }
-
-    #[test]
-    fn detection_counts_are_withheld_when_capabilities_are_unknown() {
-        // The dangerous edit is not adding a count deliberately; it is
-        // simplifying this expression to `state.system && ...`, which reads
-        // identically and shows fixture-derived numbers whenever `/api/system`
-        // fails to load. Fixture detections are shaped and timed like real
-        // ones, so nothing downstream would notice.
-        assert!(
-            DASHBOARD.contains("!state.system || state.system.detection.results_are_fixture"),
-            "detection must be treated as a fixture until proven otherwise"
-        );
-        let fixture_check = DASHBOARD
-            .find("results_are_fixture")
-            .expect("the dashboard must consult the fixture flag");
-        for count in [
-            "camera.detection_inferred",
-            "camera.detections_published",
-            "camera.detection_dropped",
-        ] {
-            for occurrence in DASHBOARD.match_indices(count) {
-                assert!(
-                    occurrence.0 > fixture_check,
-                    "{count} is rendered before the fixture flag is consulted"
-                );
-            }
-        }
     }
 
     #[tokio::test]
@@ -5566,181 +5324,5 @@ mod tests {
             .unwrap_or_else(|error| panic!("shutdown: {error}"));
         task.await
             .unwrap_or_else(|error| panic!("supervisor task: {error}"));
-    }
-
-    /// The add form and the add route are one contract split across two
-    /// languages, and nothing in the build type-checks the seam. Before this,
-    /// the form posted `{camera_id}` alone against a route that requires four
-    /// fields, so the button could not succeed and said "Camera added." on a
-    /// path it never reached.
-    #[test]
-    fn the_add_camera_form_sends_what_the_add_route_requires() {
-        // Every field `AddCameraRequest` declares without a serde default, in
-        // one literal, so a field added to the route without one fails here
-        // rather than at a button press.
-        assert!(
-            DASHBOARD.contains("{ camera_id: id, rtsp_endpoint: rtsp, width, height }"),
-            "the add form must send every field the route requires"
-        );
-        // No RTSP credential fields, and this is the reason rather than an
-        // oversight: `the_dashboard_never_handles_a_credential` forbids a
-        // password input outright, and a camera that needs one is added through
-        // the API. The form says so instead of failing at the server.
-        assert!(
-            DASHBOARD.contains("This form takes no RTSP username or password"),
-            "the form must say why it cannot add an authenticated camera"
-        );
-        // Omitted unless the operator chooses, because absent means "follow the
-        // deployment" and sending `false` by default is exactly the bug that
-        // left every API-added camera unable to publish.
-        assert!(
-            DASHBOARD
-                .contains(r#"if (publication === "on") request.live_publication_enabled = true;"#)
-                && DASHBOARD.contains(
-                    r#"if (publication === "off") request.live_publication_enabled = false;"#
-                ),
-            "publication must be sent only when explicitly chosen"
-        );
-        assert!(
-            !DASHBOARD.contains("It records but does not publish to LiveKit."),
-            "the page must not still claim a camera added here cannot publish"
-        );
-        // The endpoint and the credential are the deployment's. A field on this
-        // form would make the page a place one could be typed in, read from, or
-        // pointed somewhere else.
-        for absent in ["livekit_endpoint", "api_secret", "deployment_namespace:"] {
-            assert!(
-                !DASHBOARD.contains(absent),
-                "the add form must not carry LiveKit connection details: {absent}"
-            );
-        }
-    }
-
-    /// The dashboard's recording search must name its range the way the route
-    /// reads it.
-    ///
-    /// It did not. The page sent `from`/`to`; [`recording_search`] reads
-    /// `start`/`end` and answers `missing_recording_range` to anything else, so
-    /// every search from the Playback screen failed with a 400 regardless of the
-    /// range asked for. Nothing caught it because the two halves are compiled
-    /// separately — one is Rust, the other is bytes in an `include_str!` — and
-    /// the screen is unreachable without an authenticated session, so no unit
-    /// test and no unauthenticated browser walk ever put them together.
-    ///
-    /// This is that missing joint. It builds the query names from
-    /// [`RANGE_START`] and [`RANGE_END`] — the same constants the two routes
-    /// read — so a rename on the Rust side fails here until the page follows,
-    /// which is the direction the drift actually went.
-    ///
-    /// It cannot instead drive the router and assert the 400: the range is
-    /// parsed after the recording index is required, so a request without
-    /// `SURVEILLANCE_DATABASE_URL` answers `recording_index_unavailable` first
-    /// and never reaches the parameters. The 400 was observed in the fixture,
-    /// under `scripts/phase9/authenticated-ui-fixture.sh`.
-    #[test]
-    fn the_playback_screen_names_the_range_the_way_the_route_reads_it() {
-        for sent in [
-            format!("?{RANGE_START}=${{encodeURIComponent("),
-            format!("&{RANGE_END}=${{encodeURIComponent("),
-        ] {
-            assert!(
-                DASHBOARD.contains(&sent),
-                "the playback screen must name the range the way the route reads it: {sent}"
-            );
-        }
-        assert!(
-            !DASHBOARD.contains("?from=") && !DASHBOARD.contains("&to="),
-            "no request may still carry the from/to names the route refuses"
-        );
-    }
-
-    /// The add-camera form must survive its own screen re-rendering.
-    ///
-    /// The fleet screen repaints on every poll — five seconds — by replacing the
-    /// whole of `#main`. The form's only copy of what had been typed was the DOM
-    /// it replaced, so a camera identifier and an RTSP URL were wiped mid-entry
-    /// and the submit handler read back empty strings. Nobody can type a URL in
-    /// under five seconds, so the form was unusable on the screen it lives on.
-    ///
-    /// Fixed the way the playback filters already worked: bound state, rendered
-    /// back out. This pins both halves, because either alone is still broken —
-    /// state nothing writes to, or a handler that reads the DOM anyway.
-    #[test]
-    fn the_add_camera_form_survives_the_poll_that_repaints_its_screen() {
-        for bound in [
-            r#"data-add="id" value="${esc(add.id)}""#,
-            r#"data-add="rtsp" value="${esc(add.rtsp)}""#,
-            r#"data-add="width""#,
-            r#"data-add="height""#,
-            r#"data-add="live""#,
-        ] {
-            assert!(
-                DASHBOARD.contains(bound),
-                "the add form must render from bound state: {bound}"
-            );
-        }
-        assert!(
-            DASHBOARD.contains("add[node.dataset.add] = node.value;"),
-            "typing must write through to that state, or rendering from it wipes every keystroke"
-        );
-        // And the submit path must not go back to the DOM, which is the thing
-        // being replaced underneath it.
-        assert!(
-            !DASHBOARD.contains("document.getElementById(`add-camera-${name}`)"),
-            "the add handler must read its state, not the elements the poll replaces"
-        );
-        for read in [
-            "add.id.trim()",
-            "add.rtsp.trim()",
-            "const publication = add.live;",
-        ] {
-            assert!(
-                DASHBOARD.contains(read),
-                "the add handler must read the bound state: {read}"
-            );
-        }
-    }
-
-    /// A playing tile must survive the poll that repaints its screen.
-    ///
-    /// The same repaint that ate the add form destroyed every `<video>` on the
-    /// live screen. `reattachLive` re-attached each track to the replacement
-    /// element, which looks correct and is not: a new element starts with a cold
-    /// decoder, reporting `readyState 0` and `videoWidth 0` until it warms. Every
-    /// tile therefore went black for part of every five-second poll. Sampling
-    /// the elements once per second through the fixture showed each tile
-    /// alternating between `640x360@4` and `0x0@0`.
-    ///
-    /// The fix carries the node itself across the swap. This pins that it is the
-    /// node being moved and not the track being re-attached, because the second
-    /// reintroduces the defect while still looking like live video most of the
-    /// time — which is exactly how it survived the first browser walk.
-    #[test]
-    fn a_playing_tile_survives_the_poll_that_repaints_its_screen() {
-        for carried in [
-            "const carried = new Map();",
-            "carried.set(cameraId, video);",
-            "fresh.parentNode.replaceChild(video, fresh);",
-        ] {
-            assert!(
-                DASHBOARD.contains(carried),
-                "the live tiles must be carried across the repaint: {carried}"
-            );
-        }
-        // The carry has to happen around the swap, not after it: once `#main` is
-        // replaced the old nodes are unreachable.
-        let lift = DASHBOARD
-            .find("carried.set(cameraId, video);")
-            .unwrap_or_else(|| panic!("the lift must exist"));
-        let swap = DASHBOARD
-            .find("main.innerHTML = html;")
-            .unwrap_or_else(|| panic!("the swap must exist"));
-        let restore = DASHBOARD
-            .find("fresh.parentNode.replaceChild(video, fresh);")
-            .unwrap_or_else(|| panic!("the restore must exist"));
-        assert!(
-            lift < swap && swap < restore,
-            "the tiles must be lifted before the swap and restored after it"
-        );
     }
 }

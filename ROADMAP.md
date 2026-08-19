@@ -433,23 +433,19 @@ remains unconfirmed**, which blocks items 8 and 9 in part.
 
 ### Operator dashboard (not a Phase 8 instruction; recorded because it ships)
 
-- [~] A browser dashboard exists at `GET /` and `GET /ui`:
-  `apps/server/ui/dashboard.html`, one self-contained file compiled in with
-  `include_str!`, no build step and no external request. Screens: fleet rollup,
-  camera detail with lifecycle actions, recording search and playback, settings
-  (read-only), and capabilities. It is unauthenticated for the same reason as
-  `/live`, `/ready`, and `/metrics` — a compile-time constant naming no camera,
-  no principal, and no time range — and it must be reachable by a caller this
-  system refuses, or an unprovisioned person meets a raw `401` instead of the
-  screen saying that signing in again cannot help. Six tests assert properties
-  of the shipped bytes (no external resource, no credential handling, no
-  `controls` on the player, no permission vocabulary in the not-found path,
-  detection counts unreachable until the fixture flag is consulted), each
-  mutation-verified. **Marked `[~]` and not `[x]`: there is no JavaScript
-  engine in this workspace and no browser test, so nothing verifies that a
-  screen renders or that a click works.** Live video, audit log, settings
-  editing, and identity management are deliberately absent — see
-  `docs/phase-8/ui-spec.md` §10 for which server gap blocks each.
+- [~] A framework-free browser dashboard exists at `GET /` and `GET /ui`.
+  Its shell, four CSS files, composition root, domain modules, components,
+  nine screen modules, and vendored LiveKit SDK are compiled into the Rust
+  binary and served only through an exact static registry with same-origin and
+  `no-store` behavior. Node's test runner executes focused metrics, playback,
+  routing, state, theme, camera-not-found, and LiveKit lifecycle tests through
+  `make check`; Rust tests exercise every registered route, MIME type, exact
+  body, unknown path, and traversal-shaped path instead of inspecting
+  concatenated JavaScript text. On 2026-08-19 the authenticated fixture served
+  every asset and primary API with `200`, and headless Chrome executed the real
+  module graph and rendered a non-empty dashboard. Still `[~]`: the browser
+  walk covers one Chromium build and one synthetic camera, not representative
+  cameras, multiple browsers, or target viewer concurrency.
 - [~] Driven in a browser against the local webcam loop on 2026-08-15 (webcam →
   FFmpeg → MediaMTX → Retina → 60 indexed segments across four real gaps →
   proxied dashboard). Three defects that the byte-level tests could not reach
