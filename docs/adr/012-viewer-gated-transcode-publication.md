@@ -56,7 +56,8 @@ and it is the more expensive mistake:
   committed to. Recording and camera connectivity outrank it, and both are
   unaffected — proved by the run in `docs/phase-5/local-evidence-2026-08-16.md`,
   where 8 segments completed while publication went terminal.
-- Transcode cost scales with **concurrent viewers**, not with camera count. The
+- Transcode cost scales with **concurrent or recently disconnected viewers**,
+  bounded by the configured idle grace, not with total camera count. The
   scaling risk this project actually carries is 10 → 20 → 200 cameras. A cost
   that is zero when nobody is watching does not sit on that axis.
 - H.265 cameras cannot be passed through to a browser at all — WebRTC has no
@@ -80,9 +81,9 @@ option A is ever taken, and it still compiles and is still tested.
 
 ### Decision 2 — decoding is gated on viewer presence, and that is the load-bearing property
 
-No viewer means no FFmpeg process, no decode, no encode, and no published track.
-The adapter stays connected to the room so it can observe arrivals, which is
-idle signalling only.
+No viewer beyond the configured idle grace means no FFmpeg process, no decode,
+no encode, and no published track. The adapter stays connected to the room so
+it can observe arrivals, which is idle signalling only.
 
 Viewer presence is derived from remote participant count, maintained from the
 room event stream that `native.rs` previously discarded. **This is a deliberate
@@ -92,9 +93,18 @@ participant in one is there to watch that camera, and the approximation is tight
 in practice. If it ever stops being tight, the refinement is to track
 `TrackSubscribed`/`TrackUnsubscribed` instead; the seam is one type.
 
-The track is published on first viewer and unpublished on last. An idle camera
-therefore shows *no track* rather than a frozen or black one, which is the
-honest UI signal and avoids feeding a published track nothing.
+The track is published on the first viewer and unpublished after the last
+viewer has been absent for `camera.livekit.viewer_idle_grace` (five seconds by
+default; zero restores immediate teardown). During that bounded interval the
+same decoder and track continue to consume the existing live lane. This avoids
+another process startup and source-keyframe wait during ordinary navigation; it
+adds no queue, decoder, room, or upstream camera connection. A returning viewer
+cancels teardown. Once the grace expires, an idle camera shows *no track* rather
+than a frozen or black one.
+
+Amended 2026-08-19 after the authenticated Chrome fixture measured cold and
+warm reconnects. Evidence and limitations are in
+`docs/phase-9/livekit-low-latency-2026-08-19.md`.
 
 ### Decision 3 — the timestamp authority is the adapter clock, and no latency claim follows
 

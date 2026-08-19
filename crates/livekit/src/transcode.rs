@@ -11,7 +11,8 @@
 //!   every camera all of the time would spend the machine's CPU on pictures no
 //!   subscriber receives, and detection and recording sit above live viewing in
 //!   the subsystem ordering. The decoder starts on the first remote participant
-//!   and stops on the last (ADR 012 Decision 2).
+//!   and stops after the last participant's configured, bounded idle grace
+//!   (ADR 012 Decision 2).
 //! * **This is an adapter, not a second pipeline.** It implements the same
 //!   [`PublicationAdapter`] contract as `native.rs`, so the owner, health model,
 //!   failure categories, backoff, and metrics in `owner.rs` are untouched and
@@ -22,7 +23,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use livekit::{
@@ -76,6 +77,7 @@ pub struct TranscodePublicationAdapter {
     endpoint: String,
     decoder_program: String,
     max_publish_height: u32,
+    viewer_idle_grace: Duration,
     decode_counters: Arc<DecodeCounters>,
     counters: Arc<TranscodeCounters>,
     session: Option<Session>,
@@ -87,6 +89,7 @@ struct Session {
     events: UnboundedReceiver<RoomEvent>,
     viewers: usize,
     track: Option<PublishedTrack>,
+    idle_deadline: Option<Instant>,
 }
 
 /// A published track, the source feeding it, and the decode session behind it.
@@ -130,6 +133,7 @@ impl TranscodePublicationAdapter {
             endpoint: config.endpoint.as_str().to_owned(),
             decoder_program: config.decoder_program.clone(),
             max_publish_height: config.max_publish_height,
+            viewer_idle_grace: config.viewer_idle_grace,
             decode_counters: Arc::new(DecodeCounters::default()),
             counters: Arc::new(TranscodeCounters::default()),
             session: None,
@@ -363,6 +367,7 @@ impl PublicationAdapter for TranscodePublicationAdapter {
                 events,
                 viewers,
                 track: None,
+                idle_deadline: None,
             });
             Ok(())
         })
@@ -379,6 +384,7 @@ impl PublicationAdapter for TranscodePublicationAdapter {
                 identity,
                 decoder_program,
                 max_publish_height,
+                viewer_idle_grace,
                 decode_counters,
                 counters,
                 session,
@@ -389,11 +395,42 @@ impl PublicationAdapter for TranscodePublicationAdapter {
             };
             session.refresh_viewers();
 
-            if session.viewers == 0 {
-                // Idempotent: the first access unit after the last viewer
-                // leaves tears the track down, the rest are a load and a
-                // compare.
+            if should_stop_publishing(
+                session.viewers,
+                Instant::now(),
+                &mut session.idle_deadline,
+                *viewer_idle_grace,
+            ) {
                 session.stop_publishing().await;
+                counters
+                    .access_units_dropped
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(SendOutcome::Dropped);
+            }
+
+            if session.viewers == 0 {
+                // Keep feeding the already-running bounded session during the
+                // grace. That preserves a current decoder and track for a
+                // quick route change without creating another queue or camera
+                // connection.
+                let Some(decoder) = session
+                    .track
+                    .as_mut()
+                    .and_then(|track| track.decoder.as_mut())
+                else {
+                    counters
+                        .access_units_dropped
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(SendOutcome::Dropped);
+                };
+                let outcome = decoder.feed(access_unit.annex_b).await;
+                if outcome.is_ok() {
+                    return Ok(SendOutcome::Published);
+                }
+                if let Some(track) = session.track.as_mut() {
+                    track.stop_decoder().await;
+                }
+                counters.decoder_restarts.fetch_add(1, Ordering::Relaxed);
                 counters
                     .access_units_dropped
                     .fetch_add(1, Ordering::Relaxed);
@@ -481,6 +518,20 @@ impl PublicationAdapter for TranscodePublicationAdapter {
             Ok(())
         })
     }
+}
+
+fn should_stop_publishing(
+    viewers: usize,
+    now: Instant,
+    idle_deadline: &mut Option<Instant>,
+    grace: Duration,
+) -> bool {
+    if viewers > 0 {
+        *idle_deadline = None;
+        return false;
+    }
+    let deadline = idle_deadline.get_or_insert_with(|| now + grace);
+    now >= *deadline
 }
 
 /// The geometry to publish at: the stream's own size, under the configured cap.
@@ -620,6 +671,7 @@ mod tests {
             LiveKitSettings {
                 decoder_program: "ffmpeg".to_owned(),
                 max_publish_height,
+                viewer_idle_grace: Duration::from_secs(5),
                 endpoint: "ws://127.0.0.1:7880".to_owned(),
                 api_key: "devkey".to_owned(),
                 api_secret: "development-secret".to_owned(),
@@ -657,6 +709,50 @@ mod tests {
         assert_eq!(adapter.viewers(), 0);
         assert!(!adapter.decoding());
         assert_eq!(adapter.frames_decoded(), 0);
+    }
+
+    #[test]
+    fn idle_grace_is_bounded_and_a_returning_viewer_cancels_teardown() {
+        let start = Instant::now();
+        let grace = Duration::from_secs(5);
+        let mut deadline = None;
+
+        assert!(!should_stop_publishing(0, start, &mut deadline, grace));
+        assert!(!should_stop_publishing(
+            0,
+            start + Duration::from_secs(4),
+            &mut deadline,
+            grace
+        ));
+        assert!(!should_stop_publishing(
+            1,
+            start + Duration::from_secs(4),
+            &mut deadline,
+            grace
+        ));
+        assert_eq!(deadline, None);
+        assert!(!should_stop_publishing(
+            0,
+            start + Duration::from_secs(10),
+            &mut deadline,
+            grace
+        ));
+        assert!(should_stop_publishing(
+            0,
+            start + Duration::from_secs(15),
+            &mut deadline,
+            grace
+        ));
+    }
+
+    #[test]
+    fn zero_idle_grace_preserves_immediate_teardown() {
+        assert!(should_stop_publishing(
+            0,
+            Instant::now(),
+            &mut None,
+            Duration::ZERO
+        ));
     }
 
     #[tokio::test]

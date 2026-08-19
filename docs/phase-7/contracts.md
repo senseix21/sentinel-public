@@ -160,6 +160,7 @@ camera cardinality is already bounded by `supervision.maximum_cameras`.
 | `camera.livekit.reconnect_stable_reset` | `Duration` | `PipelineRestart` | Public |
 | `camera.livekit.decoder` | `PathBuf` | `PipelineRestart` | Public |
 | `camera.livekit.max_publish_height` | `u32` | `PipelineRestart` | Public |
+| `camera.livekit.viewer_idle_grace` | `Duration` | `PipelineRestart` | Public |
 
 Amended 2026-08-16: `camera.livekit.cli_path`, `camera.livekit.cli_version` and
 `camera.livekit.ipc_write_timeout` were removed with the child-process publisher
@@ -173,6 +174,12 @@ migration is needed — an absent key falls back to its versioned default, and t
 cache only rejects a key it cannot classify.
 `max_publish_height` is the one knob that trades published resolution for CPU;
 `0` means publish the camera's own height.
+
+Amended 2026-08-19: `camera.livekit.viewer_idle_grace` keeps the existing
+published track and decoder warm for a bounded interval after the final viewer
+leaves. The default is five seconds and zero restores immediate teardown. It
+absorbs short browser navigation gaps without adding a queue, decoder, or
+upstream camera connection.
 
 `camera_id` is not in the table. It is the scope key, not a setting; changing it
 would create a different camera, which is a lifecycle operation the existing

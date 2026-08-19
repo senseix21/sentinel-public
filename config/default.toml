@@ -141,3 +141,7 @@ decoder = "ffmpeg"
 # resolution. This is the largest CPU lever on the live path -- a 4K camera in
 # a browser tile costs several times what 720p costs and shows no more.
 max_publish_height = 0
+# Keep the existing decoder and published track briefly after the final viewer
+# leaves. This absorbs normal dashboard navigation without paying another
+# keyframe wait; zero restores immediate teardown.
+viewer_idle_grace = "5s"

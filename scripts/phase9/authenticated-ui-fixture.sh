@@ -24,7 +24,8 @@ set -euo pipefail
 #
 # Usage:  scripts/phase9/authenticated-ui-fixture.sh
 # Vars:   WINDOW (seconds to hold, default 1800), CAMERAS (default 2),
-#         PRINCIPAL (default admin), ROLE (default administrator).
+#         PRINCIPAL (default admin), ROLE (default administrator),
+#         LIVEKIT_LATENCY_BENCHMARK=1 to run Chrome trials and exit.
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/surveillance-phase9-ui.XXXXXX")
@@ -310,5 +311,15 @@ $(for index in $(seq 1 "${CAMERAS}"); do
 
 Holding for ${WINDOW}s. Ctrl-C tears everything down.
 EOF
+
+if [[ "${LIVEKIT_LATENCY_BENCHMARK:-0}" == "1" ]]; then
+  note "running authenticated browser live-latency trials"
+  DASHBOARD_URL="http://127.0.0.1:${PROXY_PORT}" \
+  DEV_USERNAME="${PRINCIPAL}" DEV_PASSWORD="${DEV_PASSWORD}" \
+  TRIALS="${TRIALS:-10}" \
+  node "${REPO_ROOT}/scripts/phase9/livekit-browser-latency.mjs" \
+    | tee "${LOG_DIR}/livekit-browser-latency.json"
+  exit 0
+fi
 
 sleep "${WINDOW}"

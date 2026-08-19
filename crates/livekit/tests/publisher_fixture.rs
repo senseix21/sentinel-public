@@ -41,6 +41,7 @@ fn fixture_config() -> LiveKitConfig {
     LiveKitConfig {
         decoder_program: "ffmpeg".to_owned(),
         max_publish_height: 0,
+        viewer_idle_grace: Duration::from_secs(5),
         endpoint: Url::parse(&endpoint).unwrap_or_else(|error| panic!("fixture URL: {error}")),
         credentials: LiveKitCredentials::new("devkey".to_owned(), "development-secret".to_owned())
             .unwrap_or_else(|error| panic!("{error}")),

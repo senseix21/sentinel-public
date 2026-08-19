@@ -341,6 +341,7 @@ mod tests {
             LiveKitSettings {
                 decoder_program: "ffmpeg".to_owned(),
                 max_publish_height: 0,
+                viewer_idle_grace: Duration::from_secs(5),
                 endpoint: "ws://127.0.0.1:7880".to_owned(),
                 api_key: "devkey".to_owned(),
                 api_secret: "development-secret".to_owned(),

@@ -98,6 +98,8 @@ pub struct LiveKitConfig {
     /// viewing resolution is a product decision, not one this code may make
     /// silently.
     pub max_publish_height: u32,
+    /// How long publication may stay warm after the final viewer leaves.
+    pub viewer_idle_grace: Duration,
 }
 
 impl fmt::Debug for LiveKitConfig {
@@ -139,9 +141,15 @@ pub struct LiveKitSettings {
     pub decoder_program: String,
     /// Ceiling on published picture height; `0` means no ceiling.
     pub max_publish_height: u32,
+    /// Bounded warm-session interval used to absorb short navigation gaps.
+    pub viewer_idle_grace: Duration,
 }
 
 impl LiveKitConfig {
+    /// Prevents a mistyped duration from turning viewer gating into permanent
+    /// background transcoding. Zero remains a valid immediate-teardown value.
+    pub const MAX_VIEWER_IDLE_GRACE: Duration = Duration::from_secs(300);
+
     pub fn validate(
         camera_id: &CameraId,
         settings: LiveKitSettings,
@@ -160,7 +168,10 @@ impl LiveKitConfig {
             NonZeroUsize::new(settings.queue_items).ok_or(LiveKitConfigError::InvalidQueue)?;
         let max_access_unit_bytes = NonZeroUsize::new(settings.max_access_unit_bytes)
             .ok_or(LiveKitConfigError::InvalidMediaLimit)?;
-        if settings.max_lag.is_zero() || settings.shutdown_timeout.is_zero() {
+        if settings.max_lag.is_zero()
+            || settings.shutdown_timeout.is_zero()
+            || settings.viewer_idle_grace > Self::MAX_VIEWER_IDLE_GRACE
+        {
             return Err(LiveKitConfigError::InvalidTiming);
         }
         // An empty program name would fail at spawn time, one camera at a
@@ -171,6 +182,7 @@ impl LiveKitConfig {
         Ok(Self {
             decoder_program: settings.decoder_program,
             max_publish_height: settings.max_publish_height,
+            viewer_idle_grace: settings.viewer_idle_grace,
             endpoint,
             credentials: LiveKitCredentials::new(settings.api_key, settings.api_secret)?,
             identity: PublicationIdentity::for_camera(&settings.deployment_namespace, camera_id)
@@ -217,6 +229,7 @@ mod tests {
         LiveKitSettings {
             decoder_program: "ffmpeg".to_owned(),
             max_publish_height: 0,
+            viewer_idle_grace: Duration::from_secs(5),
             endpoint: "ws://127.0.0.1:7880".to_owned(),
             api_key: "devkey".to_owned(),
             api_secret: "development-secret".to_owned(),
@@ -256,5 +269,20 @@ mod tests {
         .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(policy.delay(0), Duration::from_millis(10));
         assert_eq!(policy.delay(20), Duration::from_millis(40));
+    }
+
+    #[test]
+    fn viewer_idle_grace_is_optional_but_cannot_disable_viewer_gating() {
+        let camera = CameraId::new("camera-01").unwrap_or_else(|error| panic!("{error}"));
+        let mut immediate = valid();
+        immediate.viewer_idle_grace = Duration::ZERO;
+        assert!(LiveKitConfig::validate(&camera, immediate).is_ok());
+
+        let mut effectively_permanent = valid();
+        effectively_permanent.viewer_idle_grace = Duration::from_secs(301);
+        assert_eq!(
+            LiveKitConfig::validate(&camera, effectively_permanent).err(),
+            Some(LiveKitConfigError::InvalidTiming)
+        );
     }
 }

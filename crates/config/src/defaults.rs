@@ -357,6 +357,10 @@ fn camera_livekit(layer: &mut Layer) {
         SettingId::CameraLiveKitMaxPublishHeight,
         SettingValue::Unsigned(0),
     );
+    set(
+        SettingId::CameraLiveKitViewerIdleGrace,
+        SettingValue::Duration(Duration::from_secs(5)),
+    );
 }
 
 #[cfg(test)]

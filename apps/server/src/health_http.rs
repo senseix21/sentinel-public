@@ -3294,7 +3294,8 @@ fn render_metrics(
                 // encoder, so this over the offered total — `access_units` plus
                 // `adapter_drops`, since `access_units` counts only what was
                 // published — is the fraction of the stream a subscriber saw.
-                // Expect zero whenever `surveillance_livekit_viewers` is zero.
+                // May continue briefly with zero viewers during the configured
+                // warm-session grace; it stops after that bound.
                 "surveillance_livekit_published_frames_total",
                 publication.counters.adapter_media_produced,
             ),
@@ -5142,6 +5143,7 @@ mod tests {
         super::LiveKitSettings {
             decoder_program: "ffmpeg".to_owned(),
             max_publish_height: 0,
+            viewer_idle_grace: Duration::from_secs(5),
             endpoint: endpoint.to_owned(),
             api_key: "devkey".to_owned(),
             api_secret: "development-secret-of-at-least-32-bytes".to_owned(),

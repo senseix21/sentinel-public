@@ -473,6 +473,9 @@ settings! {
     CameraLiveKitMaxPublishHeight =>
         "camera.livekit.max_publish_height", Operational, PipelineRestart, Public, PerCamera,
         Unsigned, [];
+    CameraLiveKitViewerIdleGrace =>
+        "camera.livekit.viewer_idle_grace", Operational, PipelineRestart, Public, PerCamera,
+        Duration, [];
 }
 
 impl SettingId {
@@ -694,7 +697,8 @@ mod tests {
                         "recent",
                         "budget",
                         "gap",
-                        "tolerance"
+                        "tolerance",
+                        "grace"
                     ]
                     .iter()
                     .any(|marker| key.contains(marker)),
@@ -708,6 +712,6 @@ mod tests {
     fn table_covers_the_documented_setting_count() {
         // Guards against an accidental deletion of a table row. The number is
         // the contracts table's row count; changing it is a deliberate act.
-        assert_eq!(SettingId::ALL.len(), 79);
+        assert_eq!(SettingId::ALL.len(), 80);
     }
 }
