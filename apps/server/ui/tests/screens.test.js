@@ -1,0 +1,38 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { createStorageScreen } from "../js/screens/storage.js";
+import { createSystemScreen } from "../js/screens/system.js";
+
+test("storage renders from its explicit metrics and settings dependencies", () => {
+  const render = createStorageScreen({
+    fleetCounts: () => ({
+      cameras: [{
+        camera_id: "north", pipeline_state: "running", connection_state: "connected",
+        last_actionable_failure: null, recorder_queue_depth: 0, recorder_queue_capacity: 8,
+        recorder_completed_segments: 1, recorder_failed_segments: 0, last_media_unix_ms: 1,
+      }],
+      total: 1,
+      readable: true,
+    }),
+    fleetProblem: () => "",
+    isState: (value, expected) => value === expected,
+    metricSum: () => 0,
+    pipelinePill: () => "running",
+    pressureName: () => "nominal",
+    recordingDot: () => "recording",
+    settingValue: () => null,
+    storageFacts: () => ({ used: null, free: null, total: null, usedPct: null, pressure: null }),
+  });
+  assert.match(render(), /Storage capacity is not being reported/);
+});
+
+test("system renders an unavailable capability report without throwing", () => {
+  const render = createSystemScreen({
+    state: { system: null, systemError: null },
+    metric: () => null,
+    metricSum: () => null,
+    detectionIsFixture: () => true,
+    errorBanner: () => "error",
+  });
+  assert.match(render(), /Loading capabilities/);
+});

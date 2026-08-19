@@ -2,6 +2,35 @@
 
 Date: 2026-08-18
 
+Follow-up execution started: 2026-08-19 on
+`refactor/complete-dashboard-modules` after PR #4 merged the static shell,
+styles, pure utilities, playback helpers, theme support, and first embedded
+registry.
+
+Implementation status: complete. Every
+screen renderer is an embedded ES module, the LiveKit and camera-tile owners
+are extracted, JavaScript tests run from `make check`, the Rust source-string
+corpus is gone, and the authenticated fixture plus headless Chrome rendered the
+real URL successfully. The final repository gate and remaining external limits
+are recorded in the dated context snapshot.
+
+## Completion slice acceptance criteria
+
+- `app.js` owns composition, polling, delegated DOM events, and boot only; it
+  contains no screen renderer and no LiveKit `Room` registry.
+- `livekit.js` is the sole owner of SDK loading and room/session lifetime, with
+  executable tests for replacement, stale completion, stop, and stop-all.
+- `camera-tile.js` and every existing screen under `js/screens/` contain their
+  real renderer implementation rather than forwarding wrappers.
+- The Rust test-only concatenation of JavaScript source is removed. Rust tests
+  exercise exact registered routes, MIME types, bytes, no-store headers,
+  unknown paths, traversal-shaped paths, and wrong methods.
+- `make check` executes the JavaScript suite before the Rust gate.
+- A real browser loads every module and renders through the authenticated
+  fixture; navigation cleanup and light/dark toggling remain operational.
+- `ROADMAP.md` and a new dated `context/` snapshot state what was verified and
+  retain every external product/hardware gate.
+
 The work is one behavior-preserving vertical slice. Each step leaves the server
 able to compile, and focused checks run before moving to the next ownership
 boundary.

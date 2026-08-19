@@ -2,6 +2,7 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
 CARGO ?= cargo
+NODE ?= node
 FFMPEG_BIN ?= ffmpeg
 FFPLAY_BIN ?= ffplay
 MEDIAMTX_BIN ?= mediamtx
@@ -111,6 +112,7 @@ fixture: ## Run the complete deterministic MediaMTX/Retina Phase 2 qualification
 check: ## Run the complete Rust workspace quality gate.
 	bash -n scripts/dev/local-stack.sh scripts/phase9/authenticated-ui-fixture.sh
 	python3 -m unittest scripts/dev/test_trust_boundary_proxy.py
+	"$(NODE)" --test apps/server/ui/tests/*.test.js
 	"$(CARGO)" fmt --all --check
 	"$(CARGO)" clippy --workspace --all-targets --all-features -- -D warnings
 	"$(CARGO)" test --workspace --all-features
