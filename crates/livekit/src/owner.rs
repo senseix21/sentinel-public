@@ -684,6 +684,7 @@ mod tests {
         LiveKitConfig {
             decoder_program: "ffmpeg".to_owned(),
             max_publish_height: 0,
+            viewer_idle_grace: Duration::from_secs(5),
             endpoint: Url::parse("ws://127.0.0.1:7880").unwrap_or_else(|error| panic!("{error}")),
             credentials: LiveKitCredentials::new("key".to_owned(), "secret-value".to_owned())
                 .unwrap_or_else(|error| panic!("{error}")),

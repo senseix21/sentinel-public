@@ -400,6 +400,11 @@ fn load_with(
                 0,
             ))
             .unwrap_or(u32::MAX),
+            viewer_idle_grace: bootstrap_duration(
+                resolved,
+                SettingId::CameraLiveKitViewerIdleGrace,
+            )
+            .unwrap_or_else(|| Duration::from_secs(5)),
         }),
         _ => return Err(EnvironmentConfigError::IncompleteLiveKitCredentials),
     };
@@ -541,6 +546,7 @@ mod tests {
         );
         assert_eq!(livekit.max_lag, Duration::from_secs(2));
         assert_eq!(livekit.shutdown_timeout, Duration::from_secs(5));
+        assert_eq!(livekit.viewer_idle_grace, Duration::from_secs(5));
 
         // Identity stays on the environment path.
         assert_eq!(livekit.endpoint, "ws://127.0.0.1:7880");
