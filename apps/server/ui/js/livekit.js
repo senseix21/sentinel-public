@@ -1,11 +1,15 @@
 import { esc } from "./formatting.js";
 
-export function createLiveKitOwner({ ApiError, api, banner, errorBanner, sdkLoader = null }) {
+export function createLiveKitOwner({
+  ApiError, api, banner, errorBanner, sdkLoader = null,
+  setRetryTimer = (callback, delay) => setTimeout(callback, delay),
+  clearRetryTimer = (timer) => clearTimeout(timer),
+}) {
 
 // ------------------------------------------------------------- live viewing
 
-// The SDK is half a megabyte and live viewing is opt-in, so it is fetched on the
-// first press rather than on every page load. It is same-origin:
+// The SDK is half a megabyte, so it is fetched only when a live subscription is
+// requested rather than on every page load. It is same-origin:
 // `/ui/livekit-client.js` is a compile-time constant inside the server binary,
 // not a CDN, so this page still issues no external request.
 let sdkPromise = null;
@@ -38,7 +42,7 @@ function loadBrowserLiveKit() {
 // re-render on a five-second poll, which destroys the element the track was
 // attached to. Without the track in hand, a refresh would silently blank every
 // tile while the subscriptions stayed open.
-const live = { rooms: new Map() };
+const live = { rooms: new Map(), desired: new Set(), retries: new Map() };
 
 function liveNote(cameraId, html) {
   for (const node of document.querySelectorAll("[data-live-note]")) {
@@ -57,7 +61,13 @@ function liveVideos(cameraId) {
     .filter((node) => node.dataset.liveTile === cameraId);
 }
 
-async function stopLive(cameraId) {
+function cancelRetry(cameraId) {
+  const retry = live.retries.get(cameraId);
+  if (retry) clearRetryTimer(retry.timer);
+  live.retries.delete(cameraId);
+}
+
+async function teardownLive(cameraId) {
   const session = live.rooms.get(cameraId);
   live.rooms.delete(cameraId);
   if (session && session.track) {
@@ -73,15 +83,40 @@ async function stopLive(cameraId) {
   try { await session.room.disconnect(); } catch (error) { /* already gone */ }
 }
 
+async function stopLive(cameraId) {
+  live.desired.delete(cameraId);
+  cancelRetry(cameraId);
+  await teardownLive(cameraId);
+}
+
 async function stopAllLive() {
-  for (const cameraId of [...live.rooms.keys()]) await stopLive(cameraId);
+  const cameraIds = new Set([...live.desired, ...live.rooms.keys(), ...live.retries.keys()]);
+  for (const cameraId of cameraIds) await stopLive(cameraId);
+}
+
+function scheduleReconnect(cameraId, priorAttempt = 0) {
+  if (!live.desired.has(cameraId) || live.retries.has(cameraId)) return;
+  const attempt = priorAttempt + 1;
+  const delay = Math.min(30_000, 1_000 * (2 ** Math.min(attempt - 1, 5)));
+  const timer = setRetryTimer(async () => {
+    live.retries.delete(cameraId);
+    if (!live.desired.has(cameraId) || live.rooms.has(cameraId)) return;
+    const video = liveVideos(cameraId)[0];
+    if (!video) {
+      scheduleReconnect(cameraId);
+      return;
+    }
+    await startLive(cameraId, video, attempt);
+  }, delay);
+  live.retries.set(cameraId, { timer, attempt });
+  liveNote(cameraId, banner("warn", "Reconnecting to the live stream…",
+    `Retrying automatically in ${Math.ceil(delay / 1_000)} second(s). Recording is unaffected.`));
 }
 
 // The fleet screens re-render every five seconds, which replaces the elements
 // the tracks were attached to. The subscriptions are untouched by that — they
 // belong to the rooms, not to the DOM — so the video is put back rather than
-// re-negotiated. Nothing here joins a room; a session that does not already
-// exist is not created by a refresh.
+// re-negotiated. The live-screen reconciler separately starts missing sessions.
 function reattachLive() {
   for (const [cameraId, session] of live.rooms) {
     if (!session.track) continue;
@@ -96,8 +131,10 @@ function reattachLive() {
   }
 }
 
-async function startLive(cameraId, video) {
-  await stopLive(cameraId);
+async function startLive(cameraId, video, retryAttempt = 0) {
+  live.desired.add(cameraId);
+  cancelRetry(cameraId);
+  await teardownLive(cameraId);
 
   let sdk;
   try {
@@ -106,6 +143,7 @@ async function startLive(cameraId, video) {
     liveNote(cameraId, banner("bad", "The live player could not be loaded.",
       "This page serves the LiveKit browser SDK from the server binary itself. " +
       "That request failed, so no player exists to connect with."));
+    scheduleReconnect(cameraId, retryAttempt);
     return;
   }
 
@@ -114,11 +152,12 @@ async function startLive(cameraId, video) {
     access = await api(`/api/cameras/${encodeURIComponent(cameraId)}/viewer-token`, { method: "POST" });
   } catch (error) {
     liveNote(cameraId, errorBanner(error));
+    scheduleReconnect(cameraId, retryAttempt);
     return;
   }
 
   const room = new sdk.Room();
-  const session = { room, track: null };
+  const session = { room, track: null, retryAttempt };
   live.rooms.set(cameraId, session);
 
   // Attaching on subscribe rather than on connect: a room can be joined while
@@ -155,8 +194,7 @@ async function startLive(cameraId, video) {
     live.rooms.delete(cameraId);
     video.hidden = true;
     liveIdle(cameraId, true);
-    liveNote(cameraId, banner("warn", "Disconnected from the live stream.",
-      "Press watch to reconnect. Recording is unaffected."));
+    scheduleReconnect(cameraId, session.retryAttempt);
   });
 
   liveNote(cameraId, banner("info", "Connecting…",
@@ -165,10 +203,11 @@ async function startLive(cameraId, video) {
   try {
     await room.connect(access.endpoint, access.token);
   } catch (error) {
-    await stopLive(cameraId);
+    await teardownLive(cameraId);
     liveNote(cameraId, banner("bad", "Could not connect to the live server.",
       "The token was issued, but this browser could not reach the LiveKit " +
       "server at " + esc(access.endpoint) + ". Recording is unaffected."));
+    scheduleReconnect(cameraId, retryAttempt);
     return;
   }
   if (live.rooms.get(cameraId) !== session) return;  // superseded while connecting
@@ -181,5 +220,14 @@ async function startLive(cameraId, video) {
   }
 }
 
-  return { live, liveVideos, startLive, stopLive, stopAllLive, reattachLive };
+async function startVisibleLive() {
+  const videos = document.querySelectorAll("[data-live-tile][data-live-watchable]");
+  await Promise.all([...videos].map(async (video) => {
+    const cameraId = video.dataset.liveTile;
+    if (live.rooms.has(cameraId) || live.retries.has(cameraId)) return;
+    await startLive(cameraId, video);
+  }));
+}
+
+  return { live, liveVideos, startLive, startVisibleLive, stopLive, stopAllLive, reattachLive };
 }

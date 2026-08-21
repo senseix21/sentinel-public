@@ -4,16 +4,15 @@ export function createCameraTile({ cameraLabel, pipelinePill, recordingDot, live
 function cameraTile(camera, options) {
   const id = esc(camera.camera_id);
   const canWatch = camera.live_publication_enabled;
-  // The element carries no `src` and no `autoplay`: a track is attached to it
-  // by `startLive`, and only after a press. `hidden` keeps a black rectangle
-  // off the screen until there is something in it to see.
+  // The track is attached by the LiveKit owner. Muted autoplay is explicit so
+  // browsers can begin playback without an operator gesture.
   // `data-live-watchable` is what "Watch all" filters on. Without it that button
   // joins a room for a camera whose own tile offers no watch button, because
   // publication is disabled — the page would contradict itself in one press.
   const watchable = canWatch ? " data-live-watchable" : "";
   const element = options && options.primary
-    ? `<video id="live" data-live-tile="${id}"${watchable} muted playsinline hidden></video>`
-    : `<video data-live-tile="${id}"${watchable} muted playsinline hidden></video>`;
+    ? `<video id="live" data-live-tile="${id}"${watchable} muted autoplay playsinline hidden></video>`
+    : `<video data-live-tile="${id}"${watchable} muted autoplay playsinline hidden></video>`;
   return `<div class="tile">
       <div class="tile-head">
         <b>${cameraLabel(camera)}</b>
@@ -23,10 +22,7 @@ function cameraTile(camera, options) {
       <div class="stage">
         ${element}
         <div class="idle" data-live-idle="${id}" >
-          ${icon(canWatch ? "live" : "cam", "lg")}
-          <div>${canWatch
-            ? "Not subscribed. Press watch to join the room."
-            : "This camera does not publish to LiveKit."}</div>
+          ${canWatch ? "" : `${icon("cam", "lg")}<div>This camera does not publish to LiveKit.</div>`}
         </div>
       </div>
       <div class="tile-foot">

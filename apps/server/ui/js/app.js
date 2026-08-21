@@ -30,7 +30,7 @@ const metricSum = metrics.sum;
 const metricWhere = metrics.where;
 const theme = createThemeController();
 const liveKit = createLiveKitOwner({ ApiError, api, banner, errorBanner });
-const { live, liveVideos, startLive, stopLive, stopAllLive, reattachLive } = liveKit;
+const { live, liveVideos, startLive, startVisibleLive, stopLive, stopAllLive, reattachLive } = liveKit;
 const cameraTile = createCameraTile({ cameraLabel, pipelinePill, recordingDot, livekitChip });
 const screenEvents = createEventsScreen({ metric, metricSamples, metricSum, kpi, sparkline, trend });
 const liveScreen = createLiveScreen({ cameraTile, fleetCounts, fleetProblem, live });
@@ -343,7 +343,7 @@ async function render() {
     // and `reattachLive` will skip this node precisely because it is already
     // attached — so copying the fresh element's `hidden` would black out the
     // one tile that is genuinely playing. Same for the idle overlay, which the
-    // new markup renders in its "press watch" state.
+    // new markup initially renders visible.
     video.className = fresh.className;
     video.hidden = false;
     fresh.parentNode.replaceChild(video, fresh);
@@ -351,6 +351,7 @@ async function render() {
   }
   renderGauges();
   reattachLive();
+  if (currentScreen().id === "live") await startVisibleLive();
 }
 
 // ---------------------------------------------------------------- data loads
@@ -463,10 +464,7 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  // Live viewing has one entry point: a press. Rendering a screen must never
-  // join a room — that would issue a viewer token and subscribe a real consumer
-  // to the publisher on every navigation. "Watch all" is still one press, and
-  // it resolves to the same call.
+  // Manual controls share the same owner as automatic live-screen startup.
   if (act === "watch-live" || act === "watch-all") {
     const targets = act === "watch-all"
       ? [...document.querySelectorAll("[data-live-tile][data-live-watchable]")]
