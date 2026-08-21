@@ -13,6 +13,17 @@ function owner(overrides = {}) {
   });
 }
 
+function fakeDocument(videos = []) {
+  return {
+    querySelectorAll(selector) {
+      if (!selector.includes("data-live-tile")) return [];
+      return selector.includes("data-live-watchable")
+        ? videos.filter((video) => Object.hasOwn(video.dataset, "liveWatchable"))
+        : videos;
+    },
+  };
+}
+
 test("stopAllLive disconnects and forgets every owned room", async () => {
   const previousDocument = globalThis.document;
   globalThis.document = { querySelectorAll: () => [] };
@@ -46,6 +57,87 @@ test("stopLive detaches media before disconnecting its room", async () => {
 
     assert.deepEqual(calls, ["detach", "disconnect"]);
     assert.equal(sessions.live.rooms.has("north"), false);
+  } finally {
+    globalThis.document = previousDocument;
+  }
+});
+
+test("startVisibleLive automatically joins every visible watchable camera", async () => {
+  const previousDocument = globalThis.document;
+  const videos = [
+    { dataset: { liveTile: "north", liveWatchable: "" }, removeAttribute() {} },
+    { dataset: { liveTile: "south" }, removeAttribute() {} },
+  ];
+  globalThis.document = fakeDocument(videos);
+  const connected = [];
+  class Room {
+    on() {}
+    async connect(endpoint) { connected.push(endpoint); }
+    async disconnect() {}
+  }
+  try {
+    const sessions = owner({
+      sdkLoader: async () => ({ Room, RoomEvent: {}, Track: { Kind: { Video: "video" } } }),
+    });
+
+    await sessions.startVisibleLive();
+
+    assert.deepEqual(connected, ["wss://live.test"]);
+    assert.equal(sessions.live.rooms.has("north"), true);
+    assert.equal(sessions.live.rooms.has("south"), false);
+  } finally {
+    globalThis.document = previousDocument;
+  }
+});
+
+test("a disconnected desired session schedules and performs a reconnect", async () => {
+  const previousDocument = globalThis.document;
+  const video = { dataset: { liveTile: "north", liveWatchable: "" }, hidden: true, removeAttribute() {} };
+  globalThis.document = fakeDocument([video]);
+  const scheduled = [];
+  const rooms = [];
+  const RoomEvent = { Disconnected: "disconnected" };
+  class Room {
+    constructor() { this.handlers = new Map(); rooms.push(this); }
+    on(event, handler) { this.handlers.set(event, handler); }
+    async connect() {}
+    async disconnect() {}
+  }
+  try {
+    const sessions = owner({
+      sdkLoader: async () => ({ Room, RoomEvent, Track: { Kind: { Video: "video" } } }),
+      setRetryTimer: (callback, delay) => { scheduled.push({ callback, delay }); return scheduled.length; },
+      clearRetryTimer: () => {},
+    });
+    await sessions.startLive("north", video);
+
+    rooms[0].handlers.get("disconnected")();
+    assert.equal(scheduled.length, 1);
+    assert.equal(scheduled[0].delay, 1_000);
+
+    await scheduled[0].callback();
+    assert.equal(rooms.length, 2);
+    assert.equal(sessions.live.rooms.get("north").room, rooms[1]);
+  } finally {
+    globalThis.document = previousDocument;
+  }
+});
+
+test("stopLive cancels reconnect intent", async () => {
+  const previousDocument = globalThis.document;
+  const video = { dataset: { liveTile: "north", liveWatchable: "" }, hidden: true, removeAttribute() {} };
+  globalThis.document = fakeDocument([video]);
+  const cleared = [];
+  try {
+    const sessions = owner({ clearRetryTimer: (timer) => cleared.push(timer) });
+    sessions.live.desired.add("north");
+    sessions.live.retries.set("north", { timer: 42, attempt: 1 });
+
+    await sessions.stopLive("north");
+
+    assert.equal(sessions.live.desired.has("north"), false);
+    assert.equal(sessions.live.retries.has("north"), false);
+    assert.deepEqual(cleared, [42]);
   } finally {
     globalThis.document = previousDocument;
   }
