@@ -7,7 +7,7 @@ import { absent } from "./components/empty-state.js";
 import { ago, bytes, esc, fmtPct, icon, pct, utc } from "./formatting.js";
 import { createMetricsView, parseMetrics } from "./metrics.js";
 import { createLiveKitOwner } from "./livekit.js";
-import { contiguousRuns, coverageBuckets, createPlaybackState, playbackPath, recordingSearchPath, searchRange } from "./playback.js";
+import { contiguousRuns, coverageBuckets, createPlaybackState, playbackPath, recordingSearchPath, searchRange, startPlayback, stopPlayback, togglePlayback } from "./playback.js";
 import { SCREENS, parseRoute, screenFor } from "./router.js";
 import { createDashboardScreen } from "./screens/dashboard.js";
 import { createEventsScreen } from "./screens/events.js";
@@ -482,11 +482,17 @@ document.addEventListener("click", async (event) => {
     const video = document.getElementById("v");
     if (!video) return;
     const url = playbackPath(pb.camera, target.dataset.start, target.dataset.end);
-    // `setAttribute` rather than `.src`, so that the only assignment to a `src`
-    // property in this file remains the one that loads the vendored SDK from
-    // this server. That single site is what the no-external-request test pins.
-    video.setAttribute("src", url);
-    video.play().catch(() => { /* the element reports its own failure */ });
+    startPlayback(video, url).catch(() => { /* the element reports its own failure */ });
+    return;
+  }
+
+  if (act === "pb-toggle") {
+    await togglePlayback(document.getElementById("v")).catch(() => { /* the element reports its own failure */ });
+    return;
+  }
+
+  if (act === "pb-stop") {
+    stopPlayback(document.getElementById("v"));
     return;
   }
 

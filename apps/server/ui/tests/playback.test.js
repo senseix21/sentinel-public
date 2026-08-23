@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { contiguousRuns, coverageBuckets, playbackPath, recordingSearchPath, searchRange } from "../js/playback.js";
+import { contiguousRuns, coverageBuckets, playbackPath, recordingSearchPath, searchRange, startPlayback, stopPlayback, togglePlayback } from "../js/playback.js";
 
 test("search uses the server start/end names", () => {
   const range = searchRange({ date: "2026-08-18", from: "01:02:03", to: "04:05:06" });
@@ -28,4 +28,36 @@ test("coverage handles empty and zero-span input", () => {
   assert.equal(coverageBuckets([]), null);
   const coverage = coverageBuckets([{ started_at: "2026-08-18T00:00:00Z", ended_at: "2026-08-18T00:00:00Z" }], 4);
   assert.deepEqual(coverage.filled, [true, false, false, false]);
+});
+
+test("playback can pause, resume and stop without pretending to seek", async () => {
+  const calls = [];
+  const video = {
+    paused: false,
+    ended: false,
+    pause() { calls.push("pause"); this.paused = true; },
+    play() { calls.push("play"); this.paused = false; return Promise.resolve(); },
+    removeAttribute(name) { calls.push(`remove:${name}`); },
+    load() { calls.push("load"); },
+  };
+
+  await togglePlayback(video);
+  await togglePlayback(video);
+  stopPlayback(video);
+
+  assert.deepEqual(calls, ["pause", "play", "pause", "remove:src", "load"]);
+});
+
+test("the play action loads the selected run before starting it", async () => {
+  const calls = [];
+  const video = {
+    pause() { calls.push("pause"); },
+    setAttribute(name, value) { calls.push(`${name}:${value}`); },
+    load() { calls.push("load"); },
+    play() { calls.push("play"); return Promise.resolve(); },
+  };
+
+  await startPlayback(video, "/recordings/run-one");
+
+  assert.deepEqual(calls, ["pause", "src:/recordings/run-one", "load", "play"]);
 });
