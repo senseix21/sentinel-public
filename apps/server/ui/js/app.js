@@ -475,8 +475,20 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
-  if (act === "stop-live") { await stopLive(cameraId); return; }
-  if (act === "stop-all") { await stopAllLive(); return; }
+  if (act === "stop-live") {
+    const stopping = stopLive(cameraId);
+    // `stopLive` removes the local room before its first await. Paint that
+    // result now instead of making the operator wait for the peer disconnect.
+    await render();
+    await stopping;
+    return;
+  }
+  if (act === "stop-all") {
+    const stopping = stopAllLive();
+    await render();
+    await stopping;
+    return;
+  }
 
   if (act === "play") {
     const video = document.getElementById("v");
@@ -667,7 +679,9 @@ async function saveSettings() {
 // the peer connections and subscriptions survive the navigation and the server
 // keeps counting viewers who left.
 window.addEventListener("hashchange", async () => {
-  await stopAllLive();
+  // Navigation owns teardown but is not an operator request to keep cameras
+  // stopped when the live screen is opened again.
+  await stopAllLive(false);
   await render();
 });
 
