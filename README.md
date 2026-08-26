@@ -12,6 +12,16 @@ production identity infrastructure, packaging, and several product decisions
 remain open. See [Current capabilities](#current-capabilities) before treating a
 development result as a production claim.
 
+## Documentation
+
+- **[Complete HTTP API reference](docs/API.md)** — authentication, roles,
+  cameras, recording search and video retrieval, LiveKit viewer access,
+  settings, identities, errors, examples, and current limitations.
+- [Delivery roadmap](ROADMAP.md) — authoritative implementation status and open
+  qualification gates.
+- [Architecture decisions](docs/adr/) — accepted design choices and reversal
+  criteria.
+
 ## Quick start on macOS
 
 The fastest way to run the complete system uses the Mac webcam as an RTSP camera:
