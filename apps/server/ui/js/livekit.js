@@ -42,7 +42,10 @@ function loadBrowserLiveKit() {
 // re-render on a five-second poll, which destroys the element the track was
 // attached to. Without the track in hand, a refresh would silently blank every
 // tile while the subscriptions stayed open.
-const live = { rooms: new Map(), desired: new Set(), retries: new Map() };
+// `stopped` is operator intent, distinct from a disconnected room. Without it,
+// the live-screen reconciler sees the intentionally empty room map on its next
+// poll and immediately starts every stopped camera again.
+const live = { rooms: new Map(), desired: new Set(), retries: new Map(), stopped: new Set() };
 
 function liveNote(cameraId, html) {
   for (const node of document.querySelectorAll("[data-live-note]")) {
@@ -83,15 +86,24 @@ async function teardownLive(cameraId) {
   try { await session.room.disconnect(); } catch (error) { /* already gone */ }
 }
 
-async function stopLive(cameraId) {
+async function stopLive(cameraId, remember = true) {
+  if (remember) live.stopped.add(cameraId);
   live.desired.delete(cameraId);
   cancelRetry(cameraId);
   await teardownLive(cameraId);
 }
 
-async function stopAllLive() {
+async function stopAllLive(remember = true) {
   const cameraIds = new Set([...live.desired, ...live.rooms.keys(), ...live.retries.keys()]);
-  for (const cameraId of cameraIds) await stopLive(cameraId);
+  if (remember) {
+    for (const video of document.querySelectorAll("[data-live-tile][data-live-watchable]")) {
+      cameraIds.add(video.dataset.liveTile);
+    }
+  }
+  // Each stop removes its local room and media synchronously before awaiting
+  // the network disconnect. Start all teardowns together so one slow LiveKit
+  // peer cannot delay stopping the remaining tiles.
+  await Promise.all([...cameraIds].map((cameraId) => stopLive(cameraId, remember)));
 }
 
 function scheduleReconnect(cameraId, priorAttempt = 0) {
@@ -132,6 +144,7 @@ function reattachLive() {
 }
 
 async function startLive(cameraId, video, retryAttempt = 0) {
+  live.stopped.delete(cameraId);
   live.desired.add(cameraId);
   cancelRetry(cameraId);
   await teardownLive(cameraId);
@@ -224,7 +237,7 @@ async function startVisibleLive() {
   const videos = document.querySelectorAll("[data-live-tile][data-live-watchable]");
   await Promise.all([...videos].map(async (video) => {
     const cameraId = video.dataset.liveTile;
-    if (live.rooms.has(cameraId) || live.retries.has(cameraId)) return;
+    if (live.stopped.has(cameraId) || live.rooms.has(cameraId) || live.retries.has(cameraId)) return;
     await startLive(cameraId, video);
   }));
 }

@@ -19,6 +19,35 @@ export function playbackPath(cameraId, start, end) {
     + `?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`;
 }
 
+export function startPlayback(video, url) {
+  if (!video) return Promise.resolve();
+  video.pause();
+  video.setAttribute("src", url);
+  // Assigning `src` queues resource selection, but explicitly loading here
+  // makes the button deterministic when it replaces a stopped or failed
+  // stream whose element has already been reset with `load()`.
+  video.load();
+  return video.play();
+}
+
+// Pausing keeps the current media resource so playback can resume. Stopping is
+// intentionally stronger: clearing the resource closes the HTTP response and
+// lets the server cancel its bounded FFmpeg assembly instead of continuing to
+// produce footage nobody is watching.
+export function togglePlayback(video) {
+  if (!video) return Promise.resolve();
+  if (video.paused || video.ended) return video.play();
+  video.pause();
+  return Promise.resolve();
+}
+
+export function stopPlayback(video) {
+  if (!video) return;
+  video.pause();
+  video.removeAttribute("src");
+  video.load();
+}
+
 export function contiguousRuns(recordings) {
   const sorted = [...recordings].sort((a, b) => (a.started_at < b.started_at ? -1 : 1));
   const runs = [];

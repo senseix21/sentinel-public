@@ -59,8 +59,8 @@ export function createPlaybackScreen({ state, fleetCounts, fleetProblem, errorBa
         </div>
         ${capability ? `<div class="tiny muted mt" style="border-top:1px solid var(--line);padding-top:11px">
           Accuracy <b>${esc(capability.accuracy)}</b>${capability.seekable ? "" : ", not seekable"}. The server answers
-          <code>Accept-Ranges: none</code> and streams chunked, so there is no scrubber, no duration and no speed control here —
-          none of them could be honoured.
+          <code>Accept-Ranges: none</code> and streams chunked, so seeking, duration and speed control are unavailable.
+          Playback can still be paused, resumed or stopped.
         </div>` : ""}
       </div>`;
   }
@@ -87,7 +87,11 @@ export function createPlaybackScreen({ state, fleetCounts, fleetProblem, errorBa
             <td><button class="btn" data-act="play" data-start="${esc(run.started_at)}" data-end="${esc(run.ended_at)}">${icon("play")} Play</button></td>
           </tr>`).join("")}</tbody>
         </table></div>
-        <video id="v" preload="none" playsinline class="mt" style="width:100%;border-radius:8px;background:#05080d"></video>
+        <video id="v" preload="none" playsinline controls class="mt" style="width:100%;border-radius:8px;background:#05080d"></video>
+        <div class="row mt">
+          <button class="btn" data-act="pb-toggle">Pause / Resume</button>
+          <button class="btn" data-act="pb-stop">Stop</button>
+        </div>
       </div>`;
     }
     const run = runs[0];
@@ -96,9 +100,11 @@ export function createPlaybackScreen({ state, fleetCounts, fleetProblem, errorBa
         <span class="right"><span class="pill arch">ARCHIVE</span></span>
       </h3>
       <p class="note">${esc(run.count)} contiguous segment(s), ${esc(bytes(run.bytes))}, from a single stream at <code>${esc(url)}</code>.</p>
-      <video id="v" preload="none" playsinline style="width:100%;border-radius:8px;background:#05080d"></video>
+      <video id="v" preload="none" playsinline controls style="width:100%;border-radius:8px;background:#05080d"></video>
       <div class="row mt">
         <button class="btn primary" data-act="play" data-start="${esc(run.started_at)}" data-end="${esc(run.ended_at)}">${icon("play")} Play this run</button>
+        <button class="btn" data-act="pb-toggle">Pause / Resume</button>
+        <button class="btn" data-act="pb-stop">Stop</button>
         <span class="muted tiny">${esc(utc(Date.parse(run.started_at)))} &rarr; ${esc(utc(Date.parse(run.ended_at)))}</span>
       </div>
     </div>`;
@@ -110,7 +116,7 @@ export function createPlaybackScreen({ state, fleetCounts, fleetProblem, errorBa
         <h3>${icon("db")} Segments <span class="right">${recordings.length} matched</span></h3>
         ${coverage(recordings)}
         <div class="wrap mt"><table>
-          <thead><tr><th>Started</th><th>Ended</th><th>Codec</th><th>Resolution</th><th>Size</th><th>Status</th></tr></thead>
+          <thead><tr><th>Started</th><th>Ended</th><th>Codec</th><th>Resolution</th><th>Size</th><th>Status</th><th></th></tr></thead>
           <tbody>${recordings.map((recording) => `<tr>
             <td class="num">${esc(utc(Date.parse(recording.started_at)))}</td>
             <td class="num">${esc(utc(Date.parse(recording.ended_at)))}</td>
@@ -118,6 +124,7 @@ export function createPlaybackScreen({ state, fleetCounts, fleetProblem, errorBa
             <td class="num">${recording.width && recording.height ? `${esc(recording.width)}&times;${esc(recording.height)}` : "—"}</td>
             <td class="num">${esc(bytes(recording.size_bytes))}</td>
             <td>${esc(recording.status || "—")}</td>
+            <td><button class="btn" data-act="play" data-start="${esc(recording.started_at)}" data-end="${esc(recording.ended_at)}">${icon("play")} Play</button></td>
           </tr>`).join("")}</tbody>
         </table></div>
       </div>`;

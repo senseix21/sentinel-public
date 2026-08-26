@@ -42,6 +42,27 @@ test("stopAllLive disconnects and forgets every owned room", async () => {
   }
 });
 
+test("stopAllLive tears down every local room before slow peers disconnect", async () => {
+  const previousDocument = globalThis.document;
+  globalThis.document = { querySelectorAll: () => [] };
+  let release;
+  const blocked = new Promise((resolve) => { release = resolve; });
+  try {
+    const sessions = owner();
+    sessions.live.rooms.set("north", { room: { disconnect: () => blocked }, track: null });
+    sessions.live.rooms.set("south", { room: { disconnect: () => blocked }, track: null });
+
+    const stopping = sessions.stopAllLive();
+
+    assert.equal(sessions.live.rooms.size, 0);
+    assert.deepEqual([...sessions.live.stopped].sort(), ["north", "south"]);
+    release();
+    await stopping;
+  } finally {
+    globalThis.document = previousDocument;
+  }
+});
+
 test("stopLive detaches media before disconnecting its room", async () => {
   const previousDocument = globalThis.document;
   globalThis.document = { querySelectorAll: () => [] };
@@ -57,6 +78,49 @@ test("stopLive detaches media before disconnecting its room", async () => {
 
     assert.deepEqual(calls, ["detach", "disconnect"]);
     assert.equal(sessions.live.rooms.has("north"), false);
+    assert.equal(sessions.live.stopped.has("north"), true);
+  } finally {
+    globalThis.document = previousDocument;
+  }
+});
+
+test("automatic live reconciliation respects stop until an explicit watch", async () => {
+  const previousDocument = globalThis.document;
+  const video = { dataset: { liveTile: "north", liveWatchable: "" }, hidden: true, removeAttribute() {} };
+  globalThis.document = fakeDocument([video]);
+  const connected = [];
+  class Room {
+    on() {}
+    async connect() { connected.push("north"); }
+    async disconnect() {}
+  }
+  try {
+    const sessions = owner({
+      sdkLoader: async () => ({ Room, RoomEvent: {}, Track: { Kind: { Video: "video" } } }),
+    });
+
+    await sessions.stopLive("north");
+    await sessions.startVisibleLive();
+    assert.deepEqual(connected, []);
+
+    await sessions.startLive("north", video);
+    assert.deepEqual(connected, ["north"]);
+    assert.equal(sessions.live.stopped.has("north"), false);
+  } finally {
+    globalThis.document = previousDocument;
+  }
+});
+
+test("temporary navigation teardown does not suppress later automatic viewing", async () => {
+  const previousDocument = globalThis.document;
+  globalThis.document = fakeDocument([]);
+  try {
+    const sessions = owner();
+    sessions.live.desired.add("north");
+
+    await sessions.stopAllLive(false);
+
+    assert.equal(sessions.live.stopped.has("north"), false);
   } finally {
     globalThis.document = previousDocument;
   }
