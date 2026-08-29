@@ -27,7 +27,7 @@ pub struct ReconnectPolicy {
 
 impl ReconnectPolicy {
     /// Creates a reconnect policy. Jitter is symmetric and at most 100%.
-    ///
+    ///a
     /// # Errors
     ///
     /// Rejects zero durations, a maximum below the initial delay, or jitter

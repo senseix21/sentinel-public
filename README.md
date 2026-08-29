@@ -14,6 +14,9 @@ development result as a production claim.
 
 ## Documentation
 
+- **[Client system guide](docs/CLIENT_SYSTEM_GUIDE.md)** — plain-language
+  explanation of the product, end-to-end operation, components, delivered
+  capabilities, limitations, client decisions, and path to production.
 - **[Complete HTTP API reference](docs/API.md)** — authentication, roles,
   cameras, recording search and video retrieval, LiveKit viewer access,
   settings, identities, errors, examples, and current limitations.
