@@ -562,6 +562,19 @@ Measure CPU, GPU, RAM, allocations where relevant, disk MB/s/latency/capacity, n
 ### Instructions
 
 - [ ] Establish an unoptimized one-camera baseline.
+- [~] Qualify the direct physical-camera RTSP topology through
+  `docs/direct-camera-rtsp/SPEC.md` and its executable `PLAN.md`. The owned
+  direct-RTSP harness, resource/metric capture, recording verification, evidence
+  template, and camera-scoped metric gate are implemented. Execution remains
+  blocked on representative cameras, disruption authority, target hardware, and
+  approved objectives. MediaMTX retirement and the replacement FFmpeg webcam
+  source are specified in `docs/ffmpeg-webcam-source/`; proxy-backed fixtures
+  remain transitional until their individual behaviors have executable
+  replacements.
+  On 2026-09-01, `make check`, the
+  authenticated Retina fixture, the synthetic 10-camera/two-camera isolation
+  fixture, and the direct-report regression suite passed; these results validate
+  the tooling baseline, not representative-camera interoperability or capacity.
 - [ ] Qualify 10 realistic cameras through a sustained soak with recording, live viewing, and detection enabled.
 - [ ] Profile the limiting workload; fix correctness and topology problems before micro-optimizing.
 - [ ] Change one variable at a time and retain optimizations only with reproducible improvement.

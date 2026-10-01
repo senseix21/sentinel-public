@@ -2,7 +2,7 @@
 
 Status: Phase 0 draft with accepted 2026 MVP qualification baseline
 
-Last updated: 2026-08-10
+Last updated: 2026-09-01
 
 This document separates confirmed direction from reversible defaults and unanswered product decisions. A working assumption is not an accepted requirement and must not be used to claim capacity or production readiness.
 
@@ -20,7 +20,9 @@ The system provides reliable real-time and historical visibility into homes and 
 - Initial target: 10 cameras on one server.
 - Target deployment: approximately 20 cameras.
 - Future direction: 100–200+ cameras without constraining later workload extraction.
-- Input protocol: authenticated IP cameras over RTSP; ONVIF remains optional/unconfirmed.
+- Input protocol: authenticated IP cameras connect directly to the server over
+  RTSP/TCP. No RTSP proxy is part of the current codebase or production
+  topology. ONVIF remains optional/unconfirmed.
 - Recording: continuous, segmented, local, camera/time indexed, with configurable retention defaulting provisionally to 30 days.
 - Live view: publish through LiveKit/WebRTC independently of recording.
 - Detection: detect people from sampled decoded frames independently of recording.
@@ -46,6 +48,12 @@ Erik accepted the initial profile in `docs/phase-0/2026-mvp-baseline.md` on 2026
 - H.264 LiveKit publication for browser compatibility.
 
 These values define the first qualification workload. They do not prove capacity and may be revised through evidence with a recorded decision.
+
+Direct-camera qualification tooling is implemented under
+`docs/direct-camera-rtsp/`, but no representative physical-camera evidence has
+yet been collected. Camera-model interoperability, recovery under authorized
+network/camera disruption, sustained soak, and 10/20-camera target-hardware
+capacity remain open acceptance gates.
 
 ## Reliability requirements
 
