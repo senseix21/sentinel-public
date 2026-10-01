@@ -21,7 +21,7 @@ RTSP_URL ?= $(SURVEILLANCE_RTSP_URL)
 RECORDING_ROOT ?= ./recordings
 HEALTH_BIND ?= 127.0.0.1:3000
 
-.PHONY: help prerequisites webcam-devices run run-release server direct-camera-qualification health live ready metrics recordings play verify-recordings check
+.PHONY: help prerequisites webcam-devices run run-release server direct-camera-qualification health live ready metrics recordings play verify-recordings check verify
 
 help: ## Show manual development commands and configurable values.
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-20s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -86,6 +86,10 @@ verify-recordings: ## Fully decode every durable recording for the selected came
 	if [[ $$found -eq 0 ]]; then echo "no durable recordings found" >&2; exit 1; fi
 
 check: ## Run the complete Rust workspace quality gate.
+	$(MAKE) verify
+	$(MAKE) audit
+
+verify: ## Run the gate without the live advisory database (used by pull-request CI).
 	bash -n scripts/dev/local-webcam-stack.sh scripts/phase9/direct-camera-qualification.sh
 	python3 -m unittest scripts/dev/test_trust_boundary_proxy.py scripts/phase9/test_direct_camera_report.py
 	"$(NODE)" --test apps/server/ui/tests/*.test.js
@@ -93,7 +97,6 @@ check: ## Run the complete Rust workspace quality gate.
 	"$(CARGO)" clippy --workspace --all-targets --all-features -- -D warnings
 	"$(CARGO)" test --workspace --all-features
 	"$(CARGO)" build --workspace --release
-	$(MAKE) audit
 
 .PHONY: audit
 audit: ## Phase 8 (P8.10) dependency policy: advisories, licences, sources.
