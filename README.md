@@ -25,26 +25,29 @@ development result as a production claim.
 - [Architecture decisions](docs/adr/) — accepted design choices and reversal
   criteria.
 
-## Quick start on macOS
+## Local webcam quick start
 
-The fastest way to run the complete system uses the Mac webcam as an RTSP camera:
+`make run` uses the webcam without an RTSP proxy:
 
 ```text
-AVFoundation webcam -> FFmpeg -> MediaMTX -> RTSP ingest
-                                              |-> local MP4 recording
-                                              `-> LiveKit -> browser WebRTC
+webcam -> server-owned FFmpeg -> bounded H.264 distributor
+                                      |-> local MP4 recording
+                                      |-> detection
+                                      `-> LiveKit -> browser WebRTC
 ```
+
+FFmpeg handles operating-system capture and H.264 encoding. The Rust camera
+pipeline owns the child process, parsing, lifecycle, reconnect epochs, queues,
+recording, and downstream consumers.
 
 ### 1. Install prerequisites
 
 Required commands:
 
 - Rust 1.88 or newer (`cargo` and `rustc`)
-- PostgreSQL (`initdb`, `pg_ctl`, and `psql`)
 - FFmpeg (`ffmpeg`, `ffprobe`, and optionally `ffplay`)
-- MediaMTX (`mediamtx`)
 - LiveKit Server (`livekit-server`)
-- Python 3, `curl`, and `lsof`
+- `curl` and `lsof`
 
 On macOS, install the third-party services with your preferred package manager,
 then verify the basic media tools:
@@ -53,8 +56,8 @@ then verify the basic media tools:
 make prerequisites
 ```
 
-The full-stack launcher checks its additional PostgreSQL, LiveKit, Python, and
-port-inspection dependencies before changing runtime state.
+The launcher checks FFmpeg, LiveKit, and port-inspection dependencies before
+changing runtime state.
 
 ### 2. Select the webcam
 
@@ -64,16 +67,17 @@ List AVFoundation devices:
 make webcam-devices
 ```
 
-The default video device is `0`. On first use, macOS may ask for camera access.
+The launcher defaults to video device `0` only for local development. On first
+use, macOS may ask for camera access.
 Grant the terminal application access under **System Settings -> Privacy &
 Security -> Camera**.
 
 ### 3. Start SENTINEL
 
-Use an explicit local-only password when you want a predictable login:
+Start the stack:
 
 ```bash
-SENTINEL_DEV_PASSWORD=sentinel-local make run
+make run
 ```
 
 Then open:
@@ -82,32 +86,22 @@ Then open:
 http://127.0.0.1:3001/
 ```
 
-Sign in with:
+The stack starts PostgreSQL and a loopback development login proxy so recording
+search, playback, settings, and authenticated dashboard requests work locally.
 
-```text
-Username: operator
-Password: sentinel-local
-```
-
-If `SENTINEL_DEV_PASSWORD` is omitted, the launcher generates a new password and
-prints it in the `AUTH` startup lines. It is neither persisted nor written to a
-log file.
-
-Keep the terminal running. Press Ctrl-C once to stop the owned processes. The
-database, recordings, settings, and recording index are preserved for the next
-run.
+Keep the terminal running. Press Ctrl-C once to stop the server-owned webcam
+process and the launcher-owned LiveKit process. Recordings are preserved.
 
 ### 4. Override local fixture values
 
 All values are optional:
 
 ```bash
-SENTINEL_DEV_PASSWORD=sentinel-local \
 WEBCAM_DEVICE=1 \
 VIDEO_WIDTH=1920 \
 VIDEO_HEIGHT=1080 \
 VIDEO_FPS=15 \
-VIDEO_BITRATE=2500k \
+VIDEO_BITRATE_KBPS=2500 \
 CAMERA_ID=office-webcam \
 make run
 ```
@@ -133,42 +127,32 @@ The launcher owns and supervises this local stack:
 
 | Component | Default endpoint or path | Responsibility |
 |---|---|---|
-| PostgreSQL | `127.0.0.1:55432` | Cameras, identities, settings, audit, and recording index |
+| PostgreSQL | `127.0.0.1:55432` | Recording index, settings, identities, and audit |
 | LiveKit | `ws://127.0.0.1:7880` | WebRTC distribution to browser viewers |
-| MediaMTX | `rtsp://127.0.0.1:8554/webcam` | Local RTSP bridge |
-| FFmpeg | webcam device `0` | Publishes H.264 from AVFoundation to MediaMTX |
+| FFmpeg child | selected webcam | Captures and encodes H.264 into the Rust source owner |
 | SENTINEL server | `http://127.0.0.1:3000` | API, dashboard assets, ingest, recording, and publication |
-| Development login proxy | `http://127.0.0.1:3001` | Local login, session, and trusted principal assertion |
+| Development proxy | `http://127.0.0.1:3001` | Loopback login and trusted identity assertion |
 
 Persistent local state defaults to:
 
 ```text
-.local/run/pgdata    PostgreSQL data
-.local/run/logs      service logs
+.local/webcam-run/logs service logs
+.local/webcam-run/pgdata persistent PostgreSQL data
 recordings/          finalized and partial recording segments
 ```
-
-Generated LiveKit and trust-boundary secrets are per-run development values.
-They are not deployment credentials.
 
 ## Security model
 
 ### Local development
 
-Always browse through `http://127.0.0.1:3001`. The development proxy establishes
-an in-memory, expiring session after the login form succeeds. It then proves its
-origin to the Rust server and asserts the configured principal. The Rust server,
-not the proxy, loads that principal's role and camera scope and makes the final
-authorization decision.
+`make run` binds every component to loopback and serves the development login at
+`http://127.0.0.1:3001/`. The launcher prints its local credentials; override
+them with `SENTINEL_DEV_USERNAME` and `SENTINEL_DEV_PASSWORD`. This is not a
+deployable authentication design.
 
-Port `3000` is the server itself. A direct request to a protected `/api` route
-normally returns `401 Unauthorized`; that is intentional. The public liveness,
-readiness, metrics, and UI asset routes remain available without an API identity.
-
-The local login is a development fixture. It has no TLS, MFA, account recovery,
-durable session store, or production rate-limit infrastructure. It binds only to
-loopback and must not be exposed to a network or deployed as the identity
-provider.
+The Phase 8 security fixtures separately exercise bearer authentication and the
+identity-aware reverse-proxy boundary with PostgreSQL-backed principals. Those
+fixtures remain the evidence for the production authorization contract.
 
 ### Production boundary
 
@@ -186,10 +170,9 @@ principal make that exposure explicit.
 ## System architecture
 
 ```text
-RTSP camera
-    |
-    v
-Camera ingestion owner  (one authenticated upstream connection per camera)
+RTSP camera ----------------------.
+                                    v
+Local webcam -> owned FFmpeg -> Camera ingestion owner (one source per camera)
     |
     v
 Bounded media distributor
@@ -215,7 +198,7 @@ show that a process boundary is necessary; it is not part of the current system.
 
 | Capability | Current state | Important limits |
 |---|---|---|
-| RTSP camera ingest | Implemented for the qualified H.264/TCP path | Representative cameras, H.265, High Profile/multi-slice, and 10/20-camera qualification remain |
+| H.264 camera ingest | RTSP/TCP and server-owned FFmpeg webcam sources implemented | Representative cameras, non-H.264 codecs, and 10/20-camera qualification remain |
 | Local recording | H.264 MVP implemented | Deployment filesystem and genuine disk-full behavior remain unqualified |
 | Recording index and retention | Implemented with PostgreSQL reconciliation and watermarks | Backup/restore and target storage sizing remain open |
 | Live browser video | Implemented through viewer-gated transcoding and LiveKit | First-picture time, viewer-visible reconnect, latency, representative cameras, and production concurrency remain open |
@@ -232,7 +215,7 @@ or product-decision gates.
 
 ## Using the dashboard
 
-After login, the dashboard provides the implemented operator views for live
+The dashboard provides the implemented operator views for live
 cameras, camera state, playback search, settings, system state, and identity
 administration. Availability of actions depends on the authenticated role,
 camera scope, enabled server surfaces, and configured dependencies.
@@ -241,11 +224,9 @@ For the local stack:
 
 - **Live view** requests a short-lived viewer token and subscribes through
   LiveKit. Transcoding runs only while a remote participant is present.
-- **Playback** searches PostgreSQL for all segments overlapping the requested
-  camera and time range, then streams assembled MP4 content.
-- **Settings** reads resolved values and their origins. The local launcher opts
-  into the normally disabled mutating surface so the development screen can save
-  operational settings.
+- **Playback** searches the PostgreSQL recording index started by `make run`.
+- **Settings** uses the persistent settings store and the launcher's explicit
+  development-only mutating-surface opt-in.
 - **System** reports server capabilities and dependency state.
 - **Logout** revokes the in-memory development session.
 
@@ -255,10 +236,10 @@ synthetic facts as if they represented a real detector.
 
 ## HTTP API
 
-Use the dashboard through port `3001` for interactive development. For scripted
-API work, authenticate through the configured proxy session or use an authorized
-bearer token. The examples below show route shapes, not a production credential
-workflow.
+Use port `3001` for the loopback-only `make run` dashboard. In a configured
+deployment, scripted API work must authenticate through the trusted proxy or an
+authorized bearer token. The examples below show route shapes, not a production
+credential workflow.
 
 ### Public routes
 
@@ -285,6 +266,7 @@ workflow.
 | `GET` | `/api/cameras/{camera_id}/recordings?start={RFC3339}&end={RFC3339}&cursor={opaque}` | Search overlapping segments |
 | `GET` | `/api/cameras/{camera_id}/recordings/{recording_id}` | Recording metadata |
 | `GET` | `/api/cameras/{camera_id}/recordings/playback?start={RFC3339}&end={RFC3339}` | Stream the selected recorded range |
+| `GET` | `/api/cameras/{camera_id}/recordings/{recording_id}/video[?duration_seconds=N]` | Stream a full recording or its first 1–60 seconds |
 
 ### Protected operations routes
 
@@ -336,14 +318,15 @@ range and streams assembled MP4 bytes. The current policy is segment-aligned and
 stream-copy oriented. It does not promise arbitrary-frame accuracy or a fully
 seekable synthesized file.
 
-## Running components manually
+## Running the server manually
 
-The convenience components remain available as separate long-running targets
-for focused debugging. Run each long-lived target in its own terminal:
+Supply a direct camera endpoint and run the server:
 
 ```bash
-make mediamtx
-make webcam WEBCAM_DEVICE=0
+RTSP_URL=rtsp://camera-host:554/stream \
+CAMERA_ID=camera-01 \
+VIDEO_WIDTH=1920 \
+VIDEO_HEIGHT=1080 \
 make server
 ```
 
@@ -432,13 +415,11 @@ file-layer behavior:
 For `make run`, inspect:
 
 ```text
-.local/run/logs/build.log
-.local/run/logs/server.log
-.local/run/logs/proxy.log
-.local/run/logs/postgres.log
-.local/run/logs/livekit.log
-.local/run/logs/mediamtx.log
-.local/run/logs/webcam.log
+.local/webcam-run/logs/build.log
+.local/webcam-run/logs/server.log
+.local/webcam-run/logs/livekit.log
+.local/webcam-run/logs/postgres.log
+.local/webcam-run/logs/proxy.log
 ```
 
 `/live` answers whether the process can serve requests. `/ready` reports whether
@@ -454,37 +435,25 @@ import. Readiness and reconciliation metrics expose degraded repair state.
 
 ## Troubleshooting
 
-### Login says `Forbidden`
-
-- Use exactly `http://127.0.0.1:3001/` or `http://localhost:3001/`.
-- Restart `make run` after changing proxy code; the running Python process does
-  not reload itself.
-- Use the username printed in the `AUTH` line. It defaults to `operator`.
-- Use the supplied `SENTINEL_DEV_PASSWORD`, or the generated password printed by
-  that specific run.
-- Do not browse through `0.0.0.0`, another hostname, or port `3000`.
-- Inspect `.local/run/logs/proxy.log` without copying session cookies or secrets
-  into an issue.
-
 ### Direct API says `401 Unauthorized`
 
-This is expected on port `3000`. Protected routes require either a valid bearer
-token or a trusted assertion from the configured proxy. Use port `3001` for the
-local browser session.
+With PostgreSQL or a non-loopback deployment boundary configured, this is
+expected: protected routes require a valid bearer token or a trusted proxy
+assertion. The no-database `make run` fixture is the only administrator fallback.
 
 ### Startup stops at the webcam
 
 - Grant the terminal camera permission in macOS settings.
 - Run `make webcam-devices` and select the correct `WEBCAM_DEVICE`.
-- Inspect `.local/run/logs/webcam.log` and `.local/run/logs/mediamtx.log`.
+- Inspect `.local/webcam-run/logs/server.log`; owned FFmpeg failures are reported
+  through the camera lifecycle.
 - Close software that holds exclusive access to the camera.
 
 ### A port is already in use
 
-The launcher refuses to attach to an old server, proxy, LiveKit, or MediaMTX
-process because stale processes can carry stale secrets. It prints the owning
-PID. Confirm that it belongs to the previous development run, then stop that
-specific process and restart SENTINEL.
+The launcher refuses to attach to an old server or LiveKit process. It prints
+the owning PID. Confirm that it belongs to the previous development run, then
+stop that specific process and restart SENTINEL.
 
 ### The first build is slow
 
@@ -524,13 +493,12 @@ cargo build --workspace --release
 ```
 
 Ignored tests require external programs or services such as FFmpeg/libx264,
-MediaMTX, PostgreSQL, or LiveKit. `cargo test` reports them but does not execute
+PostgreSQL, or LiveKit. `cargo test` reports them but does not execute
 them. Run the corresponding fixture when changing that integration:
 
 | Area | Fixture |
 |---|---|
-| RTSP ingest, recording, and reconnect | `scripts/phase0/` |
-| Multi-camera isolation | `scripts/phase3/multi-camera-fixture.sh` |
+| FFmpeg source and RTSP ingest/reconnect | camera tests plus `scripts/phase0/` |
 | PostgreSQL, playback, reconciliation, and retention | `scripts/phase4/postgres-fixture.sh` |
 | LiveKit publication and outage isolation | `scripts/phase5/` |
 | Persistent configuration | `scripts/phase7/config-fixture.sh` |

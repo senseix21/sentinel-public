@@ -13,6 +13,17 @@ Camera -> Ingestion -> Bounded Media Distribution
 
 Media packets and frames never travel over the domain event bus.
 
+The camera owner accepts an exhaustive H.264 source configuration. Physical IP
+cameras connect directly through Retina RTSP/TCP. Local webcams are captured by
+a server-owned FFmpeg child that emits bounded Annex-B H.264 into the same
+source lifecycle; there is no local RTSP proxy in that path. The distributor,
+recorder, detector, and LiveKit boundaries are identical for both source kinds.
+
+MediaMTX retirement and fixture replacement are governed by
+`docs/ffmpeg-webcam-source/SPEC.md` and `PLAN.md`. External RTSP protocol,
+authentication, and reconnect qualification still requires an owned RTSP peer;
+the FFmpeg webcam source does not prove those transport behaviors.
+
 The Phase 3 process ownership boundary is:
 
 ```text

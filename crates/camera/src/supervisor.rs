@@ -12,7 +12,7 @@ use tokio::sync::watch;
 use crate::health::{camera_health_channel, CameraHealthPublisher};
 use crate::{
     connection::{ConnectionSnapshot, DisconnectedCamera, ReconnectDelay, RetryableCameraFailure},
-    rtsp::{connect_h264, RtspConnectError, RtspReadOutcome, RtspSourceConfig},
+    source::{connect_h264, H264SourceConfig, H264SourceConnectError, H264SourceReadOutcome},
 };
 
 /// Validated bounded exponential-backoff parameters.
@@ -154,7 +154,7 @@ pub struct SupervisorExit {
 )]
 pub async fn run_h264_camera<J: JitterSource>(
     camera_id: CameraId,
-    source: &RtspSourceConfig,
+    source: &H264SourceConfig,
     distributor: MediaDistributor<H264AccessUnit>,
     policy: ReconnectPolicy,
     jitter: &mut J,
@@ -181,7 +181,7 @@ pub async fn run_h264_camera<J: JitterSource>(
 )]
 pub async fn run_h264_camera_observed<J: JitterSource>(
     camera_id: CameraId,
-    source: &RtspSourceConfig,
+    source: &H264SourceConfig,
     distributor: MediaDistributor<H264AccessUnit>,
     policy: ReconnectPolicy,
     jitter: &mut J,
@@ -228,18 +228,18 @@ pub async fn run_h264_camera_observed<J: JitterSource>(
 
         let session = match connection {
             Ok(session) => session,
-            Err(RtspConnectError::Terminal { failure, .. }) => {
-                tracing::error!(camera_id = %log_camera_id, ?failure, state = "terminal", "camera connection rejected");
-                let stopped = connecting.fail(failure);
-                return observed_exit(
-                    SupervisorStopReason::TerminalConnection,
-                    stopped.snapshot(),
-                    counters,
-                    distributor,
-                    &health,
-                );
-            }
             Err(error) => {
+                if let Some(failure) = error.terminal_failure() {
+                    tracing::error!(camera_id = %log_camera_id, ?failure, state = "terminal", "camera connection rejected");
+                    let stopped = connecting.fail(failure);
+                    return observed_exit(
+                        SupervisorStopReason::TerminalConnection,
+                        stopped.snapshot(),
+                        counters,
+                        distributor,
+                        &health,
+                    );
+                }
                 let failure = retryable_connect_failure(&error);
                 consecutive_failures = consecutive_failures.saturating_add(1);
                 let Some(failure_count) = NonZeroU32::new(consecutive_failures) else {
@@ -313,7 +313,7 @@ pub async fn run_h264_camera_observed<J: JitterSource>(
             };
 
             let retry_failure = match outcome {
-                Ok(RtspReadOutcome::AccessUnit(received)) => {
+                Ok(H264SourceReadOutcome::AccessUnit(received)) => {
                     let access_unit = match Arc::try_unwrap(received.access_unit) {
                         Ok(unit) => unit,
                         Err(unit) => (*unit).clone(),
@@ -356,7 +356,7 @@ pub async fn run_h264_camera_observed<J: JitterSource>(
                     }
                     continue;
                 }
-                Ok(RtspReadOutcome::PacketLoss { lost_packets }) => {
+                Ok(H264SourceReadOutcome::PacketLoss { lost_packets }) => {
                     counters.packet_loss_events = counters.packet_loss_events.saturating_add(1);
                     counters.lost_packets = counters
                         .lost_packets
@@ -364,7 +364,7 @@ pub async fn run_h264_camera_observed<J: JitterSource>(
                     health.packet_loss(lost_packets);
                     continue;
                 }
-                Ok(RtspReadOutcome::EndOfStream) => RetryableCameraFailure::EndOfStream,
+                Ok(H264SourceReadOutcome::EndOfStream) => RetryableCameraFailure::EndOfStream,
                 Err(_) => RetryableCameraFailure::TransportProtocol,
             };
 
@@ -459,12 +459,8 @@ fn observed_exit(
     }
 }
 
-fn retryable_connect_failure(error: &RtspConnectError) -> RetryableCameraFailure {
-    match error {
-        RtspConnectError::Timeout => RetryableCameraFailure::Timeout,
-        RtspConnectError::Retryable { failure, .. } => *failure,
-        RtspConnectError::Terminal { .. } => RetryableCameraFailure::TransportProtocol,
-    }
+fn retryable_connect_failure(error: &H264SourceConnectError) -> RetryableCameraFailure {
+    error.retryable_failure()
 }
 
 fn shutdown_requested(shutdown: &watch::Receiver<bool>) -> bool {

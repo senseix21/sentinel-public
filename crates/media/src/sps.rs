@@ -415,7 +415,7 @@ mod tests {
     // would prove nothing about real media.
 
     /// From `recordings/mac-webcam/2026/08/16/05-21-44--r-6a8148e8-a9a1907-2.mp4`,
-    /// the Mac webcam through the local `MediaMTX` bridge. Constrained Baseline.
+    /// a previously qualified Mac webcam RTSP bridge. Constrained Baseline.
     const REAL_WEBCAM_1280X720: &[u8] = &[
         0x67, 0x42, 0xc0, 0x1f, 0xda, 0x01, 0x40, 0x16, 0xe8, 0x40, 0x00, 0x00, 0x03, 0x03, 0x00,
         0x00, 0x03, 0x00, 0x5a, 0xa3, 0xc6, 0x0c, 0xa8,

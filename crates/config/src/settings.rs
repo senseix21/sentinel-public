@@ -7,6 +7,7 @@ use surveillance_camera::{
         RtspCredentials, RtspCredentialsError, RtspEndpoint, RtspEndpointError, RtspFrameLimits,
         RtspFrameLimitsError, RtspSourceConfig, RtspSourceConfigError,
     },
+    source::H264SourceConfig,
     supervisor::{ReconnectPolicy, ReconnectPolicyError},
 };
 use surveillance_common::types::{CameraId, IdentifierError};
@@ -119,7 +120,7 @@ impl OneCameraSettings {
 /// All validated domain configurations needed to construct one pipeline.
 pub struct OneCameraConfig {
     pub camera_id: CameraId,
-    pub source: RtspSourceConfig,
+    pub source: H264SourceConfig,
     pub reconnect: ReconnectPolicy,
     pub recorder_queue: QueueCapacity,
     pub live_queue: QueueCapacity,
@@ -131,6 +132,7 @@ pub struct OneCameraConfig {
     pub detection_decoder: PathBuf,
     pub detection_decode_timeout: Duration,
     pub max_access_unit_bytes: usize,
+    pub max_nals_per_access_unit: usize,
     pub recorder: Fmp4SinkConfig,
     pub layout: RecordingLayout,
     pub ffprobe: PathBuf,
@@ -138,10 +140,38 @@ pub struct OneCameraConfig {
     pub lifecycle_event_items: NonZeroUsize,
     pub reconciliation_limit: ReconciliationLimit,
     pub bounded_memory_bytes: usize,
+    max_pipeline_memory_bytes: usize,
+    non_source_bounded_memory_bytes: usize,
     pub livekit: Option<LiveKitConfig>,
 }
 
 impl OneCameraConfig {
+    /// Replaces only the validated source while preserving every downstream
+    /// pipeline contract and rechecking the complete memory budget.
+    ///
+    /// # Errors
+    /// Returns a memory error when source parser storage exceeds the configured
+    /// per-camera bound.
+    pub fn with_source(mut self, source: H264SourceConfig) -> Result<Self, OneCameraConfigError> {
+        let source_bytes = match &source {
+            H264SourceConfig::Rtsp(_) => 0,
+            H264SourceConfig::Ffmpeg(config) => config.bounded_memory_bytes(),
+        };
+        let bounded_memory_bytes = self
+            .non_source_bounded_memory_bytes
+            .checked_add(source_bytes)
+            .ok_or(OneCameraConfigError::MemoryBoundOverflow)?;
+        if bounded_memory_bytes > self.max_pipeline_memory_bytes {
+            return Err(OneCameraConfigError::MemoryBudgetExceeded {
+                required: bounded_memory_bytes,
+                configured: self.max_pipeline_memory_bytes,
+            });
+        }
+        self.source = source;
+        self.bounded_memory_bytes = bounded_memory_bytes;
+        Ok(self)
+    }
+
     /// Validates every field before exposing any runnable configuration.
     ///
     /// # Errors
@@ -169,7 +199,8 @@ impl OneCameraConfig {
         .map_err(OneCameraConfigError::FrameLimits)?;
         let source = RtspSourceConfig::new(endpoint, credentials, settings.connect_timeout, limits)
             .and_then(|source| source.require_dimensions(settings.width, settings.height))
-            .map_err(OneCameraConfigError::Source)?;
+            .map_err(OneCameraConfigError::Source)?
+            .into();
         let reconnect = ReconnectPolicy::new(
             settings.reconnect_initial,
             settings.reconnect_maximum,
@@ -279,6 +310,7 @@ impl OneCameraConfig {
             detection_decoder: settings.detection_decoder,
             detection_decode_timeout: settings.detection_decode_timeout,
             max_access_unit_bytes: settings.max_access_unit_bytes,
+            max_nals_per_access_unit: settings.max_nals_per_access_unit,
             recorder,
             layout,
             ffprobe: settings.ffprobe,
@@ -286,6 +318,8 @@ impl OneCameraConfig {
             lifecycle_event_items,
             reconciliation_limit,
             bounded_memory_bytes,
+            max_pipeline_memory_bytes: settings.max_pipeline_memory_bytes,
+            non_source_bounded_memory_bytes: bounded_memory_bytes,
             livekit,
         })
     }

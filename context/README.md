@@ -4,14 +4,14 @@ This directory contains compact, dated handoff snapshots. Its purpose is to let 
 
 ## Latest snapshot
 
-**2026-08-18 18:45 +06:** [`context/2026-08-18-1845/`](2026-08-18-1845/) — `make run` now has an explicit bounded loopback development login, session expiry/logout behavior, and a fast development build. Reconciliation is background repair rather than an HTTP availability prerequisite: the real persistent archive reached `/live` in 9 seconds instead of 183, and its 419-candidate pass completed in about 1.25 seconds by skipping 404 already-indexed immutable files. The real PostgreSQL/FFmpeg fixture and complete gate pass. Previous snapshot, **2026-08-18 17:17 +06:** [`context/2026-08-18-1717/`](2026-08-18-1717/) — current LiveKit frame/reconnect and fan-out qualification evidence.
+**2026-09-05 11:16 +06:** [`context/2026-09-05-1116/`](2026-09-05-1116/) — the source-neutral H.264 boundary and owned FFmpeg webcam source are implemented; real `make run` capture, recording, graceful finalization, and the complete local quality gate passed without MediaMTX. Linux/Windows, replacement RTSP fixtures, and scale remain open. Previous snapshot, **2026-09-01 10:49 +06:** [`context/2026-09-01-1049/`](2026-09-01-1049/) — direct physical-camera topology and qualification harness.
 
 Read in this order:
 
-1. [`next-actions.md`](2026-08-18-1845/next-actions.md) — current position and immediate work.
-2. [`repository-status.md`](2026-08-18-1845/repository-status.md) — verified repository facts and test results.
-3. [`architecture.md`](2026-08-15-1200/architecture.md) — current owned runtime boundary.
-4. [`decisions-and-open-questions.md`](2026-08-15-1200/decisions-and-open-questions.md) — decisions, evidence, and blockers.
+1. [`next-actions.md`](2026-09-05-1116/next-actions.md) — current position and immediate work.
+2. [`repository-status.md`](2026-09-05-1116/repository-status.md) — verified repository facts and test results.
+3. [`architecture.md`](2026-09-05-1116/architecture.md) — current source-neutral ownership boundary.
+4. [`decisions-and-open-questions.md`](2026-09-05-1116/decisions-and-open-questions.md) — decisions, evidence, and blockers.
 
 The paused detection model/runtime design remains in the previous snapshot:
 [`detection-model-design.md`](2026-08-14-1914/detection-model-design.md).

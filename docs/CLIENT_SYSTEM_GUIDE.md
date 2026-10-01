@@ -3,7 +3,7 @@
 Document purpose: explain what SENTINEL is, how it works, what each component
 does, what is working today, and what remains before production deployment.
 
-Status date: 2026-08-28
+Status date: 2026-09-01
 
 ## Executive summary
 
@@ -185,7 +185,7 @@ detection or an accuracy claim.
 | Analytics | Would own ROI-derived occupancy, paths, or heatmaps | Not implemented; semantics are undefined |
 | Worker application | Reserved for a future separately deployed workload if measurements require it | Empty stub; not deployed |
 | Development proxy | Provides a loopback-only browser login and trusted identity assertion for local use | Working development fixture; not a production identity provider |
-| MediaMTX | Bridges a local webcam or suitable source to RTSP during development | External development dependency |
+| External RTSP fixture | Previously provided deterministic RTSP and webcam-backed sources | Removed by ADR 013; replacement not implemented |
 | LiveKit Server | Delivers WebRTC media to browser viewers | External runtime dependency |
 | PostgreSQL | Stores operational state and indexes, not video payloads | External runtime dependency |
 | FFmpeg/FFprobe | Supports local camera bridging, decoding/transcoding, and media inspection | External runtime dependency |
@@ -193,6 +193,23 @@ detection or an accuracy claim.
 The original `cam_rtsp` prototype under the repository root is reference
 material only. It is outside the Rust workspace, is not compiled, and is not
 part of the shipped system.
+
+### Production and development media paths
+
+The intended physical-camera production path is direct:
+
+```text
+IP camera -> one owned Retina RTSP/TCP session -> bounded distributor
+                                              |-> recorder
+                                              |-> detector
+                                              `-> LiveKit publisher -> browser
+```
+
+LiveKit is a downstream WebRTC delivery system; it does not ingest RTSP from the
+camera or replace the camera ingestion owner. The former proxy-backed automated
+RTSP tests and macOS webcam bridge were removed by ADR 013. The executable
+physical-camera qualification contract is
+in `docs/direct-camera-rtsp/SPEC.md` and `docs/direct-camera-rtsp/PLAN.md`.
 
 ## Working crates and important files
 
@@ -255,7 +272,6 @@ Owns camera connectivity and the singular upstream RTSP session.
 | `src/h264_depay.rs` | Bounded RFC 6184 H.264 RTP depayloading and access-unit assembly. |
 | `src/supervisor.rs` | Owns camera task lifetime, cancellation, retry, and child-task outcomes. |
 | `src/health.rs` | Credential-free camera health snapshots and state reporting. |
-| `tests/retina_mediamtx.rs` | Ignored external integration coverage for Retina ingest through MediaMTX. |
 
 `reconnect.rs` is presently a placeholder; the active reconnect mechanics are
 implemented with the connection/supervisor ownership rather than this file.
@@ -531,11 +547,18 @@ real Grafana instance. They must not yet be described as operationally proven.
 - Layered, validated, persisted, and audited configuration.
 - Authentication, camera-scoped authorization, secret redaction, proxy-origin
   proof, and access audit.
-- A local macOS end-to-end environment using webcam, FFmpeg, MediaMTX,
-  PostgreSQL, LiveKit, the Rust server, and the development login proxy.
+- Unit and in-process integration coverage for the direct ingestion contracts.
+- A guarded direct-camera qualification harness that runs the release server
+  without an RTSP proxy, samples metrics/resources, proves the
+  server-owned RTSP/TCP peer, and validates recorded segments. Its local report
+  and regression gates pass; it has not yet been executed against a physical
+  production camera.
 
 ### Implemented but only partly qualified
 
+- Direct physical-camera RTSP is the intended production topology, but camera-
+  model interoperability, disruption recovery, sustained soak, and 10/20-camera
+  target-hardware capacity remain external qualification gates.
 - Real browser live rendering has been demonstrated on controlled local H.264
   sources and Chromium, but not across the final camera/browser matrix.
 - Controlled local frame accounting showed no publisher loss at 15 FPS for one
