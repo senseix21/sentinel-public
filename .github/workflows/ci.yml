@@ -1,8 +1,12 @@
 name: gate
 
 on:
+  # A branch with an open pull request would otherwise run this twice, once per
+  # event, and the concurrency groups differ by ref so neither cancels the
+  # other. Guard the default branch on push; everything else is covered by the
+  # pull-request event.
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
 
 concurrency:
@@ -25,16 +29,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `rust-toolchain.toml` pins the compiler, and rustup installs it with its
+      # declared components on first use. Proving each tool answers here fails
+      # fast and in an obvious place rather than deep inside the gate.
       - name: Record the toolchain under test
         run: |
+          rustup show active-toolchain
           rustc --version
           cargo --version
+          cargo clippy --version
+          cargo fmt --version
           node --version
           python3 --version
           bash --version | head -1
-
-      - name: Ensure clippy and rustfmt are present
-        run: rustup component add clippy rustfmt
 
       - name: Cache cargo registry and build artifacts
         uses: actions/cache@v4
@@ -44,7 +51,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 

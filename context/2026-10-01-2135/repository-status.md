@@ -42,6 +42,13 @@
   clone — and succeeded on retry each time. Pull-request CI therefore warms that
   download in a separate retried step so a transient fetch is not reported as a
   failing gate; the gate itself still runs once.
+- The gate was toolchain-version dependent and is now pinned. The first CI run
+  failed on `macos-latest`, which ships Rust 1.98.0, with
+  `clippy::unused_async_trait_impl` firing twice in `crates/auth/src/store.rs`;
+  that lint does not exist in the local 1.92.0 toolchain, and Clippy runs with
+  warnings denied. Every dependency was pinned exactly but the compiler was not,
+  so `rust-toolchain.toml` now pins 1.92.0 with clippy and rustfmt. The two
+  1.98 lint hits are recorded debt for whoever raises the pin, not suppressed.
 - Phase 1 now has CI: `.github/workflows/ci.yml` runs `make verify` on
   `macos-latest` for every push and pull request, and
   `.github/workflows/audit.yml` runs `make audit` daily and on demand.

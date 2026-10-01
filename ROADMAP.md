@@ -158,7 +158,10 @@ Create a reproducible Rust workspace that builds cleanly and establishes enforce
   modules; `config/example.toml` names environment variables, never values.
 - [x] Establish workspace lint policy without blindly enabling lints that conflict with FFI/media code.
   `unsafe_code` is forbidden; clippy `all` and `pedantic` warn at workspace
-  level with no blanket allow list.
+  level with no blanket allow list. Because the gate denies warnings, the
+  compiler is part of that policy: `rust-toolchain.toml` pins 1.92.0, after CI
+  on a 1.98 runner failed an unchanged tree on a lint that did not exist
+  locally.
 - [x] Add CI for format, clippy, tests, and release build.
   `.github/workflows/ci.yml` runs `make verify` on `macos-latest` for every push
   and pull request. `make check` keeps its meaning and is now `verify` plus
