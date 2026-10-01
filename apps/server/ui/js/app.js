@@ -7,7 +7,7 @@ import { absent } from "./components/empty-state.js";
 import { ago, bytes, esc, fmtPct, icon, pct, utc } from "./formatting.js";
 import { createMetricsView, parseMetrics } from "./metrics.js";
 import { createLiveKitOwner } from "./livekit.js";
-import { contiguousRuns, coverageBuckets, createPlaybackState, playbackPath, recordingSearchPath, searchRange, startPlayback, stopPlayback, togglePlayback } from "./playback.js";
+import { contiguousRuns, coverageBuckets, createPlaybackState, playbackPath, recordingSearchPath, recordingVideoPath, searchRange, startPlayback, stopPlayback, togglePlayback } from "./playback.js";
 import { SCREENS, parseRoute, screenFor } from "./router.js";
 import { createDashboardScreen } from "./screens/dashboard.js";
 import { createEventsScreen } from "./screens/events.js";
@@ -498,6 +498,21 @@ document.addEventListener("click", async (event) => {
     return;
   }
 
+  if (act === "play-recording") {
+    const video = document.getElementById("v");
+    if (!video) return;
+    const duration = pb.clipDuration === "custom" ? pb.customClipDuration : pb.clipDuration;
+    try {
+      const url = recordingVideoPath(pb.camera, target.dataset.recording, duration);
+      pb.error = null;
+      startPlayback(video, url).catch(() => { /* the element reports its own failure */ });
+    } catch (error) {
+      pb.error = error instanceof Error ? error.message : "Invalid clip duration.";
+      await render();
+    }
+    return;
+  }
+
   if (act === "pb-toggle") {
     await togglePlayback(document.getElementById("v")).catch(() => { /* the element reports its own failure */ });
     return;
@@ -605,6 +620,7 @@ document.addEventListener("input", (event) => {
   const node = event.target;
   if (node.dataset && node.dataset.bind) {
     pb[node.dataset.bind] = node.value;
+    if (node.dataset.bind === "timezone") void render();
     return;
   }
   if (node.dataset && node.dataset.add) {
