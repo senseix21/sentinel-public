@@ -311,7 +311,8 @@ impl FfmpegSourceConfig {
             .arg("pipe:1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
         command
     }
 }
@@ -1013,5 +1014,105 @@ mod tests {
             .shutdown(Duration::from_secs(2))
             .await
             .unwrap_or_else(|error| panic!("stop synthetic source: {error}"));
+    }
+
+    #[cfg(unix)]
+    mod cancellation {
+        use super::super::{FfmpegH264Session, FfmpegSourceConfig};
+        use std::{
+            os::unix::fs::PermissionsExt,
+            path::{Path, PathBuf},
+            process::Command as StdCommand,
+            time::Duration,
+        };
+
+        fn stalled_executable(directory: &Path) -> PathBuf {
+            let pid_path = directory.join("child.pid");
+            let script_path = directory.join("stalled-ffmpeg");
+            std::fs::write(
+                &script_path,
+                format!(
+                    "#!/bin/sh\necho $$ > {}\nexec sleep 30\n",
+                    pid_path.display()
+                ),
+            )
+            .unwrap_or_else(|error| panic!("write stalled executable: {error}"));
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+                .unwrap_or_else(|error| panic!("mark stalled executable runnable: {error}"));
+            script_path
+        }
+
+        fn running(pid: &str) -> bool {
+            let output = StdCommand::new("ps")
+                .args(["-o", "stat=", "-p", pid])
+                .output()
+                .unwrap_or_else(|error| panic!("inspect pid {pid}: {error}"));
+            let state = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            !state.is_empty() && !state.starts_with('Z')
+        }
+
+        async fn settled_pid(pid_path: &Path) -> String {
+            for _ in 0..200 {
+                if let Ok(contents) = std::fs::read_to_string(pid_path) {
+                    let pid = contents.trim().to_owned();
+                    if !pid.is_empty() {
+                        return pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("stalled executable never reported its pid");
+        }
+
+        #[tokio::test]
+        async fn cancelling_startup_does_not_leak_the_child() {
+            let directory = std::env::temp_dir()
+                .join(format!("ffmpeg-cancelled-startup-{}", std::process::id()));
+            std::fs::create_dir_all(&directory)
+                .unwrap_or_else(|error| panic!("create fixture directory: {error}"));
+            let pid_path = directory.join("child.pid");
+            let max_access_unit_bytes = 2 * 1024 * 1024;
+            let config = FfmpegSourceConfig::synthetic(
+                stalled_executable(&directory),
+                640,
+                360,
+                15,
+                500,
+                15,
+                Duration::from_secs(30),
+                Duration::from_secs(2),
+                max_access_unit_bytes,
+                128,
+                max_access_unit_bytes + 8,
+            )
+            .unwrap_or_else(|error| panic!("valid source: {error}"));
+
+            let started = tokio::time::Instant::now();
+            let outcome = tokio::time::timeout(
+                Duration::from_millis(750),
+                FfmpegH264Session::start(&config),
+            )
+            .await;
+            assert!(
+                outcome.is_err(),
+                "a source that never emits media must not become ready"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "the startup timeout must not have elapsed, so the future was cancelled"
+            );
+
+            let pid = settled_pid(&pid_path).await;
+            for _ in 0..200 {
+                if !running(&pid) {
+                    let _ = std::fs::remove_dir_all(&directory);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            let _ = StdCommand::new("kill").args(["-KILL", &pid]).status();
+            let _ = std::fs::remove_dir_all(&directory);
+            panic!("cancelling startup leaked FFmpeg child {pid}");
+        }
     }
 }
