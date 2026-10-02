@@ -550,7 +550,7 @@ async fn record_export(
     guard: &Guard<'_>,
     camera: &CameraId,
     exported: Option<Exported>,
-    result: &io::Result<Exported>,
+    succeeded: bool,
 ) {
     let Some(repository) = guard.audit else {
         return;
@@ -567,7 +567,7 @@ async fn record_export(
         .authentication()
         .principal()
         .map_or_else(|| ANONYMOUS_ACTOR.to_owned(), Principal::audit_identity);
-    let outcome = if result.is_ok() {
+    let outcome = if succeeded {
         AuditOutcome::Succeeded
     } else {
         AuditOutcome::Failed
@@ -1284,14 +1284,12 @@ async fn handle_client(
         // A failure mid-stream still produces a row: partial footage left the
         // system, and an audit trail that recorded only clean successes would
         // be exactly the one an incident cannot use.
-        record_export(
-            &guard,
-            &camera_id,
-            exported.as_ref().ok().copied(),
-            &exported,
-        )
-        .await;
-        return exported.map(|_| ());
+        let delivered = match &exported {
+            Ok(exported) => Some(*exported),
+            Err(partial) => partial.delivered,
+        };
+        record_export(&guard, &camera_id, delivered, exported.is_ok()).await;
+        return exported.map(|_| ()).map_err(|partial| partial.error);
     }
     let response = route_with_recordings(
         &request,
@@ -1442,6 +1440,19 @@ fn parse_recording_video_extent(query: &str) -> Result<RecordingVideoExtent, &'s
         .map_err(|_| "invalid_recording_video_duration")
 }
 
+/// Writes a JSON error response and reports that nothing was exported.
+///
+/// Ten call sites repeated this five-line shape; collapsing it keeps both
+/// streaming handlers inside the workspace line budget and leaves one place
+/// where a refusal's response and its audit meaning are decided together.
+async fn refuse(stream: &mut TcpStream, status: &str, code: &str) -> ExportResult {
+    stream
+        .write_all(json_error(status, code).as_bytes())
+        .await
+        .map(|()| Exported::refused())
+        .map_err(PartialExport::from)
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the streaming adapter receives each independently owned boundary explicitly"
@@ -1455,39 +1466,33 @@ async fn stream_recording_video(
     assembler: &PlaybackAssembler,
     metrics: Option<&Phase4Metrics>,
     io_timeout: Duration,
-) -> io::Result<Exported> {
+) -> ExportResult {
     let extent = match parse_recording_video_extent(query) {
         Ok(extent) => extent,
         Err(code) => {
-            return stream
-                .write_all(json_error("400 Bad Request", code).as_bytes())
-                .await
-                .map(|()| Exported::refused());
+            return refuse(stream, "400 Bad Request", code).await;
         }
     };
     let recording = match repository.find_completed(&camera_id, &recording_id).await {
         Ok(Some(recording)) => recording,
         Ok(None) => {
-            return stream
-                .write_all(json_error("404 Not Found", "recording_not_found").as_bytes())
-                .await
-                .map(|()| Exported::refused());
+            return refuse(stream, "404 Not Found", "recording_not_found").await;
         }
         Err(error) if error.retryable() => {
-            return stream
-                .write_all(
-                    json_error("503 Service Unavailable", "recording_index_unavailable").as_bytes(),
-                )
-                .await
-                .map(|()| Exported::refused());
+            return refuse(
+                stream,
+                "503 Service Unavailable",
+                "recording_index_unavailable",
+            )
+            .await;
         }
         Err(_) => {
-            return stream
-                .write_all(
-                    json_error("500 Internal Server Error", "recording_query_failed").as_bytes(),
-                )
-                .await
-                .map(|()| Exported::refused());
+            return refuse(
+                stream,
+                "500 Internal Server Error",
+                "recording_query_failed",
+            )
+            .await;
         }
     };
     let available_duration = recording_duration(&recording)?;
@@ -1498,25 +1503,18 @@ async fn stream_recording_video(
         }
     };
     if requested_duration > available_duration {
-        return stream
-            .write_all(
-                json_error(
-                    "400 Bad Request",
-                    "recording_video_duration_exceeds_recording",
-                )
-                .as_bytes(),
-            )
-            .await
-            .map(|()| Exported::refused());
+        return refuse(
+            stream,
+            "400 Bad Request",
+            "recording_video_duration_exceeds_recording",
+        )
+        .await;
     }
     let Ok(mut playback) = assembler.start_recording(&recording, extent).await else {
         if let Some(metrics) = metrics {
             metrics.playback_failed();
         }
-        return stream
-            .write_all(json_error("409 Conflict", "recording_media_unavailable").as_bytes())
-            .await
-            .map(|()| Exported::refused());
+        return refuse(stream, "409 Conflict", "recording_media_unavailable").await;
     };
     if let Some(metrics) = metrics {
         metrics.playback_started();
@@ -1524,33 +1522,58 @@ async fn stream_recording_video(
     stream
         .write_all(recording_video_headers(&recording_id, extent).as_bytes())
         .await?;
-    let exported_bytes =
-        match stream_recording_video_body(stream, &mut playback, metrics, io_timeout).await {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                playback.cancel().await;
-                return Err(error);
+    let (exported_bytes, outcome) = stream_chunked_media(
+        stream,
+        &mut playback,
+        io_timeout,
+        "recording video client stalled",
+    )
+    .await;
+    let delivered = |bytes| {
+        recording_extent(&recording, requested_duration)
+            .map(|(start, end)| Exported::delivered(start, end, bytes))
+    };
+    if let Err(error) = outcome {
+        playback.cancel().await;
+        if error.kind() == io::ErrorKind::TimedOut {
+            if let Some(metrics) = metrics {
+                metrics.playback_cancelled();
+                metrics.playback_closed();
             }
-        };
+        }
+        return Err(PartialExport::after(delivered(exported_bytes), error));
+    }
     if playback.finish().await.is_err() {
         if let Some(metrics) = metrics {
             metrics.playback_failed();
             metrics.playback_closed();
         }
-        return Err(io::Error::other("recording video assembly failed"));
+        return Err(PartialExport::after(
+            delivered(exported_bytes),
+            io::Error::other("recording video assembly failed"),
+        ));
     }
     if let Some(metrics) = metrics {
         metrics.playback_completed();
         metrics.playback_closed();
     }
-    let start = jiff::Timestamp::try_from(recording.started_at())
-        .map_err(|_| io::Error::other("recording start invalid"))?;
-    let end = jiff::Timestamp::try_from(recording.started_at() + requested_duration)
-        .map_err(|_| io::Error::other("recording end invalid"))?;
+    let (start, end) = recording_extent(&recording, requested_duration)
+        .ok_or_else(|| io::Error::other("recording extent invalid"))?;
     stream
         .write_all(b"0\r\n\r\n")
         .await
         .map(|()| Exported::delivered(start, end, exported_bytes))
+        .map_err(PartialExport::from)
+}
+
+/// The audit extent of one recording-video response.
+fn recording_extent(
+    recording: &surveillance_storage::metadata::CompletedRecording,
+    requested_duration: Duration,
+) -> Option<(jiff::Timestamp, jiff::Timestamp)> {
+    let start = jiff::Timestamp::try_from(recording.started_at()).ok()?;
+    let end = jiff::Timestamp::try_from(recording.started_at() + requested_duration).ok()?;
+    Some((start, end))
 }
 
 fn recording_duration(
@@ -1562,16 +1585,28 @@ fn recording_duration(
         .map_err(|_| io::Error::other("recording interval invalid"))
 }
 
-async fn stream_recording_video_body(
+/// Writes assembled media as chunked transfer encoding.
+///
+/// Returns the media bytes delivered alongside the outcome, because the two are
+/// independent: a stall or a broken pipe partway through still handed footage
+/// over, and the export audit row has to be able to say how much. Media bytes
+/// only -- the chunk framing and headers are transport, not footage, and an
+/// audit row that counted them would misstate what left.
+///
+/// Shared by both streaming handlers, which had the same loop written twice.
+async fn stream_chunked_media(
     stream: &mut TcpStream,
     playback: &mut PlaybackStream,
-    metrics: Option<&Phase4Metrics>,
     io_timeout: Duration,
-) -> io::Result<u64> {
+    stall_message: &'static str,
+) -> (u64, io::Result<()>) {
     let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     let mut exported_bytes = 0_u64;
     loop {
-        let read = playback.stdout_mut().read(&mut buffer).await?;
+        let read = match playback.read(&mut buffer).await {
+            Ok(read) => read,
+            Err(error) => return (exported_bytes, Err(error)),
+        };
         if read == 0 {
             break;
         }
@@ -1583,19 +1618,17 @@ async fn stream_recording_video_body(
             stream.write_all(b"\r\n").await
         };
         if let Ok(result) = tokio::time::timeout(io_timeout, write).await {
-            result?;
-        } else {
-            if let Some(metrics) = metrics {
-                metrics.playback_cancelled();
-                metrics.playback_closed();
+            if let Err(error) = result {
+                return (exported_bytes, Err(error));
             }
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "recording video client stalled",
-            ));
+        } else {
+            return (
+                exported_bytes,
+                Err(io::Error::new(io::ErrorKind::TimedOut, stall_message)),
+            );
         }
     }
-    Ok(exported_bytes)
+    (exported_bytes, Ok(()))
 }
 
 async fn stream_playback(
@@ -1606,7 +1639,7 @@ async fn stream_playback(
     assembler: &PlaybackAssembler,
     metrics: Option<&Phase4Metrics>,
     io_timeout: Duration,
-) -> io::Result<Exported> {
+) -> ExportResult {
     let parameters: std::collections::BTreeMap<_, _> =
         url::form_urlencoded::parse(query.as_bytes())
             .into_owned()
@@ -1615,10 +1648,7 @@ async fn stream_playback(
         if let Some(metrics) = metrics {
             metrics.range_rejected();
         }
-        return stream
-            .write_all(json_error("400 Bad Request", "invalid_recording_range").as_bytes())
-            .await
-            .map(|()| Exported::refused());
+        return refuse(stream, "400 Bad Request", "invalid_recording_range").await;
     };
     let search = RecordingSearch::new(
         camera_id,
@@ -1630,30 +1660,24 @@ async fn stream_playback(
         if let Some(metrics) = metrics {
             metrics.query_failed();
         }
-        return stream
-            .write_all(
-                json_error("503 Service Unavailable", "recording_index_unavailable").as_bytes(),
-            )
-            .await
-            .map(|()| Exported::refused());
+        return refuse(
+            stream,
+            "503 Service Unavailable",
+            "recording_index_unavailable",
+        )
+        .await;
     };
     if let Some(metrics) = metrics {
         metrics.query(rows.len());
     }
     let Ok(plan) = PlaybackPlan::new(range, rows) else {
-        return stream
-            .write_all(json_error("409 Conflict", "recording_range_not_contiguous").as_bytes())
-            .await
-            .map(|()| Exported::refused());
+        return refuse(stream, "409 Conflict", "recording_range_not_contiguous").await;
     };
     let Ok(mut playback) = assembler.start(&plan).await else {
         if let Some(metrics) = metrics {
             metrics.playback_failed();
         }
-        return stream
-            .write_all(json_error("409 Conflict", "recording_media_unavailable").as_bytes())
-            .await
-            .map(|()| Exported::refused());
+        return refuse(stream, "409 Conflict", "recording_media_unavailable").await;
     };
     if let Some(metrics) = metrics {
         metrics.playback_started();
@@ -1661,46 +1685,31 @@ async fn stream_playback(
     stream
         .write_all(playback_headers(start, end).as_bytes())
         .await?;
-    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
-    // Counted for the export audit row. Media bytes only: the chunked-encoding
-    // framing and the headers are transport, not footage, and an audit row that
-    // inflated them would misstate what left.
-    let mut exported_bytes: u64 = 0;
-    loop {
-        let read = playback.stdout_mut().read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-        exported_bytes = exported_bytes.saturating_add(read as u64);
-        let chunk_header = format!("{read:x}\r\n");
-        let write = async {
-            stream.write_all(chunk_header.as_bytes()).await?;
-            stream.write_all(&buffer[..read]).await?;
-            stream.write_all(b"\r\n").await
-        };
-        if let Ok(result) = tokio::time::timeout(io_timeout, write).await {
-            result?;
-        } else {
-            playback.cancel().await;
+    let delivered = |bytes| Some(Exported::delivered(start, end, bytes));
+    let (exported_bytes, outcome) =
+        stream_chunked_media(stream, &mut playback, io_timeout, "playback client stalled").await;
+    if let Err(error) = outcome {
+        playback.cancel().await;
+        if error.kind() == io::ErrorKind::TimedOut {
             if let Some(metrics) = metrics {
                 metrics.playback_cancelled();
                 metrics.playback_closed();
             }
-            // The client got part of the footage before stalling. The audit
-            // row must say so: reporting zero would understate what left, and
-            // reporting success would overstate it.
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "playback client stalled",
-            ));
         }
+        // The client may have got part of the footage before failing. The audit
+        // row must say so: reporting zero would understate what left, and
+        // reporting success would overstate it.
+        return Err(PartialExport::after(delivered(exported_bytes), error));
     }
     if playback.finish().await.is_err() {
         if let Some(metrics) = metrics {
             metrics.playback_failed();
             metrics.playback_closed();
         }
-        return Err(io::Error::other("playback assembly failed"));
+        return Err(PartialExport::after(
+            delivered(exported_bytes),
+            io::Error::other("playback assembly failed"),
+        ));
     }
     if let Some(metrics) = metrics {
         metrics.playback_completed();
@@ -1710,6 +1719,7 @@ async fn stream_playback(
         .write_all(b"0\r\n\r\n")
         .await
         .map(|()| Exported::delivered(start, end, exported_bytes))
+        .map_err(PartialExport::from)
 }
 
 /// What a playback request actually handed over.
@@ -1757,6 +1767,38 @@ impl Exported {
         self.bytes
     }
 }
+
+/// An export that failed after footage had already been handed over.
+///
+/// The delivered extent and the failure are independent facts. Both call sites
+/// already documented the intent -- "a failure mid-stream still produces a
+/// row", "reporting zero would understate what left" -- but the extent was
+/// dropped with the error, so `record_export` received `None` and wrote
+/// nothing. Carrying it inside the error is what makes those comments true.
+///
+/// `From<io::Error>` exists so `?` keeps working on the many write paths that
+/// fail before anything was delivered.
+pub(crate) struct PartialExport {
+    delivered: Option<Exported>,
+    error: io::Error,
+}
+
+impl PartialExport {
+    fn after(delivered: Option<Exported>, error: io::Error) -> Self {
+        Self { delivered, error }
+    }
+}
+
+impl From<io::Error> for PartialExport {
+    fn from(error: io::Error) -> Self {
+        Self {
+            delivered: None,
+            error,
+        }
+    }
+}
+
+type ExportResult = Result<Exported, PartialExport>;
 
 /// The query parameters naming a recording time range.
 ///

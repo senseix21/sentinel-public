@@ -12,9 +12,11 @@ use std::{
 use surveillance_storage::metadata::CompletedRecording;
 use surveillance_storage::recordings::PlaybackPlan;
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, ChildStdout, Command},
 };
+
+const PREFETCH_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct PlaybackAssembler {
@@ -134,7 +136,7 @@ impl PlaybackAssembler {
             .map_err(PlaybackError::Io)?;
         drop(stdin);
         let stdout = child.stdout.take().ok_or(PlaybackError::MissingPipe)?;
-        Ok(PlaybackStream { child, stdout })
+        Self::with_media_ready(child, stdout, self.startup_timeout).await
     }
 
     /// Starts one owned stream-copy child for a completed recording.
@@ -176,7 +178,48 @@ impl PlaybackAssembler {
             .spawn()
             .map_err(PlaybackError::Io)?;
         let stdout = child.stdout.take().ok_or(PlaybackError::MissingPipe)?;
-        Ok(PlaybackStream { child, stdout })
+        Self::with_media_ready(child, stdout, self.startup_timeout).await
+    }
+
+    /// Returns a stream only once the child has actually produced media.
+    ///
+    /// A successful spawn is not readiness. Without this, an unreadable or
+    /// corrupt recording was discovered only after `200 OK` and the response
+    /// headers had been written, so the handler could do nothing but truncate
+    /// the body -- while `docs/API.md` and the plan both document a
+    /// `409 recording_media_unavailable` for exactly that case. Reading the
+    /// first chunk under the startup timeout makes that status reachable.
+    ///
+    /// The bytes are kept and replayed, so prefetching costs nothing.
+    async fn with_media_ready(
+        mut child: Child,
+        mut stdout: ChildStdout,
+        startup_timeout: Duration,
+    ) -> Result<PlaybackStream, PlaybackError> {
+        let mut prefetched = vec![0_u8; PREFETCH_BYTES];
+        let outcome = tokio::time::timeout(startup_timeout, stdout.read(&mut prefetched)).await;
+        let read = match outcome {
+            Ok(Ok(read)) => read,
+            Ok(Err(error)) => {
+                let _ = child.kill().await;
+                return Err(PlaybackError::Io(error));
+            }
+            Err(_) => {
+                let _ = child.kill().await;
+                return Err(PlaybackError::StartupTimeout);
+            }
+        };
+        if read == 0 {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(PlaybackError::ProcessFailed);
+        }
+        prefetched.truncate(read);
+        Ok(PlaybackStream {
+            child,
+            stdout,
+            prefetched,
+        })
     }
 
     async fn validated_recording_path(&self, relative: &Path) -> Result<PathBuf, PlaybackError> {
@@ -203,11 +246,26 @@ impl PlaybackAssembler {
 pub struct PlaybackStream {
     child: Child,
     stdout: ChildStdout,
+    prefetched: Vec<u8>,
 }
 
 impl PlaybackStream {
-    pub fn stdout_mut(&mut self) -> &mut ChildStdout {
-        &mut self.stdout
+    /// Reads assembled media, replaying the readiness prefetch first.
+    ///
+    /// This replaces a raw accessor for the child's stdout: a caller holding
+    /// the pipe directly would skip the prefetched bytes and silently drop the
+    /// start of every response, including the fragmented-MP4 header.
+    ///
+    /// # Errors
+    /// Returns the underlying pipe failure.
+    pub async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, std::io::Error> {
+        if self.prefetched.is_empty() {
+            return self.stdout.read(buffer).await;
+        }
+        let taken = buffer.len().min(self.prefetched.len());
+        buffer[..taken].copy_from_slice(&self.prefetched[..taken]);
+        self.prefetched.drain(..taken);
+        Ok(taken)
     }
 
     /// Waits for the owned assembler child after its output is drained.
