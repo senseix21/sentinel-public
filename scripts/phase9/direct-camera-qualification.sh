@@ -158,13 +158,61 @@ curl --fail --silent --show-error --max-time 2 "${http_url}/live" \
 # private and the operator may redact this file before publication.
 lsof -nP -a -p "${server_pid}" -iTCP -sTCP:ESTABLISHED \
     > "${evidence_dir}/established-tcp.txt" || true
-rtsp_port="$(python3 -c 'import sys, urllib.parse; parsed = urllib.parse.urlsplit(sys.argv[1]); print(parsed.port or 554)' "${rtsp_url}")"
-rtsp_peer_count="$(
-    grep -Ec -- "->[^ ]+:${rtsp_port}[[:space:]]+\\(ESTABLISHED\\)" \
-        "${evidence_dir}/established-tcp.txt" || true
+
+# Resolve the configured endpoint. Matching on the port alone would accept a
+# connection to any host, so a server pointed at a local proxy would pass a gate
+# whose entire purpose is proving the camera is reached directly.
+rtsp_target="$(
+    python3 - "${rtsp_url}" <<'RESOLVE'
+import socket
+import sys
+import urllib.parse
+
+parsed = urllib.parse.urlsplit(sys.argv[1])
+host = parsed.hostname
+if not host:
+    sys.exit("the RTSP endpoint has no host")
+port = parsed.port or 554
+try:
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+except socket.gaierror as error:
+    sys.exit(f"could not resolve {host}: {error}")
+print(port)
+print(" ".join(sorted({info[4][0] for info in infos})))
+RESOLVE
+)" || fail "could not resolve the configured RTSP endpoint"
+rtsp_port="$(printf '%s\n' "${rtsp_target}" | sed -n 1p)"
+rtsp_addresses="$(printf '%s\n' "${rtsp_target}" | sed -n 2p)"
+[[ -n "${rtsp_addresses}" ]] || fail "the configured RTSP endpoint resolved to no address"
+printf 'port=%s\naddresses=%s\n' "${rtsp_port}" "${rtsp_addresses}" \
+    > "${evidence_dir}/rtsp-peer-expectation.txt"
+
+# A physical camera is never on loopback, and no local process may be serving
+# this port. Both checks are independent of what a proxy calls itself, which
+# matching a process name would not be.
+for address in ${rtsp_addresses}; do
+    case "${address}" in
+    127.* | ::1 | 0.0.0.0 | ::)
+        fail "the RTSP endpoint resolves to ${address}; a direct-camera run must not target a local address"
+        ;;
+    esac
+done
+local_rtsp_listener="$(
+    lsof -nP -iTCP:"${rtsp_port}" -sTCP:LISTEN -t 2>/dev/null | head -1 || true
 )"
+[[ -z "${local_rtsp_listener}" ]] ||
+    fail "pid ${local_rtsp_listener} is listening on RTSP port ${rtsp_port} on this host; a direct-camera run must not go through a local proxy"
+
+# Count only peers that are the resolved camera. lsof brackets IPv6 literals.
+rtsp_peer_count=0
+for address in ${rtsp_addresses}; do
+    for form in "->${address}:${rtsp_port} (ESTABLISHED)" "->[${address}]:${rtsp_port} (ESTABLISHED)"; do
+        matched="$(grep -Fc -- "${form}" "${evidence_dir}/established-tcp.txt" || true)"
+        rtsp_peer_count=$((rtsp_peer_count + matched))
+    done
+done
 [[ "${rtsp_peer_count}" == "1" ]] ||
-    fail "expected one server-owned RTSP/TCP peer, observed ${rtsp_peer_count} on the configured port"
+    fail "expected one server-owned RTSP/TCP peer at the resolved camera address, observed ${rtsp_peer_count}"
 
 sample_metrics() {
     local sequence=0
@@ -246,12 +294,20 @@ metric_samples="$(find "${evidence_dir}/metrics" -type f -name '*.prom' \
     -print 2>/dev/null | wc -l | tr -d ' ')"
 completed_at="$(date -u '+%Y%m%dT%H%M%SZ')"
 
+# A partial left after a graceful stop means the recorder did not finalize its
+# active segment. Counting it into the manifest while still reporting
+# status=completed would let a finalization failure pass qualification, so the
+# evidence is written first and the run then fails on it.
+run_status=completed
+(( partial_count == 0 )) || run_status=failed
 cat >> "${evidence_dir}/run.txt" <<EOF
-status=completed
+status=${run_status}
 completed_at_utc=${completed_at}
 metric_samples=${metric_samples}
 durable_segments=${recording_count}
 remaining_partials=${partial_count}
 EOF
+(( partial_count == 0 )) ||
+    fail "graceful shutdown left ${partial_count} partial segment(s); the recorder did not finalize"
 
 printf 'Direct-camera qualification completed. Evidence: %s\n' "${evidence_dir}"
