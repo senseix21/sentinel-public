@@ -6,8 +6,8 @@ import { createSystemScreen } from "../js/screens/system.js";
 
 test("playback segment rows can start their exact recording", () => {
   const recordings = [
-    { started_at: "2026-08-18T00:00:00.100Z", ended_at: "2026-08-18T00:01:00.200Z", size_bytes: 1 },
-    { started_at: "2026-08-18T00:01:00.200Z", ended_at: "2026-08-18T00:02:00.300Z", size_bytes: 1 },
+    { recording_id: "rec-1", started_at: "2026-08-18T00:00:00.100Z", ended_at: "2026-08-18T00:01:00.200Z", size_bytes: 1 },
+    { recording_id: "rec-2", started_at: "2026-08-18T00:01:00.200Z", ended_at: "2026-08-18T00:02:00.300Z", size_bytes: 1 },
   ];
   const render = createPlaybackScreen({
     state: { system: null },
@@ -21,8 +21,9 @@ test("playback segment rows can start their exact recording", () => {
   });
 
   const html = render();
-  assert.match(html, /data-start="2026-08-18T00:00:00\.100Z" data-end="2026-08-18T00:01:00\.200Z"/);
-  assert.match(html, /data-start="2026-08-18T00:01:00\.200Z" data-end="2026-08-18T00:02:00\.300Z"/);
+  assert.match(html, /data-recording="rec-1"/);
+  assert.match(html, /data-recording="rec-2"/);
+  assert.match(html, /Full recording/);
 });
 
 test("storage renders from its explicit metrics and settings dependencies", () => {

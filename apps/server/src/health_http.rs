@@ -47,7 +47,7 @@ use crate::{
     authorize::{authorize, Action, Authorized, Denied, MutatingSurface, RequestContext},
     metadata_writer::MetadataWriterHandle,
     phase4_metrics::Phase4Metrics,
-    playback::PlaybackAssembler,
+    playback::{ClipDuration, PlaybackAssembler, PlaybackStream, RecordingVideoExtent},
     settings_service::{ConfigurationMetricsView, SettingsService},
     trust_boundary::{
         TrustBoundary, AUTHENTICATED_PRINCIPAL_HEADER, FORWARDED_FOR_HEADER, PROOF_HEADER,
@@ -550,7 +550,7 @@ async fn record_export(
     guard: &Guard<'_>,
     camera: &CameraId,
     exported: Option<Exported>,
-    result: &io::Result<Exported>,
+    succeeded: bool,
 ) {
     let Some(repository) = guard.audit else {
         return;
@@ -567,7 +567,7 @@ async fn record_export(
         .authentication()
         .principal()
         .map_or_else(|| ANONYMOUS_ACTOR.to_owned(), Principal::audit_identity);
-    let outcome = if result.is_ok() {
+    let outcome = if succeeded {
         AuditOutcome::Succeeded
     } else {
         AuditOutcome::Failed
@@ -1203,7 +1203,7 @@ async fn handle_client(
 ) -> io::Result<()> {
     let (max_request_bytes, io_timeout) = request_bounds(settings).await;
     let request = read_request(&mut stream, max_request_bytes, io_timeout).await?;
-    if let (Some(repository), Some(assembler), Some((camera_id, query))) =
+    if let (Some(repository), Some(assembler), Some(target)) =
         (recordings, playback, playback_target(&request))
     {
         // Playback streams a response body, so it cannot go through the
@@ -1242,34 +1242,54 @@ async fn handle_client(
             context,
             audit: access_audit,
         };
+        let camera_id = target.camera_id().clone();
         if let Err(response) =
             authorize_audited(&guard, Action::ExportRecording(camera_id.clone())).await
         {
             return write_response(&mut stream, io_timeout, &response).await;
         }
-        let exported = Box::pin(stream_playback(
-            &mut stream,
-            camera_id.clone(),
-            query,
-            repository,
-            assembler,
-            phase4,
-            playback_stall_timeout(settings).await,
-        ))
-        .await;
+        let exported = match target {
+            PlaybackTarget::Range { query, .. } => {
+                Box::pin(stream_playback(
+                    &mut stream,
+                    camera_id.clone(),
+                    query,
+                    repository,
+                    assembler,
+                    phase4,
+                    playback_stall_timeout(settings).await,
+                ))
+                .await
+            }
+            PlaybackTarget::Recording {
+                recording_id,
+                query,
+                ..
+            } => {
+                Box::pin(stream_recording_video(
+                    &mut stream,
+                    camera_id.clone(),
+                    recording_id,
+                    query,
+                    repository,
+                    assembler,
+                    phase4,
+                    playback_stall_timeout(settings).await,
+                ))
+                .await
+            }
+        };
 
         // Written after streaming, because the byte count is only known then.
         // A failure mid-stream still produces a row: partial footage left the
         // system, and an audit trail that recorded only clean successes would
         // be exactly the one an incident cannot use.
-        record_export(
-            &guard,
-            &camera_id,
-            exported.as_ref().ok().copied(),
-            &exported,
-        )
-        .await;
-        return exported.map(|_| ());
+        let delivered = match &exported {
+            Ok(exported) => Some(*exported),
+            Err(partial) => partial.delivered,
+        };
+        record_export(&guard, &camera_id, delivered, exported.is_ok()).await;
+        return exported.map(|_| ()).map_err(|partial| partial.error);
     }
     let response = route_with_recordings(
         &request,
@@ -1302,7 +1322,27 @@ async fn write_response(
     Ok(())
 }
 
-fn playback_target(request: &[u8]) -> Option<(CameraId, &str)> {
+enum PlaybackTarget<'a> {
+    Range {
+        camera_id: CameraId,
+        query: &'a str,
+    },
+    Recording {
+        camera_id: CameraId,
+        recording_id: surveillance_common::types::RecordingId,
+        query: &'a str,
+    },
+}
+
+impl PlaybackTarget<'_> {
+    fn camera_id(&self) -> &CameraId {
+        match self {
+            Self::Range { camera_id, .. } | Self::Recording { camera_id, .. } => camera_id,
+        }
+    }
+}
+
+fn playback_target(request: &[u8]) -> Option<PlaybackTarget<'_>> {
     let header_end = find_header_end(request)?;
     let head = std::str::from_utf8(&request[..header_end]).ok()?;
     let mut line = head.lines().next()?.split_whitespace();
@@ -1312,17 +1352,25 @@ fn playback_target(request: &[u8]) -> Option<(CameraId, &str)> {
     let target = line.next()?;
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let parts: Vec<_> = path.trim_matches('/').split('/').collect();
-    if parts.len() != 5
-        || parts[0] != "api"
-        || parts[1] != "cameras"
-        || parts[3] != "recordings"
-        || parts[4] != "playback"
+    if parts.first() != Some(&"api")
+        || parts.get(1) != Some(&"cameras")
+        || parts.get(3) != Some(&"recordings")
     {
         return None;
     }
-    CameraId::new(parts[2])
-        .ok()
-        .map(|camera_id| (camera_id, query))
+    let camera_id = CameraId::new(parts[2]).ok()?;
+    if parts.len() == 5 && parts[4] == "playback" {
+        return Some(PlaybackTarget::Range { camera_id, query });
+    }
+    if parts.len() == 6 && parts[5] == "video" {
+        let recording_id = surveillance_common::types::RecordingId::new(parts[4]).ok()?;
+        return Some(PlaybackTarget::Recording {
+            camera_id,
+            recording_id,
+            query,
+        });
+    }
+    None
 }
 
 /// The response headers for a playback stream.
@@ -1355,76 +1403,210 @@ fn playback_headers(start: impl std::fmt::Display, end: impl std::fmt::Display) 
     )
 }
 
-async fn stream_playback(
+fn recording_video_headers(
+    recording_id: &surveillance_common::types::RecordingId,
+    extent: RecordingVideoExtent,
+) -> String {
+    let requested = match extent {
+        RecordingVideoExtent::Full => "full".to_owned(),
+        RecordingVideoExtent::Leading(duration) => format!("{}s", duration.seconds()),
+    };
+    format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: video/mp4\r\n\
+         Transfer-Encoding: chunked\r\n\
+         Accept-Ranges: none\r\n\
+         X-Playback-Accuracy: packet-bounded\r\n\
+         X-Recording-Id: {recording_id}\r\n\
+         X-Requested-Duration: {requested}\r\n\
+         Connection: close\r\n\r\n"
+    )
+}
+
+fn parse_recording_video_extent(query: &str) -> Result<RecordingVideoExtent, &'static str> {
+    let parameters: Vec<_> = url::form_urlencoded::parse(query.as_bytes()).collect();
+    if parameters.is_empty() {
+        return Ok(RecordingVideoExtent::Full);
+    }
+    if parameters.len() != 1 || parameters[0].0 != "duration_seconds" {
+        return Err("invalid_recording_video_query");
+    }
+    let seconds = parameters[0]
+        .1
+        .parse::<u32>()
+        .map_err(|_| "invalid_recording_video_duration")?;
+    ClipDuration::new(seconds)
+        .map(RecordingVideoExtent::Leading)
+        .map_err(|_| "invalid_recording_video_duration")
+}
+
+/// Writes a JSON error response and reports that nothing was exported.
+///
+/// Ten call sites repeated this five-line shape; collapsing it keeps both
+/// streaming handlers inside the workspace line budget and leaves one place
+/// where a refusal's response and its audit meaning are decided together.
+async fn refuse(stream: &mut TcpStream, status: &str, code: &str) -> ExportResult {
+    stream
+        .write_all(json_error(status, code).as_bytes())
+        .await
+        .map(|()| Exported::refused())
+        .map_err(PartialExport::from)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the streaming adapter receives each independently owned boundary explicitly"
+)]
+async fn stream_recording_video(
     stream: &mut TcpStream,
     camera_id: CameraId,
+    recording_id: surveillance_common::types::RecordingId,
     query: &str,
     repository: &PostgresRecordingRepository,
     assembler: &PlaybackAssembler,
     metrics: Option<&Phase4Metrics>,
     io_timeout: Duration,
-) -> io::Result<Exported> {
-    let parameters: std::collections::BTreeMap<_, _> =
-        url::form_urlencoded::parse(query.as_bytes())
-            .into_owned()
-            .collect();
-    let Some((start, end, range)) = parse_range(&parameters) else {
-        if let Some(metrics) = metrics {
-            metrics.range_rejected();
+) -> ExportResult {
+    let extent = match parse_recording_video_extent(query) {
+        Ok(extent) => extent,
+        Err(code) => {
+            return refuse(stream, "400 Bad Request", code).await;
         }
-        return stream
-            .write_all(json_error("400 Bad Request", "invalid_recording_range").as_bytes())
-            .await
-            .map(|()| Exported::refused());
     };
-    let search = RecordingSearch::new(
-        camera_id,
-        range,
-        RecordingResultLimit::new(1_000).map_err(|_| io::Error::other("playback limit invalid"))?,
-        None,
-    );
-    let Ok(rows) = repository.find_overlapping_completed(&search).await else {
-        if let Some(metrics) = metrics {
-            metrics.query_failed();
+    let recording = match repository.find_completed(&camera_id, &recording_id).await {
+        Ok(Some(recording)) => recording,
+        Ok(None) => {
+            return refuse(stream, "404 Not Found", "recording_not_found").await;
         }
-        return stream
-            .write_all(
-                json_error("503 Service Unavailable", "recording_index_unavailable").as_bytes(),
+        Err(error) if error.retryable() => {
+            return refuse(
+                stream,
+                "503 Service Unavailable",
+                "recording_index_unavailable",
             )
-            .await
-            .map(|()| Exported::refused());
+            .await;
+        }
+        Err(_) => {
+            return refuse(
+                stream,
+                "500 Internal Server Error",
+                "recording_query_failed",
+            )
+            .await;
+        }
     };
-    if let Some(metrics) = metrics {
-        metrics.query(rows.len());
+    let available_duration = recording_duration(&recording)?;
+    let requested_duration = match extent {
+        RecordingVideoExtent::Full => available_duration,
+        RecordingVideoExtent::Leading(duration) => {
+            Duration::from_secs(u64::from(duration.seconds()))
+        }
+    };
+    if requested_duration > available_duration {
+        return refuse(
+            stream,
+            "400 Bad Request",
+            "recording_video_duration_exceeds_recording",
+        )
+        .await;
     }
-    let Ok(plan) = PlaybackPlan::new(range, rows) else {
-        return stream
-            .write_all(json_error("409 Conflict", "recording_range_not_contiguous").as_bytes())
-            .await
-            .map(|()| Exported::refused());
-    };
-    let Ok(mut playback) = assembler.start(&plan).await else {
+    let Ok(mut playback) = assembler.start_recording(&recording, extent).await else {
         if let Some(metrics) = metrics {
             metrics.playback_failed();
         }
-        return stream
-            .write_all(json_error("409 Conflict", "recording_media_unavailable").as_bytes())
-            .await
-            .map(|()| Exported::refused());
+        return refuse(stream, "409 Conflict", "recording_media_unavailable").await;
     };
     if let Some(metrics) = metrics {
         metrics.playback_started();
     }
     stream
-        .write_all(playback_headers(start, end).as_bytes())
+        .write_all(recording_video_headers(&recording_id, extent).as_bytes())
         .await?;
+    let (exported_bytes, outcome) = stream_chunked_media(
+        stream,
+        &mut playback,
+        io_timeout,
+        "recording video client stalled",
+    )
+    .await;
+    let delivered = |bytes| {
+        recording_extent(&recording, requested_duration)
+            .map(|(start, end)| Exported::delivered(start, end, bytes))
+    };
+    if let Err(error) = outcome {
+        playback.cancel().await;
+        if error.kind() == io::ErrorKind::TimedOut {
+            if let Some(metrics) = metrics {
+                metrics.playback_cancelled();
+                metrics.playback_closed();
+            }
+        }
+        return Err(PartialExport::after(delivered(exported_bytes), error));
+    }
+    if playback.finish().await.is_err() {
+        if let Some(metrics) = metrics {
+            metrics.playback_failed();
+            metrics.playback_closed();
+        }
+        return Err(PartialExport::after(
+            delivered(exported_bytes),
+            io::Error::other("recording video assembly failed"),
+        ));
+    }
+    if let Some(metrics) = metrics {
+        metrics.playback_completed();
+        metrics.playback_closed();
+    }
+    let (start, end) = recording_extent(&recording, requested_duration)
+        .ok_or_else(|| io::Error::other("recording extent invalid"))?;
+    stream
+        .write_all(b"0\r\n\r\n")
+        .await
+        .map(|()| Exported::delivered(start, end, exported_bytes))
+        .map_err(PartialExport::from)
+}
+
+/// The audit extent of one recording-video response.
+fn recording_extent(
+    recording: &surveillance_storage::metadata::CompletedRecording,
+    requested_duration: Duration,
+) -> Option<(jiff::Timestamp, jiff::Timestamp)> {
+    let start = jiff::Timestamp::try_from(recording.started_at()).ok()?;
+    let end = jiff::Timestamp::try_from(recording.started_at() + requested_duration).ok()?;
+    Some((start, end))
+}
+
+fn recording_duration(
+    recording: &surveillance_storage::metadata::CompletedRecording,
+) -> io::Result<Duration> {
+    recording
+        .ended_at()
+        .duration_since(recording.started_at())
+        .map_err(|_| io::Error::other("recording interval invalid"))
+}
+
+/// Writes assembled media as chunked transfer encoding.
+///
+/// Returns the media bytes delivered alongside the outcome, because the two are
+/// independent: a stall or a broken pipe partway through still handed footage
+/// over, and the export audit row has to be able to say how much. Media bytes
+/// only -- the chunk framing and headers are transport, not footage, and an
+/// audit row that counted them would misstate what left.
+///
+/// Shared by both streaming handlers, which had the same loop written twice.
+async fn stream_chunked_media(
+    stream: &mut TcpStream,
+    playback: &mut PlaybackStream,
+    io_timeout: Duration,
+    stall_message: &'static str,
+) -> (u64, io::Result<()>) {
     let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
-    // Counted for the export audit row. Media bytes only: the chunked-encoding
-    // framing and the headers are transport, not footage, and an audit row that
-    // inflated them would misstate what left.
-    let mut exported_bytes: u64 = 0;
+    let mut exported_bytes = 0_u64;
     loop {
-        let read = playback.stdout_mut().read(&mut buffer).await?;
+        let read = match playback.read(&mut buffer).await {
+            Ok(read) => read,
+            Err(error) => return (exported_bytes, Err(error)),
+        };
         if read == 0 {
             break;
         }
@@ -1436,28 +1618,98 @@ async fn stream_playback(
             stream.write_all(b"\r\n").await
         };
         if let Ok(result) = tokio::time::timeout(io_timeout, write).await {
-            result?;
+            if let Err(error) = result {
+                return (exported_bytes, Err(error));
+            }
         } else {
-            playback.cancel().await;
+            return (
+                exported_bytes,
+                Err(io::Error::new(io::ErrorKind::TimedOut, stall_message)),
+            );
+        }
+    }
+    (exported_bytes, Ok(()))
+}
+
+async fn stream_playback(
+    stream: &mut TcpStream,
+    camera_id: CameraId,
+    query: &str,
+    repository: &PostgresRecordingRepository,
+    assembler: &PlaybackAssembler,
+    metrics: Option<&Phase4Metrics>,
+    io_timeout: Duration,
+) -> ExportResult {
+    let parameters: std::collections::BTreeMap<_, _> =
+        url::form_urlencoded::parse(query.as_bytes())
+            .into_owned()
+            .collect();
+    let Some((start, end, range)) = parse_range(&parameters) else {
+        if let Some(metrics) = metrics {
+            metrics.range_rejected();
+        }
+        return refuse(stream, "400 Bad Request", "invalid_recording_range").await;
+    };
+    let search = RecordingSearch::new(
+        camera_id,
+        range,
+        RecordingResultLimit::new(1_000).map_err(|_| io::Error::other("playback limit invalid"))?,
+        None,
+    );
+    let Ok(rows) = repository.find_overlapping_completed(&search).await else {
+        if let Some(metrics) = metrics {
+            metrics.query_failed();
+        }
+        return refuse(
+            stream,
+            "503 Service Unavailable",
+            "recording_index_unavailable",
+        )
+        .await;
+    };
+    if let Some(metrics) = metrics {
+        metrics.query(rows.len());
+    }
+    let Ok(plan) = PlaybackPlan::new(range, rows) else {
+        return refuse(stream, "409 Conflict", "recording_range_not_contiguous").await;
+    };
+    let Ok(mut playback) = assembler.start(&plan).await else {
+        if let Some(metrics) = metrics {
+            metrics.playback_failed();
+        }
+        return refuse(stream, "409 Conflict", "recording_media_unavailable").await;
+    };
+    if let Some(metrics) = metrics {
+        metrics.playback_started();
+    }
+    stream
+        .write_all(playback_headers(start, end).as_bytes())
+        .await?;
+    let delivered = |bytes| Some(Exported::delivered(start, end, bytes));
+    let (exported_bytes, outcome) =
+        stream_chunked_media(stream, &mut playback, io_timeout, "playback client stalled").await;
+    if let Err(error) = outcome {
+        playback.cancel().await;
+        if error.kind() == io::ErrorKind::TimedOut {
             if let Some(metrics) = metrics {
                 metrics.playback_cancelled();
                 metrics.playback_closed();
             }
-            // The client got part of the footage before stalling. The audit
-            // row must say so: reporting zero would understate what left, and
-            // reporting success would overstate it.
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "playback client stalled",
-            ));
         }
+        // The client may have got part of the footage before failing. The audit
+        // row must say so: reporting zero would understate what left, and
+        // reporting success would overstate it.
+        return Err(PartialExport::after(delivered(exported_bytes), error));
     }
     if playback.finish().await.is_err() {
         if let Some(metrics) = metrics {
             metrics.playback_failed();
             metrics.playback_closed();
         }
-        return Err(io::Error::other("playback assembly failed"));
+        return Err(PartialExport::after(
+            delivered(exported_bytes),
+            io::Error::other("playback assembly failed"),
+        ));
     }
     if let Some(metrics) = metrics {
         metrics.playback_completed();
@@ -1467,6 +1719,7 @@ async fn stream_playback(
         .write_all(b"0\r\n\r\n")
         .await
         .map(|()| Exported::delivered(start, end, exported_bytes))
+        .map_err(PartialExport::from)
 }
 
 /// What a playback request actually handed over.
@@ -1514,6 +1767,38 @@ impl Exported {
         self.bytes
     }
 }
+
+/// An export that failed after footage had already been handed over.
+///
+/// The delivered extent and the failure are independent facts. Both call sites
+/// already documented the intent -- "a failure mid-stream still produces a
+/// row", "reporting zero would understate what left" -- but the extent was
+/// dropped with the error, so `record_export` received `None` and wrote
+/// nothing. Carrying it inside the error is what makes those comments true.
+///
+/// `From<io::Error>` exists so `?` keeps working on the many write paths that
+/// fail before anything was delivered.
+pub(crate) struct PartialExport {
+    delivered: Option<Exported>,
+    error: io::Error,
+}
+
+impl PartialExport {
+    fn after(delivered: Option<Exported>, error: io::Error) -> Self {
+        Self { delivered, error }
+    }
+}
+
+impl From<io::Error> for PartialExport {
+    fn from(error: io::Error) -> Self {
+        Self {
+            delivered: None,
+            error,
+        }
+    }
+}
+
+type ExportResult = Result<Exported, PartialExport>;
 
 /// The query parameters naming a recording time range.
 ///
@@ -2173,6 +2458,7 @@ struct RecordingResponse {
     size_bytes: u64,
     status: &'static str,
     playback: String,
+    video: String,
 }
 
 async fn recording_search(
@@ -2314,6 +2600,11 @@ fn recording_response(
                 .map_or_else(|_| "invalid".to_owned(), |value| value.to_string()),
             jiff::Timestamp::try_from(row.ended_at())
                 .map_or_else(|_| "invalid".to_owned(), |value| value.to_string()),
+        ),
+        video: format!(
+            "/api/cameras/{}/recordings/{}/video",
+            row.camera_id(),
+            row.recording_id()
         ),
     }
 }
@@ -3437,9 +3728,10 @@ fn response(status: &str, content_type: &str, body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_recording_cursor, encode_recording_cursor, handle_client, parse_range, route,
-        route_with_settings, serve_health, test_defaults, CameraDefaults, SecurityOwner,
-        LIVEKIT_CLIENT, UI_ASSETS,
+        decode_recording_cursor, encode_recording_cursor, handle_client, parse_range,
+        parse_recording_video_extent, playback_target, recording_video_headers, route,
+        route_with_settings, serve_health, test_defaults, CameraDefaults, PlaybackTarget,
+        SecurityOwner, LIVEKIT_CLIENT, UI_ASSETS,
     };
     use crate::authorize::{authorize_call_count, MutatingSurface};
     use crate::camera_supervisor::{CameraSupervisor, PipelineState};
@@ -3462,6 +3754,8 @@ mod tests {
         value::SettingValue,
     };
     use tokio::sync::watch;
+
+    use crate::playback::{ClipDuration, RecordingVideoExtent};
 
     fn loopback() -> IpAddr {
         IpAddr::V4(Ipv4Addr::LOCALHOST)
@@ -4374,6 +4668,64 @@ mod tests {
             !headers.contains("Content-Length"),
             "a chunked stream must not claim a length: {headers}"
         );
+    }
+
+    #[test]
+    fn recording_video_route_identifies_one_recording() {
+        let request = b"GET /api/cameras/camera-01/recordings/recording-01/video?duration_seconds=5 HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let Some(PlaybackTarget::Recording {
+            camera_id,
+            recording_id,
+            query,
+        }) = playback_target(request)
+        else {
+            panic!("recording video route was not recognized");
+        };
+        assert_eq!(camera_id.as_str(), "camera-01");
+        assert_eq!(recording_id.as_str(), "recording-01");
+        assert_eq!(query, "duration_seconds=5");
+    }
+
+    #[test]
+    fn recording_video_duration_is_optional_strict_and_bounded() {
+        assert_eq!(
+            parse_recording_video_extent(""),
+            Ok(RecordingVideoExtent::Full)
+        );
+        assert_eq!(
+            parse_recording_video_extent("duration_seconds=10"),
+            Ok(RecordingVideoExtent::Leading(
+                ClipDuration::new(10).unwrap_or_else(|_| panic!("ten seconds must be valid"))
+            ))
+        );
+        for query in [
+            "duration_seconds=0",
+            "duration_seconds=61",
+            "duration_seconds=5.5",
+            "duration_seconds=5&duration_seconds=10",
+            "other=5",
+        ] {
+            assert!(
+                parse_recording_video_extent(query).is_err(),
+                "query unexpectedly accepted: {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn recording_video_response_is_honest_about_transport_and_accuracy() {
+        let recording_id = surveillance_common::types::RecordingId::new("recording-01")
+            .unwrap_or_else(|_| panic!("fixture id must be valid"));
+        let headers = recording_video_headers(
+            &recording_id,
+            RecordingVideoExtent::Leading(
+                ClipDuration::new(5).unwrap_or_else(|_| panic!("fixture duration must be valid")),
+            ),
+        );
+        assert!(headers.contains("Accept-Ranges: none"));
+        assert!(headers.contains("X-Playback-Accuracy: packet-bounded"));
+        assert!(headers.contains("X-Requested-Duration: 5s"));
+        assert!(headers.contains("X-Recording-Id: recording-01"));
     }
 
     /// The capabilities endpoint must describe the backend that is actually

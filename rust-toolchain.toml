@@ -1,0 +1,14 @@
+# The gate runs Clippy with warnings denied, which makes the compiler version
+# part of the contract: a newer Clippy fails an unchanged tree on lints that did
+# not exist when the code was written. Every dependency in this workspace is
+# pinned exactly, and the toolchain is pinned for the same reason, so `make
+# check` means the same thing locally and in CI.
+#
+# Raising this is a deliberate change, not a routine bump. Run `make check`
+# first and fix what the newer Clippy reports. Known debt as of 2026-10-01:
+# Rust 1.98 adds `clippy::unused_async_trait_impl`, which fires twice in
+# `crates/auth/src/store.rs` on in-memory trait impls that are `async` without
+# awaiting.
+[toolchain]
+channel = "1.92.0"
+components = ["clippy", "rustfmt"]

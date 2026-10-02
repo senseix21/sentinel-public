@@ -162,6 +162,7 @@ mutating API surface to be enabled. When it is disabled, the route returns
 | `GET` | `/api/cameras/{camera_id}/recordings` | Viewer | Search completed recordings |
 | `GET` | `/api/cameras/{camera_id}/recordings/{recording_id}` | Viewer | Get completed recording metadata |
 | `GET` | `/api/cameras/{camera_id}/recordings/playback` | Viewer | Stream MP4 footage for a time range |
+| `GET` | `/api/cameras/{camera_id}/recordings/{recording_id}/video` | Viewer | Stream a full recording or a leading duration |
 | `POST` | `/api/cameras/{camera_id}/viewer-token` | Viewer | Mint development LiveKit viewer access |
 | `GET` | `/api/settings` | Viewer | List resolved global settings |
 | `GET` | `/api/settings/{setting_key}` | Viewer | Read stored and effective setting state |

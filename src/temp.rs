@@ -14,7 +14,7 @@ fn main() -> Result<()> {
     let pipeline = Pipeline::new();
     info!("Pipeline created: {:?}", pipeline);
 
-    // Use uridecodebin for RTSP streaming - MediaMTX recommended pattern
+    // Use uridecodebin for RTSP streaming.
     let src = ElementFactory::make("uridecodebin")
         .name("source")
         .property("uri", &rtsp_url)

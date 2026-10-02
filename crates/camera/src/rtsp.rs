@@ -587,7 +587,7 @@ fn classify_retina_connect_error(error: retina::Error) -> RtspConnectError {
             source: Some(error),
         },
         Some(404) => RtspConnectError::Retryable {
-            // MediaMTX and some camera proxies use 404 while a configured
+            // Some RTSP servers and camera proxies use 404 while a configured
             // source is temporarily offline. Status alone cannot distinguish
             // that condition from a misspelled path.
             failure: RetryableCameraFailure::ServerUnavailable,

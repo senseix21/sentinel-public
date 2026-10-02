@@ -138,15 +138,45 @@ Create a reproducible Rust workspace that builds cleanly and establishes enforce
 
 ### Instructions
 
-- [ ] Capture the existing manifest failure as baseline evidence.
-- [ ] Replace orphaned `workspace = true` dependencies with a real root `[workspace]` and `[workspace.dependencies]` containing pinned compatible versions.
-- [ ] Introduce `apps/server` and only the crates needed by the first vertical slice: `common`, `config`, `camera`, `media`, `recorder`, `storage`, `events`, and minimal `api`.
-- [ ] Preserve the prototype in a clearly labeled location or migrate individual mechanics only when covered by characterization tests.
-- [ ] Remove public hardcoded RTSP URLs and credentials from runtime defaults and documentation examples.
-- [ ] Establish workspace lint policy without blindly enabling lints that conflict with FFI/media code.
-- [ ] Add CI for format, clippy, tests, and release build.
-- [ ] Record required GStreamer/FFmpeg system packages for macOS development and target Linux deployment.
-- [ ] Add a configuration example with safe local defaults and no secrets.
+- [x] Capture the existing manifest failure as baseline evidence. Recorded in
+  `context/2026-08-10/repository-status.md`: `cargo check` failed with
+  `error inheriting ... from workspace root manifest` and `failed to find a
+  workspace root`.
+- [x] Replace orphaned `workspace = true` dependencies with a real root `[workspace]` and `[workspace.dependencies]` containing pinned compatible versions.
+  Sixteen members; every shared dependency is pinned with `=`.
+- [~] Introduce `apps/server` and only the crates needed by the first vertical slice: `common`, `config`, `camera`, `media`, `recorder`, `storage`, `events`, and minimal `api`.
+  Every named crate exists and carries the slice. Later phases legitimately added
+  `auth`, `database`, `detector`, and `livekit`, which are implemented. But
+  `analytics`, `rules`, and `apps/worker` were introduced ahead of their phases
+  and hold no implementation, and `api` was superseded in place. See the exit
+  gate.
+- [x] Preserve the prototype in a clearly labeled location or migrate individual mechanics only when covered by characterization tests.
+  `AGENTS.md` names the original `cam_rtsp` code in the repository root `src/`,
+  with its known defects. It is not a workspace member and is not compiled.
+- [x] Remove public hardcoded RTSP URLs and credentials from runtime defaults and documentation examples.
+  The only credentialed URLs remaining are fixtures inside `#[cfg(test)]`
+  modules; `config/example.toml` names environment variables, never values.
+- [x] Establish workspace lint policy without blindly enabling lints that conflict with FFI/media code.
+  `unsafe_code` is forbidden; clippy `all` and `pedantic` warn at workspace
+  level with no blanket allow list. Because the gate denies warnings, the
+  compiler is part of that policy: `rust-toolchain.toml` pins 1.92.0, after CI
+  on a 1.98 runner failed an unchanged tree on a lint that did not exist
+  locally.
+- [x] Add CI for format, clippy, tests, and release build.
+  `.github/workflows/ci.yml` runs `make verify` on `macos-latest` for every push
+  and pull request. `make check` keeps its meaning and is now `verify` plus
+  `audit`; `.github/workflows/audit.yml` runs the advisory half daily and on
+  demand, so a newly published advisory does not red an unrelated pull request.
+- [~] Record required GStreamer/FFmpeg system packages for macOS development and target Linux deployment.
+  macOS prerequisites are in `README.md` and checked by `make prerequisites`,
+  which now covers every executable `scripts/dev/local-webcam-stack.sh`
+  requires; the earlier list omitted PostgreSQL and Python 3, so a reader could
+  fail before the stack launched. The target Linux packages cannot be recorded
+  while the deployment distribution is unconfirmed (Phase 8). GStreamer is used
+  only by the uncompiled prototype.
+- [x] Add a configuration example with safe local defaults and no secrets.
+  `config/example.toml` binds loopback, leaves the mutating surface disabled,
+  and states that credentials come from the Phase 8 secret boundary.
 
 ### Required checks
 
@@ -166,10 +196,29 @@ cargo build --workspace --release
 
 ### Exit gate
 
-- [ ] A fresh checkout builds using documented prerequisites.
-- [ ] All required checks pass.
-- [ ] No empty speculative crates exist.
-- [ ] Prototype behavior and known defects remain documented in the latest context snapshot.
+- [x] A fresh checkout builds using documented prerequisites. Verified on
+  2026-10-01 by cloning to an empty directory and running `make verify` with no
+  inherited build artifacts: 504 tests passed, 0 failed, across 42 targets. One
+  caveat is recorded rather than hidden: a cold build must download a prebuilt
+  WebRTC archive from GitHub releases inside the `webrtc-sys` build script,
+  which hard-unwraps its HTTP result. That fetch failed three times on
+  2026-10-01 (timeout, then connection reset) and succeeded on retry, so a cold
+  build is network-dependent and not hermetic. See
+  `context/2026-10-01-2135/repository-status.md`.
+- [x] All required checks pass. `make check` passed on 2026-10-01: 504 tests
+  passed, 0 failed, 30 ignored across 42 targets; Clippy with warnings denied;
+  release workspace build; `cargo deny` advisories, bans, licences, and sources
+  ok; `cargo audit` over 461 crates.
+- [!] No empty speculative crates exist. Four members hold no implementation:
+  `crates/analytics` (8 lines), `crates/api` (12), `crates/rules` (8), and
+  `apps/worker` (5). `analytics` and `rules` are blocked on the unconfirmed
+  heatmap/analytics semantics and rule conditions already recorded in Phase 0
+  and Phase 7; `apps/worker` is reserved until Phase 9 measurements justify
+  extraction; `crates/api` is vestigial because the HTTP translation boundary
+  was implemented in `apps/server/src/health_http.rs`. Closing this needs a
+  decision to implement, remove, or re-scope, not a code change alone.
+- [x] Prototype behavior and known defects remain documented in the latest context snapshot.
+  Carried forward in `context/2026-10-01-2135/repository-status.md`.
 
 ---
 
@@ -562,6 +611,19 @@ Measure CPU, GPU, RAM, allocations where relevant, disk MB/s/latency/capacity, n
 ### Instructions
 
 - [ ] Establish an unoptimized one-camera baseline.
+- [~] Qualify the direct physical-camera RTSP topology through
+  `docs/direct-camera-rtsp/SPEC.md` and its executable `PLAN.md`. The owned
+  direct-RTSP harness, resource/metric capture, recording verification, evidence
+  template, and camera-scoped metric gate are implemented. Execution remains
+  blocked on representative cameras, disruption authority, target hardware, and
+  approved objectives. MediaMTX retirement and the replacement FFmpeg webcam
+  source are specified in `docs/ffmpeg-webcam-source/`; proxy-backed fixtures
+  remain transitional until their individual behaviors have executable
+  replacements.
+  On 2026-09-01, `make check`, the
+  authenticated Retina fixture, the synthetic 10-camera/two-camera isolation
+  fixture, and the direct-report regression suite passed; these results validate
+  the tooling baseline, not representative-camera interoperability or capacity.
 - [ ] Qualify 10 realistic cameras through a sustained soak with recording, live viewing, and detection enabled.
 - [ ] Profile the limiting workload; fix correctness and topology problems before micro-optimizing.
 - [ ] Change one variable at a time and retain optimizations only with reproducible improvement.

@@ -139,6 +139,26 @@ stable, and a new completed segment within one segment duration. Connection
 alone is not recovery — `RecordingStalled` exists precisely because a connected
 camera can still be recording nothing.
 
+## Qualify a physical camera before production admission
+
+The synthetic MediaMTX fixture proves deterministic reconnect mechanics, not a
+camera model. Before admitting a physical camera/profile to production, execute
+`docs/direct-camera-rtsp/PLAN.md`. Its first direct-ingest gate is automated by:
+
+```bash
+QUALIFICATION_ACK=direct-physical-camera \
+QUALIFICATION_SECONDS=180 \
+make direct-camera-qualification
+```
+
+The operator supplies the camera ID, credential-free RTSP endpoint, credentials,
+and expected dimensions through the supported environment/configuration boundary.
+Do not paste those values into a committed wrapper. The harness refuses a local
+MediaMTX process, requires one server-owned RTSP/TCP peer, samples bounded metrics
+and resources, gracefully stops the server, and fully decodes every durable
+segment. A passing smoke run is still not the sustained representative-camera or
+10-camera target-hardware gate.
+
 ---
 
 **Execution status**: exercised against synthetic sources

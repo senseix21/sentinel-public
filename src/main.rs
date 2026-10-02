@@ -12,7 +12,6 @@ pub mod clip_extractor;
 pub mod file_recorder;
 pub mod frame_overlay;
 pub mod h265_encoder;
-pub mod mediamtx;
 pub mod models;
 pub mod stream_detector;
 pub mod stream_forwarder;
@@ -44,12 +43,6 @@ struct Args {
 
     #[arg(long, default_value = "debug")]
     log_level: String,
-
-    #[arg(short = 'm', long, default_value = "./mediamtx.yml")]
-    mediamtx_config: String,
-
-    #[arg(long)]
-    enable_mediamtx: bool,
 
     // Stream forwarding configuration
     #[arg(long, default_value = "")]
@@ -128,9 +121,6 @@ async fn main() -> anyhow::Result<()> {
     info!("Stream URL: {}", args.stream_url);
     info!("Recordings Directory: {}", recordings_dir);
     info!("API Server: {}", args.api_addr);
-    if args.enable_mediamtx {
-        info!("MediaMTX Config: {}", args.mediamtx_config);
-    }
     if args.enable_forwarding {
         info!("Stream Forwarding: Enabled");
         info!("Forward Target: {}", args.forward_target_url);
@@ -190,7 +180,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Create PathBuf instances for constructor calls
     let recordings_dir_path: PathBuf = recordings_dir.clone().into();
-    let _mediamtx_config_path: PathBuf = args.mediamtx_config.clone().into();
 
     // Scan existing recordings on startup
     info!("Scanning existing recordings on startup...");
@@ -269,12 +258,6 @@ async fn main() -> anyhow::Result<()> {
     // Start file recorder
     let mut recorder = file_recorder::FileRecorder::new(recordings_dir_path.clone());
     let recorder_handle = recorder.start();
-
-    // MediaMTX initialization (disabled for now due to library issues)
-    if args.enable_mediamtx {
-        info!("MediaMTX startup disabled - GStreamer library issues on macOS");
-        // TODO: Fix GStreamer library issues first
-    }
 
     // Start stream receiver
     let receiver = stream_receiver::StreamReceiver::new(

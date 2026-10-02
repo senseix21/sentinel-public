@@ -34,7 +34,7 @@ use surveillance_server::{
         bootstrap_count, bootstrap_duration, bootstrap_flag, bootstrap_path, bootstrap_secret,
         load_configuration_layers, load_database_from_environment, load_ffmpeg_from_environment,
         load_from_environment, load_health_bind_from_environment, load_retention,
-        load_supervision_from_environment,
+        load_supervision_from_environment, load_webcam_source_from_environment,
     },
     security_config::{load_trust_boundary, resolve_bind},
     settings_service::SettingsService,
@@ -66,7 +66,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // back into the deployment template, so the API's add path would have
     // nothing to stamp onto a new camera.
     let livekit_template = bootstrap_camera.livekit.clone();
-    let config = Arc::new(OneCameraConfig::validate(bootstrap_camera)?);
+    let mut config = OneCameraConfig::validate(bootstrap_camera)?;
+    if let Some(source) = load_webcam_source_from_environment(
+        config.recorder.width(),
+        config.recorder.height(),
+        config.max_access_unit_bytes,
+        config.max_nals_per_access_unit,
+    )? {
+        config = config.with_source(source)?;
+    }
+    let config = Arc::new(config);
     let health_bind = load_health_bind_from_environment()?;
     let supervision = load_supervision_from_environment()?;
     let database = load_database_from_environment()?;
@@ -88,7 +97,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .transpose()?;
     tracing::info!(
         camera_id = %config.camera_id,
-        endpoint = %config.source.endpoint(),
+        source_kind = ?config.source.kind(),
         bounded_memory_bytes = config.bounded_memory_bytes,
         "validated initial camera configuration"
     );

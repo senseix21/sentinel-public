@@ -31,13 +31,13 @@ explicitly and report which ones you could not run:
 
 ```bash
 cargo test -p surveillance-detector --test ffmpeg_decode -- --ignored  # needs ffmpeg + libx264
-scripts/phase0/retina-rtsp-fixture.sh    # needs MediaMTX (also `make fixture`)
-scripts/phase3/multi-camera-fixture.sh   # ten synthetic sources
+make direct-camera-qualification         # requires an authorized physical camera
 scripts/phase4/postgres-fixture.sh       # needs PostgreSQL
 scripts/phase5/livekit-fixture.sh        # needs a LiveKit server
 ```
 
-Local media loop: `make mediamtx`, then `make webcam`, then `make server`, then
+Local media execution now requires a direct RTSP camera. Configure it, then run
+`make server`, followed by
 `make health` / `make verify-recordings`.
 
 ## Repository reality

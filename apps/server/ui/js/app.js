@@ -7,7 +7,7 @@ import { absent } from "./components/empty-state.js";
 import { ago, bytes, esc, fmtPct, icon, pct, utc } from "./formatting.js";
 import { createMetricsView, parseMetrics } from "./metrics.js";
 import { createLiveKitOwner } from "./livekit.js";
-import { contiguousRuns, coverageBuckets, createPlaybackState, playbackPath, recordingSearchPath, searchRange, startPlayback, stopPlayback, togglePlayback } from "./playback.js";
+import { contiguousRuns, coverageBuckets, createPlaybackState, mediaErrorMessage, playbackPath, recordingSearchPath, recordingVideoPath, searchRange, startPlayback, stopPlayback, togglePlayback } from "./playback.js";
 import { SCREENS, parseRoute, screenFor } from "./router.js";
 import { createDashboardScreen } from "./screens/dashboard.js";
 import { createEventsScreen } from "./screens/events.js";
@@ -356,6 +356,24 @@ async function render() {
 
 // ---------------------------------------------------------------- data loads
 
+async function playInto(video, url) {
+  pb.error = null;
+  // A media failure can arrive after play() resolves -- a dropped connection
+  // mid-stream, a segment that stops decoding -- so the element is watched as
+  // well as awaited. Assigning onerror replaces any previous handler, which
+  // matters because the element is rebuilt on every render.
+  video.onerror = () => {
+    pb.error = mediaErrorMessage(video);
+    void render();
+  };
+  try {
+    await startPlayback(video, url);
+  } catch {
+    pb.error = mediaErrorMessage(video);
+    await render();
+  }
+}
+
 async function loadSystem() {
   try {
     state.system = await api("/api/system");
@@ -493,8 +511,20 @@ document.addEventListener("click", async (event) => {
   if (act === "play") {
     const video = document.getElementById("v");
     if (!video) return;
-    const url = playbackPath(pb.camera, target.dataset.start, target.dataset.end);
-    startPlayback(video, url).catch(() => { /* the element reports its own failure */ });
+    await playInto(video, playbackPath(pb.camera, target.dataset.start, target.dataset.end));
+    return;
+  }
+
+  if (act === "play-recording") {
+    const video = document.getElementById("v");
+    if (!video) return;
+    const duration = pb.clipDuration === "custom" ? pb.customClipDuration : pb.clipDuration;
+    try {
+      await playInto(video, recordingVideoPath(pb.camera, target.dataset.recording, duration));
+    } catch (error) {
+      pb.error = error instanceof Error ? error.message : "Invalid clip duration.";
+      await render();
+    }
     return;
   }
 
@@ -605,6 +635,7 @@ document.addEventListener("input", (event) => {
   const node = event.target;
   if (node.dataset && node.dataset.bind) {
     pb[node.dataset.bind] = node.value;
+    if (node.dataset.bind === "timezone") void render();
     return;
   }
   if (node.dataset && node.dataset.add) {

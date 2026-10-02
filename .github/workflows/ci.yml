@@ -1,0 +1,82 @@
+name: gate
+
+on:
+  # A branch with an open pull request would otherwise run this twice, once per
+  # event, and the concurrency groups differ by ref so neither cancels the
+  # other. Guard the default branch on push; everything else is covered by the
+  # pull-request event.
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: gate-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: deterministic gate
+    # The development platform. Nothing here touches a camera: the AVFoundation
+    # paths are runtime-only and the tests that need FFmpeg or a device are
+    # #[ignore]d, so this runs the same `make verify` an engineer runs locally.
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      # `rust-toolchain.toml` pins the compiler, and rustup installs it with its
+      # declared components on first use. Proving each tool answers here fails
+      # fast and in an obvious place rather than deep inside the gate.
+      - name: Record the toolchain under test
+        run: |
+          rustup show active-toolchain
+          rustc --version
+          cargo --version
+          cargo clippy --version
+          cargo fmt --version
+          node --version
+          python3 --version
+          bash --version | head -1
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # webrtc-sys downloads a prebuilt WebRTC archive from GitHub releases in
+      # its build script and hard-unwraps the result, which was observed
+      # failing three times in one day locally on connection reset and
+      # timeout. Warm it separately with retries so a transient fetch does not
+      # read as a failing gate. Only this network step is retried; the gate
+      # itself runs once, so a flaky test stays visible as a flaky test.
+      - name: Warm the prebuilt WebRTC download
+        continue-on-error: true
+        run: |
+          for attempt in 1 2 3; do
+            echo "::group::webrtc-sys fetch attempt ${attempt}"
+            if cargo build --release -p webrtc-sys; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            echo "::endgroup::"
+            sleep $((attempt * 15))
+          done
+          echo "webrtc-sys could not be prefetched; the gate will report the real error"
+
+      # `make check` is verify + audit. Pull-request CI runs only the
+      # deterministic half, so a red run always means this change broke
+      # something rather than that a new advisory was published.
+      - name: Run the deterministic gate
+        run: make verify

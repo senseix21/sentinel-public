@@ -1,0 +1,37 @@
+name: advisories
+
+on:
+  schedule:
+    # Daily. Advisories land independently of pushes, so a failure here is a
+    # statement about the dependency graph, not about anyone's change.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: dependency policy
+    # Matches the platform the lockfile is resolved and verified on locally, so
+    # target-specific dependencies are evaluated the same way.
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo tool binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin
+          key: ${{ runner.os }}-audit-tools-v1
+
+      - name: Install cargo-deny and cargo-audit when absent
+        run: |
+          command -v cargo-deny >/dev/null || cargo install cargo-deny --locked
+          command -v cargo-audit >/dev/null || cargo install cargo-audit --locked
+
+      - name: Check advisories, bans, licences, and sources
+        run: make audit

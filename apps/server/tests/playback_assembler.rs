@@ -1,31 +1,43 @@
-//! Qualifies multi-segment MP4 playback assembly against the Phase 4 `PostgreSQL` fixture.
+//! Qualifies MP4 playback assembly against the Phase 4 `PostgreSQL` fixture.
+//!
+//! Both routes are covered: multi-segment time-range assembly, and the
+//! recording-video subresource in its full and leading-duration forms.
 
 use std::{
     num::NonZeroU32,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
 use surveillance_common::types::{CameraId, RecordingId};
 use surveillance_database::{DatabaseConfig, PostgresRecordingRepository};
-use surveillance_server::playback::PlaybackAssembler;
+use surveillance_server::playback::{
+    ClipDuration, PlaybackAssembler, PlaybackStream, RecordingVideoExtent,
+};
 use surveillance_storage::{
     metadata::{
         CompletedRecording, MetadataProvenance, RecordingContainer, RecordingLocator, VideoCodec,
     },
     recordings::{PlaybackPlan, RecordingResultLimit, RecordingSearch, RecordingTimeRange},
 };
-use tokio::process::Command;
+use tokio::{io::AsyncWriteExt, process::Command};
 
-#[tokio::test]
-#[ignore = "requires scripts/phase4/postgres-fixture.sh"]
-async fn three_segment_stream_copy_fully_decodes() {
-    let database_url = std::env::var("PHASE4_DATABASE_URL")
-        .unwrap_or_else(|_| panic!("fixture database URL is required"));
-    let root = PathBuf::from(
+const CAMERA: &str = "playback-camera";
+
+fn camera() -> CameraId {
+    CameraId::new(CAMERA).unwrap_or_else(|error| panic!("camera ID: {error}"))
+}
+
+fn fixture_root() -> PathBuf {
+    PathBuf::from(
         std::env::var("PHASE4_PLAYBACK_ROOT")
             .unwrap_or_else(|_| panic!("fixture playback root is required")),
-    );
+    )
+}
+
+async fn fixture_repository() -> PostgresRecordingRepository {
+    let database_url = std::env::var("PHASE4_DATABASE_URL")
+        .unwrap_or_else(|_| panic!("fixture database URL is required"));
     let config = DatabaseConfig::new(
         &database_url,
         NonZeroU32::new(2).unwrap_or(NonZeroU32::MIN),
@@ -39,32 +51,94 @@ async fn three_segment_stream_copy_fully_decodes() {
         .migrate()
         .await
         .unwrap_or_else(|error| panic!("migration: {error}"));
+    repository
+}
+
+async fn insert_segment(
+    repository: &PostgresRecordingRepository,
+    root: &Path,
+    index: u64,
+    start: u64,
+) -> CompletedRecording {
+    let locator = format!("{CAMERA}/segment-{index}.mp4");
+    let size = tokio::fs::metadata(root.join(&locator))
+        .await
+        .unwrap_or_else(|error| panic!("fixture metadata: {error}"))
+        .len();
+    let completed = CompletedRecording::new(
+        RecordingId::new(format!("playback-{index}"))
+            .unwrap_or_else(|error| panic!("recording ID: {error}")),
+        camera(),
+        SystemTime::UNIX_EPOCH + Duration::from_secs(start),
+        SystemTime::UNIX_EPOCH + Duration::from_secs(start + 2),
+        RecordingLocator::new(PathBuf::from(locator))
+            .unwrap_or_else(|error| panic!("locator: {error}")),
+        RecordingContainer::FragmentedMp4,
+        VideoCodec::H264,
+        320,
+        240,
+        size,
+        MetadataProvenance::Recorder,
+    )
+    .unwrap_or_else(|error| panic!("completed evidence: {error}"));
+    repository
+        .insert_or_confirm_completed(&completed)
+        .await
+        .unwrap_or_else(|error| panic!("insert: {error}"));
+    completed
+}
+
+/// Drains assembled media through the public reader.
+///
+/// Deliberately uses `PlaybackStream::read` rather than the child's pipe: the
+/// reader replays the readiness prefetch, and a test that bypassed it would not
+/// exercise the path the handlers use.
+async fn drain_to(playback: &mut PlaybackStream, path: &Path) {
+    let mut output = tokio::fs::File::create(path)
+        .await
+        .unwrap_or_else(|error| panic!("output: {error}"));
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = playback
+            .read(&mut buffer)
+            .await
+            .unwrap_or_else(|error| panic!("read: {error}"));
+        if read == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..read])
+            .await
+            .unwrap_or_else(|error| panic!("write: {error}"));
+    }
+    output
+        .flush()
+        .await
+        .unwrap_or_else(|error| panic!("flush: {error}"));
+}
+
+async fn assert_decodes(path: &Path) {
+    let status = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-map", "0:v:0", "-f", "null", "-"])
+        .status()
+        .await
+        .unwrap_or_else(|error| panic!("decode process: {error}"));
+    assert!(status.success(), "{} did not fully decode", path.display());
+}
+
+fn assembler(root: PathBuf) -> PlaybackAssembler {
+    PlaybackAssembler::new(root, PathBuf::from("ffmpeg"), Duration::from_secs(5))
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/phase4/postgres-fixture.sh"]
+async fn three_segment_stream_copy_fully_decodes() {
+    let root = fixture_root();
+    let repository = fixture_repository().await;
     for (index, start) in [(1_u64, 100_u64), (2, 102), (3, 104)] {
-        let locator = format!("playback-camera/segment-{index}.mp4");
-        let size = tokio::fs::metadata(root.join(&locator))
-            .await
-            .unwrap_or_else(|error| panic!("fixture metadata: {error}"))
-            .len();
-        let completed = CompletedRecording::new(
-            RecordingId::new(format!("playback-{index}"))
-                .unwrap_or_else(|error| panic!("recording ID: {error}")),
-            CameraId::new("playback-camera").unwrap_or_else(|error| panic!("camera ID: {error}")),
-            SystemTime::UNIX_EPOCH + Duration::from_secs(start),
-            SystemTime::UNIX_EPOCH + Duration::from_secs(start + 2),
-            RecordingLocator::new(PathBuf::from(locator))
-                .unwrap_or_else(|error| panic!("locator: {error}")),
-            RecordingContainer::FragmentedMp4,
-            VideoCodec::H264,
-            320,
-            240,
-            size,
-            MetadataProvenance::Recorder,
-        )
-        .unwrap_or_else(|error| panic!("completed evidence: {error}"));
-        repository
-            .insert_or_confirm_completed(&completed)
-            .await
-            .unwrap_or_else(|error| panic!("insert: {error}"));
+        insert_segment(&repository, &root, index, start).await;
     }
     let range = RecordingTimeRange::new(
         SystemTime::UNIX_EPOCH + Duration::from_secs(101),
@@ -74,7 +148,7 @@ async fn three_segment_stream_copy_fully_decodes() {
     .unwrap_or_else(|error| panic!("range: {error}"));
     let rows = repository
         .find_overlapping_completed(&RecordingSearch::new(
-            CameraId::new("playback-camera").unwrap_or_else(|error| panic!("camera: {error}")),
+            camera(),
             range,
             RecordingResultLimit::new(10).unwrap_or_else(|error| panic!("limit: {error}")),
             None,
@@ -82,32 +156,86 @@ async fn three_segment_stream_copy_fully_decodes() {
         .await
         .unwrap_or_else(|error| panic!("query: {error}"));
     let plan = PlaybackPlan::new(range, rows).unwrap_or_else(|error| panic!("plan: {error}"));
-    let assembler = PlaybackAssembler::new(
-        root.clone(),
-        PathBuf::from("ffmpeg"),
-        Duration::from_secs(5),
-    );
-    let mut playback = assembler
+    let mut playback = assembler(root.clone())
         .start(&plan)
         .await
         .unwrap_or_else(|error| panic!("start: {error}"));
     let output_path = root.join("assembled.mp4");
-    let mut output = tokio::fs::File::create(&output_path)
-        .await
-        .unwrap_or_else(|error| panic!("output: {error}"));
-    tokio::io::copy(playback.stdout_mut(), &mut output)
-        .await
-        .unwrap_or_else(|error| panic!("copy: {error}"));
+    drain_to(&mut playback, &output_path).await;
     playback
         .finish()
         .await
         .unwrap_or_else(|error| panic!("finish: {error}"));
-    let status = Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
-        .arg(&output_path)
-        .args(["-map", "0:v:0", "-f", "null", "-"])
-        .status()
+    assert_decodes(&output_path).await;
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/phase4/postgres-fixture.sh"]
+async fn recording_video_full_and_leading_both_decode() {
+    let root = fixture_root();
+    let repository = fixture_repository().await;
+    let recording = insert_segment(&repository, &root, 1, 100).await;
+    let built = assembler(root.clone());
+
+    for (extent, name) in [
+        (RecordingVideoExtent::Full, "recording-full.mp4"),
+        (
+            RecordingVideoExtent::Leading(
+                ClipDuration::new(1).unwrap_or_else(|_| panic!("one second is valid")),
+            ),
+            "recording-leading.mp4",
+        ),
+    ] {
+        let mut playback = built
+            .start_recording(&recording, extent)
+            .await
+            .unwrap_or_else(|error| panic!("start_recording {name}: {error}"));
+        let output_path = root.join(name);
+        drain_to(&mut playback, &output_path).await;
+        playback
+            .finish()
+            .await
+            .unwrap_or_else(|error| panic!("finish {name}: {error}"));
+        assert_decodes(&output_path).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/phase4/postgres-fixture.sh"]
+async fn an_unreadable_recording_is_refused_before_any_media() {
+    let root = fixture_root();
+    let repository = fixture_repository().await;
+    let recording = insert_segment(&repository, &root, 1, 100).await;
+    let truncated = root.join(CAMERA).join("segment-1.mp4.empty");
+    tokio::fs::write(&truncated, b"")
         .await
-        .unwrap_or_else(|error| panic!("decode process: {error}"));
-    assert!(status.success());
+        .unwrap_or_else(|error| panic!("write empty fixture: {error}"));
+
+    // The indexed locator still points at the valid segment, so this asserts
+    // the readiness gate on a file FFmpeg cannot remux rather than on a missing
+    // path: a spawn that succeeds must not be reported as a ready stream.
+    let empty = CompletedRecording::new(
+        RecordingId::new("playback-empty").unwrap_or_else(|error| panic!("recording ID: {error}")),
+        camera(),
+        SystemTime::UNIX_EPOCH + Duration::from_secs(200),
+        SystemTime::UNIX_EPOCH + Duration::from_secs(202),
+        RecordingLocator::new(PathBuf::from(format!("{CAMERA}/segment-1.mp4.empty")))
+            .unwrap_or_else(|error| panic!("locator: {error}")),
+        RecordingContainer::FragmentedMp4,
+        VideoCodec::H264,
+        320,
+        240,
+        0,
+        MetadataProvenance::Recorder,
+    )
+    .unwrap_or_else(|error| panic!("completed evidence: {error}"));
+    drop(recording);
+
+    let outcome = assembler(root)
+        .start_recording(&empty, RecordingVideoExtent::Full)
+        .await;
+    assert!(
+        outcome.is_err(),
+        "a recording FFmpeg cannot open must fail before the handler writes 200 OK"
+    );
 }

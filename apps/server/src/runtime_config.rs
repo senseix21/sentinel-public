@@ -9,6 +9,10 @@ use std::{
     time::Duration,
 };
 
+use surveillance_camera::{
+    ffmpeg::{FfmpegCaptureBackend, FfmpegSourceConfig, WebcamInput},
+    source::H264SourceConfig,
+};
 use surveillance_config::{
     classification::{Origin, SettingId},
     defaults, environment, file,
@@ -48,6 +52,14 @@ const DETECTION_QUEUE_ITEMS: &str = "SURVEILLANCE_DETECTION_QUEUE_ITEMS";
 const DETECTION_SAMPLE_FPS: &str = "SURVEILLANCE_DETECTION_SAMPLE_FPS";
 const DETECTION_MAX_GAP_MS: &str = "SURVEILLANCE_DETECTION_MAX_GAP_MS";
 const CONFIG_FILE: &str = "SURVEILLANCE_CONFIG_FILE";
+const WEBCAM_DEVICE: &str = "SURVEILLANCE_WEBCAM_DEVICE";
+const WEBCAM_BACKEND: &str = "SURVEILLANCE_WEBCAM_BACKEND";
+const WEBCAM_FPS: &str = "SURVEILLANCE_WEBCAM_FPS";
+const WEBCAM_BITRATE_KBPS: &str = "SURVEILLANCE_WEBCAM_BITRATE_KBPS";
+const WEBCAM_KEYFRAME_INTERVAL: &str = "SURVEILLANCE_WEBCAM_KEYFRAME_INTERVAL";
+const WEBCAM_STARTUP_TIMEOUT_SECONDS: &str = "SURVEILLANCE_WEBCAM_STARTUP_TIMEOUT_SECONDS";
+const WEBCAM_READ_TIMEOUT_SECONDS: &str = "SURVEILLANCE_WEBCAM_READ_TIMEOUT_SECONDS";
+const WEBCAM_PARSER_BYTES: &str = "SURVEILLANCE_WEBCAM_PARSER_BYTES";
 
 /// The bootstrap layers: compiled defaults, an optional file, and the
 /// environment.
@@ -237,6 +249,122 @@ pub fn load_database_from_environment() -> Result<Option<DatabaseConfig>, Enviro
 #[must_use]
 pub fn load_ffmpeg_from_environment() -> PathBuf {
     std::env::var(FFMPEG).map_or_else(|_| PathBuf::from("ffmpeg"), PathBuf::from)
+}
+
+/// Builds an optional typed local-webcam source. Absence preserves the direct
+/// RTSP path. The API accepts no arbitrary `FFmpeg` arguments.
+///
+/// # Errors
+/// Returns a credential-free configuration error for an invalid backend,
+/// numeric bound, or source invariant.
+pub fn load_webcam_source_from_environment(
+    width: u32,
+    height: u32,
+    max_access_unit_bytes: usize,
+    max_nals_per_access_unit: usize,
+) -> Result<Option<H264SourceConfig>, EnvironmentConfigError> {
+    load_webcam_source_with(
+        |key| std::env::var(key).ok(),
+        width,
+        height,
+        max_access_unit_bytes,
+        max_nals_per_access_unit,
+    )
+}
+
+fn load_webcam_source_with(
+    lookup: impl Fn(&str) -> Option<String>,
+    width: u32,
+    height: u32,
+    max_access_unit_bytes: usize,
+    max_nals_per_access_unit: usize,
+) -> Result<Option<H264SourceConfig>, EnvironmentConfigError> {
+    let Some(device) = lookup(WEBCAM_DEVICE).filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let backend_name = lookup(WEBCAM_BACKEND).unwrap_or_else(default_webcam_backend);
+    let backend = match backend_name.as_str() {
+        "avfoundation" => FfmpegCaptureBackend::AvFoundation,
+        "v4l2" => FfmpegCaptureBackend::Video4Linux2,
+        "dshow" => FfmpegCaptureBackend::DirectShow,
+        _ => return Err(EnvironmentConfigError::InvalidWebcamBackend),
+    };
+    let fps = positive_u32_override(&lookup, WEBCAM_FPS, 15)?;
+    let bitrate_kbps = positive_u32_override(&lookup, WEBCAM_BITRATE_KBPS, 1_500)?;
+    let keyframe_interval = positive_u32_override(&lookup, WEBCAM_KEYFRAME_INTERVAL, fps)?;
+    let startup_timeout = positive_u64_override(&lookup, WEBCAM_STARTUP_TIMEOUT_SECONDS, 15)?;
+    let read_timeout = positive_u64_override(&lookup, WEBCAM_READ_TIMEOUT_SECONDS, 5)?;
+    let minimum_parser_bytes = max_access_unit_bytes
+        .checked_add(8)
+        .ok_or(EnvironmentConfigError::InvalidWebcamConfiguration)?;
+    let parser_bytes = lookup(WEBCAM_PARSER_BYTES).map_or(Ok(minimum_parser_bytes), |value| {
+        value
+            .parse::<usize>()
+            .ok()
+            .filter(|value| *value != 0)
+            .ok_or(EnvironmentConfigError::InvalidPositiveInteger(
+                WEBCAM_PARSER_BYTES,
+            ))
+    })?;
+    let input = WebcamInput::new(backend, device)
+        .map_err(|_| EnvironmentConfigError::InvalidWebcamConfiguration)?;
+    FfmpegSourceConfig::webcam(
+        lookup(FFMPEG).map_or_else(|| PathBuf::from("ffmpeg"), PathBuf::from),
+        input,
+        width,
+        height,
+        fps,
+        bitrate_kbps,
+        keyframe_interval,
+        Duration::from_secs(startup_timeout),
+        Duration::from_secs(read_timeout),
+        max_access_unit_bytes,
+        max_nals_per_access_unit,
+        parser_bytes,
+    )
+    .map(H264SourceConfig::from)
+    .map(Some)
+    .map_err(|_| EnvironmentConfigError::InvalidWebcamConfiguration)
+}
+
+fn default_webcam_backend() -> String {
+    if cfg!(target_os = "macos") {
+        "avfoundation".to_owned()
+    } else if cfg!(target_os = "linux") {
+        "v4l2".to_owned()
+    } else if cfg!(target_os = "windows") {
+        "dshow".to_owned()
+    } else {
+        "unsupported".to_owned()
+    }
+}
+
+fn positive_u32_override(
+    lookup: &impl Fn(&str) -> Option<String>,
+    key: &'static str,
+    default: u32,
+) -> Result<u32, EnvironmentConfigError> {
+    lookup(key).map_or(Ok(default), |value| {
+        value
+            .parse::<u32>()
+            .ok()
+            .filter(|value| *value != 0)
+            .ok_or(EnvironmentConfigError::InvalidPositiveInteger(key))
+    })
+}
+
+fn positive_u64_override(
+    lookup: &impl Fn(&str) -> Option<String>,
+    key: &'static str,
+    default: u64,
+) -> Result<u64, EnvironmentConfigError> {
+    lookup(key).map_or(Ok(default), |value| {
+        value
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value != 0)
+            .ok_or(EnvironmentConfigError::InvalidPositiveInteger(key))
+    })
 }
 
 fn load_database_with(
@@ -442,6 +570,8 @@ pub enum EnvironmentConfigError {
     HealthBindNotLoopback,
     InvalidDatabaseConfiguration,
     InvalidRetentionConfiguration,
+    InvalidWebcamBackend,
+    InvalidWebcamConfiguration,
     /// A named configuration file that is unreadable, malformed, or contains an
     /// unknown key. Startup fails rather than skipping it.
     InvalidConfigurationFile(String),
@@ -493,6 +623,12 @@ impl fmt::Display for EnvironmentConfigError {
             Self::InvalidRetentionConfiguration => {
                 formatter.write_str("retention configuration is invalid")
             }
+            Self::InvalidWebcamBackend => {
+                formatter.write_str("webcam backend must be avfoundation, v4l2, or dshow")
+            }
+            Self::InvalidWebcamConfiguration => {
+                formatter.write_str("webcam source configuration is invalid")
+            }
         }
     }
 }
@@ -503,7 +639,7 @@ impl Error for EnvironmentConfigError {}
 mod tests {
     use super::{
         defaults, load_database_with, load_health_bind_with, load_retention, load_supervision_with,
-        load_with, EnvironmentConfigError, ResolvedSettings,
+        load_webcam_source_with, load_with, EnvironmentConfigError, ResolvedSettings,
     };
     use std::{collections::HashMap, time::Duration};
 
@@ -695,5 +831,30 @@ mod tests {
         let previous = surveillance_storage::retention::StorageWatermarks::new(80, 90, 97, 2)
             .unwrap_or_else(|error| panic!("previous constants were legal: {error:?}"));
         assert_eq!(watermarks, previous);
+    }
+
+    #[test]
+    fn webcam_source_is_opt_in_and_typed() {
+        assert!(load_webcam_source_with(|_| None, 640, 360, 1024, 16)
+            .expect("absent webcam")
+            .is_none());
+        let values = HashMap::from([
+            ("SURVEILLANCE_WEBCAM_DEVICE", "Camera Name With Spaces"),
+            ("SURVEILLANCE_WEBCAM_BACKEND", "dshow"),
+            ("SURVEILLANCE_WEBCAM_FPS", "20"),
+        ]);
+        let source = load_webcam_source_with(
+            |key| values.get(key).map(|value| (*value).to_owned()),
+            640,
+            360,
+            1024,
+            16,
+        )
+        .expect("valid webcam")
+        .expect("configured webcam");
+        assert_eq!(
+            source.kind(),
+            surveillance_camera::source::H264SourceKind::FfmpegWebcam
+        );
     }
 }

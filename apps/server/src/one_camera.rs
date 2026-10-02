@@ -13,7 +13,7 @@ use surveillance_camera::{
     health::{
         camera_health_channel, CameraHealthPublisher, CameraHealthReader, CameraOperationalMetrics,
     },
-    rtsp::RtspSourceConfig,
+    source::H264SourceConfig,
     supervisor::{
         run_h264_camera_observed, JitterSource, ReconnectPolicy, SupervisorCounters,
         SupervisorExit, SupervisorStopReason,
@@ -169,7 +169,7 @@ pub fn one_camera_health(
 /// Inputs whose ownership defines one complete camera-to-recorder pipeline.
 pub struct OneCameraRuntime<'a, J> {
     pub camera_id: &'a CameraId,
-    pub source: &'a RtspSourceConfig,
+    pub source: &'a H264SourceConfig,
     pub distributor: MediaDistributor<H264AccessUnit>,
     pub recorder_subscription: MediaSubscriber<H264AccessUnit>,
     pub reconnect: ReconnectPolicy,
