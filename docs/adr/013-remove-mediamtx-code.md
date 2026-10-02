@@ -33,6 +33,30 @@ Historical evidence documents remain historical records; they are not runnable
 instructions. Current documentation must not claim that the removed fixtures
 are available.
 
+## Separately accepted fixture losses
+
+The decision above permits removal only where equivalent behavior is executable
+or the loss is separately accepted. No replacement is executable yet, so each
+deletion below is recorded here as an accepted loss rather than a replacement.
+Accepting a loss is not the same as covering it: every row names a regression
+gate that is currently unverified.
+
+| Deleted asset | Gate now unverified | Interim coverage | Restores when |
+|---|---|---|---|
+| `scripts/dev/local-stack.sh` | webcam/database/LiveKit/dashboard/recording bring-up through a proxy | **Replaced**, not lost: `scripts/dev/local-webcam-stack.sh` performs the same bring-up with no RTSP hop | n/a |
+| `scripts/phase0/retina-rtsp-fixture.sh` | RTSP authentication, interleaved TCP, reconnect, saturation | none; the FFmpeg webcam source exercises no RTSP transport at all | an owned RTSP test peer is selected and an ADR records it |
+| `crates/camera/tests/retina_mediamtx.rs` | external Retina protocol contract | none | same owned RTSP peer |
+| `scripts/phase0/rtsp-reconnect-fixture.sh` | deterministic source outage and recovery | partial: `FfmpegH264Session` startup/read timeouts and supervisor backoff are unit-tested, which is not transport reconnect | same owned RTSP peer |
+| `scripts/phase3/multi-camera-fixture.sh` | ten-camera mechanics and two-camera failure isolation | none | a deterministic multi-source fixture exists |
+| `scripts/phase5/livekit-fixture.sh` | real LiveKit subscriber publication | none automated; last manual evidence 2026-08-17 | a source-backed LiveKit fixture exists |
+| `scripts/phase9/authenticated-ui-fixture.sh` | full authenticated browser stack | none automated; Node UI unit tests cover screen logic only | a source-backed browser fixture exists |
+| `scripts/phase9/livekit-load-fixture.sh` | concurrent viewer and load mechanics | none | a deterministic load fixture exists |
+
+Until every row above is closed, no claim of RTSP transport, authentication,
+reconnect, multi-camera isolation, LiveKit publication, browser, or load
+coverage is supported by an executable gate. `ROADMAP.md` Phase 9 and the
+current `context/` snapshot carry this as open work.
+
 ## Consequences
 
 - The shipped production topology is unchanged: camera to Retina ingestion to
