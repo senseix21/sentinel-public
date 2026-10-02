@@ -34,6 +34,12 @@ prerequisites: ## Verify required manual-run executables are available.
 	@command -v "$(FFMPEG_BIN)" >/dev/null || { echo "missing FFmpeg" >&2; exit 1; }
 	@command -v "$(CURL_BIN)" >/dev/null || { echo "missing curl" >&2; exit 1; }
 	@command -v ffprobe >/dev/null || { echo "missing ffprobe" >&2; exit 1; }
+	@command -v initdb >/dev/null || { echo "missing PostgreSQL initdb" >&2; exit 1; }
+	@command -v pg_ctl >/dev/null || { echo "missing PostgreSQL pg_ctl" >&2; exit 1; }
+	@command -v psql >/dev/null || { echo "missing PostgreSQL psql" >&2; exit 1; }
+	@command -v livekit-server >/dev/null || { echo "missing LiveKit livekit-server" >&2; exit 1; }
+	@command -v lsof >/dev/null || { echo "missing lsof" >&2; exit 1; }
+	@command -v python3 >/dev/null || { echo "missing python3" >&2; exit 1; }
 
 webcam-devices: ## List macOS AVFoundation video and audio device indices.
 	@"$(FFMPEG_BIN)" -hide_banner -f avfoundation -list_devices true -i "" 2>&1 || true

@@ -168,10 +168,12 @@ Create a reproducible Rust workspace that builds cleanly and establishes enforce
   `audit`; `.github/workflows/audit.yml` runs the advisory half daily and on
   demand, so a newly published advisory does not red an unrelated pull request.
 - [~] Record required GStreamer/FFmpeg system packages for macOS development and target Linux deployment.
-  macOS prerequisites are in `README.md` and checked by `make prerequisites`.
-  The target Linux packages cannot be recorded while the deployment
-  distribution is unconfirmed (Phase 8). GStreamer is used only by the
-  uncompiled prototype.
+  macOS prerequisites are in `README.md` and checked by `make prerequisites`,
+  which now covers every executable `scripts/dev/local-webcam-stack.sh`
+  requires; the earlier list omitted PostgreSQL and Python 3, so a reader could
+  fail before the stack launched. The target Linux packages cannot be recorded
+  while the deployment distribution is unconfirmed (Phase 8). GStreamer is used
+  only by the uncompiled prototype.
 - [x] Add a configuration example with safe local defaults and no secrets.
   `config/example.toml` binds loopback, leaves the mutating surface disabled,
   and states that credentials come from the Phase 8 secret boundary.

@@ -45,9 +45,10 @@ recording, and downstream consumers.
 Required commands:
 
 - Rust 1.88 or newer (`cargo` and `rustc`)
+- PostgreSQL (`initdb`, `pg_ctl`, and `psql`)
 - FFmpeg (`ffmpeg`, `ffprobe`, and optionally `ffplay`)
 - LiveKit Server (`livekit-server`)
-- `curl` and `lsof`
+- Python 3 (`python3`), `curl`, and `lsof`
 
 On macOS, install the third-party services with your preferred package manager,
 then verify the basic media tools:
