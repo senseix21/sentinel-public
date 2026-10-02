@@ -24,6 +24,8 @@ use tokio::{
 use crate::connection::{RetryableCameraFailure, TerminalCameraFailure};
 
 const READ_CHUNK_BYTES: usize = 16 * 1024;
+const STDERR_TAIL_BYTES: usize = 2 * 1024;
+const STDERR_SETTLE: Duration = Duration::from_millis(250);
 const H264_TIMEBASE_HZ: u32 = 90_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -409,7 +411,7 @@ impl Error for FfmpegSourceConfigError {}
 pub struct FfmpegH264Session {
     child: Child,
     reader: AnnexBAccessUnitReader<ChildStdout>,
-    stderr_drain: JoinHandle<Result<u64, io::Error>>,
+    stderr: JoinHandle<Result<StderrCapture, io::Error>>,
     prefetched: Option<Arc<H264AccessUnit>>,
     read_timeout: Duration,
 }
@@ -432,7 +434,7 @@ impl FfmpegH264Session {
             .stderr
             .take()
             .ok_or(FfmpegConnectError::MissingStderr)?;
-        let stderr_drain = tokio::spawn(drain(stderr));
+        let stderr = tokio::spawn(collect_stderr(stderr));
         let mut reader = AnnexBAccessUnitReader::new(
             stdout,
             config.frames_per_second,
@@ -443,34 +445,26 @@ impl FfmpegH264Session {
         let prefetched = match tokio::time::timeout(config.startup_timeout, reader.next()).await {
             Ok(Ok(Some(access_unit))) => access_unit,
             Ok(Ok(None)) => {
-                terminate_child(&mut child).await;
-                stderr_drain.abort();
-                let _ = stderr_drain.await;
-                return Err(FfmpegConnectError::EndedBeforeReadiness);
+                let diagnostic = terminate_and_diagnose(&mut child, stderr).await;
+                return Err(FfmpegConnectError::EndedBeforeReadiness(diagnostic));
             }
             Ok(Err(error)) => {
-                terminate_child(&mut child).await;
-                stderr_drain.abort();
-                let _ = stderr_drain.await;
-                return Err(FfmpegConnectError::Readiness(error));
+                let diagnostic = terminate_and_diagnose(&mut child, stderr).await;
+                return Err(FfmpegConnectError::Readiness(error, diagnostic));
             }
             Err(_) => {
-                terminate_child(&mut child).await;
-                stderr_drain.abort();
-                let _ = stderr_drain.await;
-                return Err(FfmpegConnectError::StartupTimeout);
+                let diagnostic = terminate_and_diagnose(&mut child, stderr).await;
+                return Err(FfmpegConnectError::StartupTimeout(diagnostic));
             }
         };
         if !prefetched.is_keyframe() || !prefetched.has_parameter_sets() {
-            terminate_child(&mut child).await;
-            stderr_drain.abort();
-            let _ = stderr_drain.await;
-            return Err(FfmpegConnectError::MissingDecodableStart);
+            let diagnostic = terminate_and_diagnose(&mut child, stderr).await;
+            return Err(FfmpegConnectError::MissingDecodableStart(diagnostic));
         }
         Ok(Self {
             child,
             reader,
-            stderr_drain,
+            stderr,
             prefetched: Some(Arc::new(prefetched)),
             read_timeout: config.read_timeout,
         })
@@ -509,12 +503,12 @@ impl FfmpegH264Session {
                 ))
             }
         }
-        match tokio::time::timeout(timeout, &mut self.stderr_drain).await {
+        match tokio::time::timeout(timeout, &mut self.stderr).await {
             Ok(Ok(Ok(_))) => Ok(()),
             Ok(Ok(Err(error))) => Err(error),
             Ok(Err(error)) => Err(io::Error::other(error)),
             Err(_) => {
-                self.stderr_drain.abort();
+                self.stderr.abort();
                 Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "FFmpeg stderr drain join timed out",
@@ -530,15 +524,105 @@ async fn terminate_child(child: &mut Child) {
     }
 }
 
-async fn drain(mut reader: impl AsyncRead + Unpin) -> Result<u64, io::Error> {
-    let mut total = 0_u64;
+/// What the child wrote to stderr: the total, and a bounded tail of the text.
+///
+/// The tail exists because discarding it leaves an operator with
+/// "ended before producing media" and no cause. A missing device, a denied
+/// camera permission, an unsupported capture mode and an absent encoder are
+/// indistinguishable without it, and `FFmpeg` names all four precisely.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StderrCapture {
+    total: u64,
+    tail: Vec<u8>,
+}
+
+impl StderrCapture {
+    #[must_use]
+    pub const fn total(&self) -> u64 {
+        self.total
+    }
+
+    #[must_use]
+    pub fn diagnostic(&self) -> Diagnostic {
+        Diagnostic::from_tail(&self.tail)
+    }
+}
+
+/// A redacted, bounded `FFmpeg` stderr tail attached to a startup failure.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Diagnostic(String);
+
+impl Diagnostic {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn from_tail(tail: &[u8]) -> Self {
+        let text = String::from_utf8_lossy(tail);
+        Self(redact_credentials(text.trim()))
+    }
+}
+
+/// Masks `scheme://user:secret@host` so a diagnostic can be logged verbatim.
+fn redact_credentials(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(scheme_end) = rest.find("://") {
+        let after = scheme_end + 3;
+        let authority_end = rest[after..]
+            .find(['/', ' ', '\t', '\n', '"', '\''])
+            .map_or(rest.len(), |offset| after + offset);
+        out.push_str(&rest[..after]);
+        let authority = &rest[after..authority_end];
+        if let Some(at) = authority.rfind('@') {
+            out.push_str("***:***@");
+            out.push_str(&authority[at + 1..]);
+        } else {
+            out.push_str(authority);
+        }
+        rest = &rest[authority_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+async fn collect_stderr(mut reader: impl AsyncRead + Unpin) -> Result<StderrCapture, io::Error> {
+    let mut capture = StderrCapture::default();
     let mut buffer = [0_u8; 4 * 1024];
     loop {
         let read = reader.read(&mut buffer).await?;
         if read == 0 {
-            return Ok(total);
+            return Ok(capture);
         }
-        total = total.saturating_add(read as u64);
+        capture.total = capture.total.saturating_add(read as u64);
+        capture.tail.extend_from_slice(&buffer[..read]);
+        if capture.tail.len() > STDERR_TAIL_BYTES {
+            let excess = capture.tail.len() - STDERR_TAIL_BYTES;
+            capture.tail.drain(..excess);
+        }
+    }
+}
+
+/// Kills the child, then reads what it managed to say.
+///
+/// Order matters: killing the child closes stderr, which ends the collector, so
+/// the tail arrives without waiting on a process that is never going to exit.
+/// A failure to collect yields an empty diagnostic rather than masking the
+/// original error.
+async fn terminate_and_diagnose(
+    child: &mut Child,
+    stderr: JoinHandle<Result<StderrCapture, io::Error>>,
+) -> Diagnostic {
+    terminate_child(child).await;
+    match tokio::time::timeout(STDERR_SETTLE, stderr).await {
+        Ok(Ok(Ok(capture))) => capture.diagnostic(),
+        _ => Diagnostic::default(),
     }
 }
 
@@ -547,10 +631,10 @@ pub enum FfmpegConnectError {
     Spawn(io::Error),
     MissingStdout,
     MissingStderr,
-    StartupTimeout,
-    EndedBeforeReadiness,
-    MissingDecodableStart,
-    Readiness(FfmpegReadError),
+    StartupTimeout(Diagnostic),
+    EndedBeforeReadiness(Diagnostic),
+    MissingDecodableStart(Diagnostic),
+    Readiness(FfmpegReadError, Diagnostic),
 }
 
 impl FfmpegConnectError {
@@ -562,19 +646,36 @@ impl FfmpegConnectError {
             }
             Self::MissingStdout
             | Self::MissingStderr
-            | Self::MissingDecodableStart
-            | Self::Readiness(FfmpegReadError::InvalidMedia(_)) => {
+            | Self::MissingDecodableStart(_)
+            | Self::Readiness(FfmpegReadError::InvalidMedia(_), _) => {
                 Some(TerminalCameraFailure::UnsupportedMedia)
             }
             _ => None,
         }
     }
 
+    /// The child's redacted stderr tail, when the failure carries one.
+    ///
+    /// Retry classification deliberately does not consult this. Deciding
+    /// "permanent" from stderr text would be a heuristic over `FFmpeg`'s wording,
+    /// and misclassifying a transient failure as terminal stops a camera for
+    /// good. The text is for the operator; the category stays structural.
+    #[must_use]
+    pub const fn diagnostic(&self) -> Option<&Diagnostic> {
+        match self {
+            Self::StartupTimeout(diagnostic)
+            | Self::EndedBeforeReadiness(diagnostic)
+            | Self::MissingDecodableStart(diagnostic)
+            | Self::Readiness(_, diagnostic) => Some(diagnostic),
+            Self::Spawn(_) | Self::MissingStdout | Self::MissingStderr => None,
+        }
+    }
+
     #[must_use]
     pub const fn retryable_failure(&self) -> RetryableCameraFailure {
         match self {
-            Self::StartupTimeout => RetryableCameraFailure::Timeout,
-            Self::EndedBeforeReadiness => RetryableCameraFailure::EndOfStream,
+            Self::StartupTimeout(_) => RetryableCameraFailure::Timeout,
+            Self::EndedBeforeReadiness(_) => RetryableCameraFailure::EndOfStream,
             _ => RetryableCameraFailure::TransportProtocol,
         }
     }
@@ -587,23 +688,44 @@ impl fmt::Display for FfmpegConnectError {
             Self::MissingStdout | Self::MissingStderr => {
                 formatter.write_str("FFmpeg source process pipes were not available")
             }
-            Self::StartupTimeout => formatter.write_str("FFmpeg source readiness timed out"),
-            Self::EndedBeforeReadiness => {
-                formatter.write_str("FFmpeg source ended before producing media")
+            Self::StartupTimeout(diagnostic) => {
+                write_reason(formatter, "FFmpeg source readiness timed out", diagnostic)
             }
-            Self::MissingDecodableStart => {
-                formatter.write_str("FFmpeg source did not begin with parameterized keyframe")
-            }
-            Self::Readiness(error) => write!(formatter, "FFmpeg source media was invalid: {error}"),
+            Self::EndedBeforeReadiness(diagnostic) => write_reason(
+                formatter,
+                "FFmpeg source ended before producing media",
+                diagnostic,
+            ),
+            Self::MissingDecodableStart(diagnostic) => write_reason(
+                formatter,
+                "FFmpeg source did not begin with parameterized keyframe",
+                diagnostic,
+            ),
+            Self::Readiness(error, diagnostic) => write_reason(
+                formatter,
+                &format!("FFmpeg source media was invalid: {error}"),
+                diagnostic,
+            ),
         }
     }
+}
+
+fn write_reason(
+    formatter: &mut fmt::Formatter<'_>,
+    message: &str,
+    diagnostic: &Diagnostic,
+) -> fmt::Result {
+    if diagnostic.is_empty() {
+        return formatter.write_str(message);
+    }
+    write!(formatter, "{message}; FFmpeg said: {}", diagnostic.as_str())
 }
 
 impl Error for FfmpegConnectError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Spawn(error) => Some(error),
-            Self::Readiness(error) => Some(error),
+            Self::Readiness(error, _) => Some(error),
             _ => None,
         }
     }
@@ -1016,6 +1138,42 @@ mod tests {
             .unwrap_or_else(|error| panic!("stop synthetic source: {error}"));
     }
 
+    #[test]
+    fn redacts_credentials_from_a_diagnostic() {
+        let raw =
+            b"[rtsp @ 0x1] method DESCRIBE failed for rtsp://admin:hunter2@10.0.0.11:554/live\n";
+        let diagnostic = super::Diagnostic::from_tail(raw);
+        assert!(
+            !diagnostic.as_str().contains("hunter2"),
+            "a diagnostic must never carry a password: {}",
+            diagnostic.as_str()
+        );
+        assert!(diagnostic.as_str().contains("***:***@10.0.0.11:554/live"));
+    }
+
+    #[test]
+    fn keeps_a_bounded_tail_of_what_the_child_said() {
+        let mut raw = vec![b'x'; super::STDERR_TAIL_BYTES * 3];
+        raw.extend_from_slice(b"Permission denied");
+        let diagnostic = super::Diagnostic::from_tail(&raw[raw.len() - super::STDERR_TAIL_BYTES..]);
+        assert!(
+            diagnostic.as_str().ends_with("Permission denied"),
+            "the newest output is the part worth keeping"
+        );
+        assert!(diagnostic.as_str().len() <= super::STDERR_TAIL_BYTES);
+    }
+
+    #[test]
+    fn an_empty_diagnostic_does_not_change_the_message() {
+        assert_eq!(
+            format!(
+                "{}",
+                super::FfmpegConnectError::StartupTimeout(super::Diagnostic::default())
+            ),
+            "FFmpeg source readiness timed out"
+        );
+    }
+
     #[cfg(unix)]
     mod cancellation {
         use super::super::{FfmpegH264Session, FfmpegSourceConfig};
@@ -1042,6 +1200,9 @@ mod tests {
             script_path
         }
 
+        /// Whether a pid is a live process. A reaped-or-zombie entry is dead:
+        /// `kill_on_drop` sends SIGKILL, and the corpse can outlive the signal
+        /// by a few milliseconds, which is not a leak.
         fn running(pid: &str) -> bool {
             let output = StdCommand::new("ps")
                 .args(["-o", "stat=", "-p", pid])
@@ -1051,8 +1212,14 @@ mod tests {
             !state.is_empty() && !state.starts_with('Z')
         }
 
+        /// Waits until the child has recorded its own pid.
+        ///
+        /// Reading this *before* cancelling is what makes the test sound. An
+        /// earlier version cancelled on a timer and only then looked for the
+        /// child, so the observation raced the kill it was meant to detect and
+        /// the test passed whether or not the fix was present.
         async fn settled_pid(pid_path: &Path) -> String {
-            for _ in 0..200 {
+            for _ in 0..400 {
                 if let Ok(contents) = std::fs::read_to_string(pid_path) {
                     let pid = contents.trim().to_owned();
                     if !pid.is_empty() {
@@ -1064,6 +1231,52 @@ mod tests {
             panic!("stalled executable never reported its pid");
         }
 
+        fn failing_executable(directory: &Path, message: &str) -> PathBuf {
+            let script_path = directory.join("failing-ffmpeg");
+            std::fs::write(
+                &script_path,
+                format!("#!/bin/sh\nprintf '%s\\n' \"{message}\" >&2\nexit 1\n"),
+            )
+            .unwrap_or_else(|error| panic!("write failing executable: {error}"));
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+                .unwrap_or_else(|error| panic!("mark failing executable runnable: {error}"));
+            script_path
+        }
+
+        #[tokio::test]
+        async fn a_failing_child_reports_its_own_stderr() {
+            let directory =
+                std::env::temp_dir().join(format!("ffmpeg-diagnostic-{}", std::process::id()));
+            std::fs::create_dir_all(&directory)
+                .unwrap_or_else(|error| panic!("create fixture directory: {error}"));
+            let max_access_unit_bytes = 2 * 1024 * 1024;
+            let config = FfmpegSourceConfig::synthetic(
+                failing_executable(&directory, "Permission denied: camera"),
+                640,
+                360,
+                15,
+                500,
+                15,
+                Duration::from_secs(5),
+                Duration::from_secs(2),
+                max_access_unit_bytes,
+                128,
+                max_access_unit_bytes + 8,
+            )
+            .unwrap_or_else(|error| panic!("valid source: {error}"));
+
+            let error = FfmpegH264Session::start(&config)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("a child that exits without media must fail"));
+            let reported = format!("{error}");
+            let _ = std::fs::remove_dir_all(&directory);
+            assert!(
+                reported.contains("Permission denied: camera"),
+                "the operator must be told the cause, got: {reported}"
+            );
+        }
+
         #[tokio::test]
         async fn cancelling_startup_does_not_leak_the_child() {
             let directory = std::env::temp_dir()
@@ -1071,6 +1284,7 @@ mod tests {
             std::fs::create_dir_all(&directory)
                 .unwrap_or_else(|error| panic!("create fixture directory: {error}"));
             let pid_path = directory.join("child.pid");
+            let _ = std::fs::remove_file(&pid_path);
             let max_access_unit_bytes = 2 * 1024 * 1024;
             let config = FfmpegSourceConfig::synthetic(
                 stalled_executable(&directory),
@@ -1087,22 +1301,19 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("valid source: {error}"));
 
-            let started = tokio::time::Instant::now();
-            let outcome = tokio::time::timeout(
-                Duration::from_millis(750),
-                FfmpegH264Session::start(&config),
-            )
-            .await;
-            assert!(
-                outcome.is_err(),
-                "a source that never emits media must not become ready"
-            );
-            assert!(
-                started.elapsed() < Duration::from_secs(30),
-                "the startup timeout must not have elapsed, so the future was cancelled"
-            );
-
+            // Start without a deadline, then cancel by aborting the task. The
+            // future is dropped at its await point, which is exactly what a
+            // supervisor shutdown inside the startup window does.
+            let startup =
+                tokio::spawn(async move { FfmpegH264Session::start(&config).await.map(|_| ()) });
             let pid = settled_pid(&pid_path).await;
+            assert!(
+                running(&pid),
+                "the fixture child must be alive before cancellation, or this test proves nothing"
+            );
+            startup.abort();
+            let _ = startup.await;
+
             for _ in 0..200 {
                 if !running(&pid) {
                     let _ = std::fs::remove_dir_all(&directory);
