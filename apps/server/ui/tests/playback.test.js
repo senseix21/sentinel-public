@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { contiguousRuns, coverageBuckets, playbackPath, playbackTime, recordingSearchPath, recordingVideoPath, searchRange, startPlayback, stopPlayback, togglePlayback, wallTimeToUtc } from "../js/playback.js";
+import { contiguousRuns, coverageBuckets, mediaErrorMessage, playbackPath, playbackTime, recordingSearchPath, recordingVideoPath, searchRange, startPlayback, stopPlayback, togglePlayback, wallTimeToUtc } from "../js/playback.js";
 
 test("search uses the server start/end names", () => {
   const range = searchRange({ date: "2026-08-18", from: "01:02:03", to: "04:05:06" });
@@ -73,4 +73,31 @@ test("the play action loads the selected run before starting it", async () => {
   await startPlayback(video, "/recordings/run-one");
 
   assert.deepEqual(calls, ["pause", "src:/recordings/run-one", "load", "play"]);
+});
+
+test("a wall time that happens twice is refused rather than guessed", () => {
+  // 2026-11-01 01:30 US Eastern is both 05:30Z and 06:30Z. Returning either
+  // one silently searches an hour the operator did not ask for.
+  assert.throws(
+    () => wallTimeToUtc("2026-11-01", "01:30:00", "America/New_York"),
+    /happens twice/,
+  );
+  // The hour either side is unambiguous and must still resolve.
+  assert.equal(wallTimeToUtc("2026-11-01", "00:30:00", "America/New_York"), "2026-11-01T04:30:00Z");
+  assert.equal(wallTimeToUtc("2026-11-01", "03:30:00", "America/New_York"), "2026-11-01T08:30:00Z");
+});
+
+test("a wall time that does not exist is still refused", () => {
+  assert.throws(
+    () => wallTimeToUtc("2026-03-08", "02:30:00", "America/New_York"),
+    /does not exist/,
+  );
+});
+
+test("media failures get operator language instead of silence", () => {
+  assert.match(mediaErrorMessage({ error: { code: 4 } }), /would not stream/);
+  assert.match(mediaErrorMessage({ error: { code: 2 } }), /connection dropped/);
+  assert.match(mediaErrorMessage({ error: { code: 3 } }), /could not be decoded/);
+  assert.match(mediaErrorMessage({}), /could not be played/);
+  assert.match(mediaErrorMessage(null), /could not be played/);
 });

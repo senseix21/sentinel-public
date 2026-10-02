@@ -19,6 +19,10 @@ export const PLAYBACK_TIMEZONES = [
   { value: "Asia/Dhaka", label: "Bangladesh" },
 ];
 
+function wallText(parts) {
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}`;
+}
+
 function wallParts(instant, timezone) {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: timezone, hourCycle: "h23", year: "numeric", month: "2-digit",
@@ -42,10 +46,22 @@ export function wallTimeToUtc(date, time, timezone) {
     );
     instant += desiredWall - observedWall;
   }
-  const resolved = wallParts(new Date(instant), timezone);
-  const resolvedText = `${resolved.year}-${resolved.month}-${resolved.day}T${resolved.hour}:${resolved.minute}:${resolved.second}`;
+  const resolvedText = wallText(wallParts(new Date(instant), timezone));
   if (resolvedText !== `${date}T${time}`) {
     throw new RangeError("That local time does not exist because of a daylight-saving change.");
+  }
+  // A fall-back wall time happens twice. The fixpoint above converges on one of
+  // the two instants, and silently picking it searches an hour of footage the
+  // operator did not ask for, with nothing on screen to say so. Offsets shift
+  // by 60 minutes almost everywhere and by 30 in Lord Howe, so both deltas are
+  // probed in each direction.
+  const ambiguous = [-60, -30, 30, 60].some(
+    (minutes) => wallText(wallParts(new Date(instant + minutes * 60_000), timezone)) === resolvedText,
+  );
+  if (ambiguous) {
+    throw new RangeError(
+      "That local time happens twice because of a daylight-saving change. Search in UTC to choose which one.",
+    );
   }
   return new Date(instant).toISOString().replace(".000Z", "Z");
 }
@@ -74,6 +90,24 @@ export function recordingVideoPath(cameraId, recordingId, durationSeconds = null
     throw new RangeError("Duration must be a whole number from 1 to 60 seconds.");
   }
   return `${base}?duration_seconds=${seconds}`;
+}
+
+/// Plain operator language for a media failure.
+///
+/// The server's stable error codes are not reachable from here: the response is
+/// consumed by the media element, and re-requesting the URL to read its JSON
+/// body would issue a second export -- another audit row for footage nobody
+/// watched. So this reports what the element knows, which is still far better
+/// than the silence it replaced.
+export function mediaErrorMessage(video) {
+  const code = video && video.error ? video.error.code : 0;
+  if (code === 1) return "Playback was stopped before it finished.";
+  if (code === 2) return "The connection dropped while streaming this footage.";
+  if (code === 3) return "This footage could not be decoded.";
+  if (code === 4) {
+    return "The server would not stream this footage. A clip longer than the recording is the usual cause.";
+  }
+  return "This footage could not be played.";
 }
 
 export function startPlayback(video, url) {
