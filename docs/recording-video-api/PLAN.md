@@ -1,6 +1,8 @@
 # Recording Video API and UI Plan
 
-Status: proposed implementation plan  
+Status: slices 0-4 implemented; slice 5 (real media and measurements) and
+slice 6 (validation and handoff) not started. Checkboxes below are ticked from
+evidence, with `[~]` where only part of the item holds and the remainder named.  
 Date: 2026-09-05  
 Scope: recording-specific full-video retrieval with optional leading duration  
 Branch: `feature/ffmpeg-webcam-source`
@@ -248,10 +250,12 @@ backpressured by clip retrieval.
 
 ### Slice 0 — ADR and executable acceptance contract
 
-- [ ] Add an ADR amending ADR 004's reversible playback policy.
-- [ ] Record why a recording subresource is separate from time-range playback.
-- [ ] Accept the provisional stream-copy accuracy statement and reversal rule.
-- [ ] Add failing HTTP route/query tests and JS URL tests first.
+- [~] Add an ADR amending ADR 004's reversible playback policy.
+  ADR 014 exists and is accepted, but it does not state that it amends ADR 004's reversible playback policy; the amendment is unrecorded.
+- [x] Record why a recording subresource is separate from time-range playback.
+- [x] Accept the provisional stream-copy accuracy statement and reversal rule.
+- [x] Add failing HTTP route/query tests and JS URL tests first.
+  Route, query-parsing and JS URL coverage all exist. That they were written first is not evidenced after the fact and is not claimed.
 
 Exit gate:
 
@@ -260,12 +264,14 @@ Exit gate:
 
 ### Slice 1 — Domain parsing and assembler seam
 
-- [ ] Add `ClipDuration`, `RecordingVideoExtent`, and request parsing.
-- [ ] Reject missing/invalid identifiers before repository access.
-- [ ] Refactor safe-path/child construction helpers out of range-only assembly.
-- [ ] Add `start_recording` with no-duration and duration argument construction.
-- [ ] Ensure FFmpeg arguments are constructed without a shell.
-- [ ] Keep stderr handling bounded and ensure child cleanup on every error.
+- [x] Add `ClipDuration`, `RecordingVideoExtent`, and request parsing.
+- [x] Reject missing/invalid identifiers before repository access.
+- [~] Refactor safe-path/child construction helpers out of range-only assembly.
+  `validated_recording_path` serves the recording route; the range route still canonicalises each segment inline inside `start`, so the helper is added rather than shared.
+- [x] Add `start_recording` with no-duration and duration argument construction.
+- [x] Ensure FFmpeg arguments are constructed without a shell.
+- [~] Keep stderr handling bounded and ensure child cleanup on every error.
+  Child cleanup is covered: `kill_on_drop` plus explicit kill on every failure path. Stderr is sent to `Stdio::null()`, so it is bounded only by being discarded and an assembly failure carries no cause -- the same gap that was fixed on the camera source.
 
 Focused tests:
 
@@ -282,18 +288,20 @@ Exit gate:
 
 ### Slice 2 — Authenticated HTTP vertical slice
 
-- [ ] Recognize exactly
+- [x] Recognize exactly
   `/api/cameras/{camera}/recordings/{recording}/video`.
-- [ ] Route through the same context establishment and
+- [x] Route through the same context establishment and
   `Action::ExportRecording` chokepoint as time-range playback.
-- [ ] Resolve recording metadata by both camera ID and recording ID.
-- [ ] Confirm the durable file is a regular non-symlink beneath the configured
+- [x] Resolve recording metadata by both camera ID and recording ID.
+- [x] Confirm the durable file is a regular non-symlink beneath the configured
   root immediately before process start.
-- [ ] Stream fragmented MP4 with explicit honesty headers.
-- [ ] Count delivered media bytes and write success, refusal, cancellation, and
+- [x] Stream fragmented MP4 with explicit honesty headers.
+- [x] Count delivered media bytes and write success, refusal, cancellation, and
   failure export-audit outcomes.
-- [ ] Reuse configured playback stall/startup bounds and bounded-cardinality
+  A mid-stream failure previously discarded the byte count with the error, so no export row was written for footage that had already left; the delivered extent now travels inside the failure.
+- [x] Reuse configured playback stall/startup bounds and bounded-cardinality
   metrics.
+  The startup bound now gates readiness: both routes read the first chunk before returning, which is also what makes `409 recording_media_unavailable` reachable.
 
 HTTP tests:
 
@@ -312,11 +320,14 @@ Exit gate:
 
 ### Slice 3 — Response links and documentation
 
-- [ ] Add a stable `video` link to each `RecordingResponse`.
-- [ ] Keep the existing `playback` link during migration.
+- [x] Add a stable `video` link to each `RecordingResponse`.
+- [x] Keep the existing `playback` link during migration.
 - [ ] Document full and duration-bounded curl examples in `docs/API.md`.
-- [ ] Document accuracy, maximum duration, response headers, and errors.
+  `docs/API.md` carries only the route-table row. There are no curl examples for this route.
+- [~] Document accuracy, maximum duration, response headers, and errors.
+  The shared playback error table covers `recording_media_unavailable`, and accuracy is stated for the range route. `duration_seconds`, its 1..60 bound, and this route's own headers are not documented.
 - [ ] Update client system and architecture guides without claiming exact trim.
+  Neither `docs/CLIENT_SYSTEM_GUIDE.md` nor `docs/architecture.md` mentions this route.
 
 Recommended response fragment:
 
@@ -334,19 +345,21 @@ Exit gate:
 
 ### Slice 4 — Playback UI
 
-- [ ] Add `recordingVideoPath(cameraId, recordingId, durationSeconds)` to
+- [x] Add `recordingVideoPath(cameraId, recordingId, durationSeconds)` to
   `ui/js/playback.js` using `URLSearchParams`/`encodeURIComponent`.
-- [ ] Add a segment-row action for “Play full recording.”
-- [ ] Add a duration selector with `Full`, `5 seconds`, `10 seconds`, and a
+- [x] Add a segment-row action for “Play full recording.”
+- [x] Add a duration selector with `Full`, `5 seconds`, `10 seconds`, and a
   validated custom integer input.
-- [ ] Label the behavior “from recording start.”
-- [ ] Disable Play while the custom value is invalid or a request is starting.
-- [ ] Reuse the existing video element lifecycle: load, pause/resume, stop, and
+- [x] Label the behavior “from recording start.”
+- [~] Disable Play while the custom value is invalid or a request is starting.
+  An invalid custom duration is reported in the error banner after the click rather than preventing it; the button is never disabled.
+- [x] Reuse the existing video element lifecycle: load, pause/resume, stop, and
   disconnect cancellation.
-- [ ] Present stable server error codes in plain operator language.
-- [ ] Keep the existing “Play this run” time-range workflow for multiple
+- [~] Present stable server error codes in plain operator language.
+  Media failures now reach the error banner in plain language, where they were previously discarded. The server's stable codes are not shown: the response body is consumed by the media element, and re-requesting the URL to read it would issue a second export and a second audit row.
+- [x] Keep the existing “Play this run” time-range workflow for multiple
   contiguous segments.
-- [ ] Do not add a seek/speed control while `Accept-Ranges: none` remains true.
+- [x] Do not add a seek/speed control while `Accept-Ranges: none` remains true.
 
 UI tests:
 
