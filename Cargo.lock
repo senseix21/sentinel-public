@@ -3530,6 +3530,8 @@ name = "surveillance-detector"
 version = "0.1.0"
 dependencies = [
  "ort",
+ "serde",
+ "serde_json",
  "sha2",
  "surveillance-common",
  "surveillance-events",

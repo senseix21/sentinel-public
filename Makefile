@@ -21,7 +21,7 @@ RTSP_URL ?= $(SURVEILLANCE_RTSP_URL)
 RECORDING_ROOT ?= ./recordings
 HEALTH_BIND ?= 127.0.0.1:3000
 
-.PHONY: help prerequisites webcam-devices run run-release server direct-camera-qualification health live ready metrics recordings play verify-recordings check verify verify-onnx container-shell container-verify container-verify-onnx container-verify-model
+.PHONY: help prerequisites webcam-devices run run-release server direct-camera-qualification health live ready metrics recordings play verify-recordings check verify verify-onnx container-shell container-verify container-verify-onnx container-verify-model container-verify-accuracy
 
 help: ## Show manual development commands and configurable values.
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-20s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -179,6 +179,31 @@ container-verify-model: container-image ## Run DI.R8 on a real model. MODEL= FRA
 		"$(IMAGE)" cargo test -p surveillance-detector \
 		--features surveillance-detector/onnx-inference \
 		--test onnx_real_model -- --ignored --nocapture
+
+# DI.R10: the adapter across a set with ground truth. Build the set first with
+# scripts/detection/build-eval-set.py. MIN_RECALL and MIN_PRECISION have no
+# defaults on purpose — a measurement that asserts nothing is a report, and a
+# report cannot fail.
+MANIFEST ?=
+IOU ?= 50
+SCORE ?= 30
+MIN_RECALL ?=
+MIN_PRECISION ?=
+
+container-verify-accuracy: container-image ## Run DI.R10 on an evaluation set. MODEL= MANIFEST= MIN_RECALL= MIN_PRECISION=
+	@test -n "$(MODEL)" || { echo "MODEL= is required: a path in this repository to an .onnx artifact" >&2; exit 1; }
+	@test -n "$(MANIFEST)" || { echo "MANIFEST= is required: a path in this repository to a generated manifest.json" >&2; exit 1; }
+	@test -n "$(MIN_RECALL)" && test -n "$(MIN_PRECISION)" || { echo "MIN_RECALL= and MIN_PRECISION= are required: what this run has to beat to pass" >&2; exit 1; }
+	$(DOCKER_RUN) \
+		-e DETECTION_MODEL_PATH="/work/$(MODEL)" \
+		-e DETECTION_EVAL_MANIFEST="/work/$(MANIFEST)" \
+		-e DETECTION_EVAL_IOU="$(IOU)" \
+		-e DETECTION_SCORE_PERCENT="$(SCORE)" \
+		-e DETECTION_MIN_RECALL_PERCENT="$(MIN_RECALL)" \
+		-e DETECTION_MIN_PRECISION_PERCENT="$(MIN_PRECISION)" \
+		"$(IMAGE)" cargo test -p surveillance-detector \
+		--features surveillance-detector/onnx-inference \
+		--test onnx_accuracy -- --ignored --nocapture
 
 .PHONY: container-image
 .PHONY: audit

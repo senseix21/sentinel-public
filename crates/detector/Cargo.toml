@@ -23,3 +23,9 @@ surveillance-common = { path = "../common" }
 surveillance-events = { path = "../events" }
 surveillance-media = { path = "../media" }
 tokio.workspace = true
+
+[dev-dependencies]
+# The accuracy harness reads a generated manifest of frames and ground-truth
+# boxes. Development only: nothing in the crate parses JSON.
+serde.workspace = true
+serde_json.workspace = true
