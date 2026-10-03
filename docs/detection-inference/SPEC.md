@@ -177,6 +177,48 @@ What this does not establish remains the larger part: accuracy on anything but
 this one frame, behaviour on the 114-grey padding this pipeline centres where
 YOLOX's own preprocessing puts it bottom-right, and every item in section 4.3.
 
+### 3.4 Padding placement and the first measurement across a set
+
+Established 2026-10-03 by evaluating the same 60 COCO val2017 photographs, 179
+people, twice: once letterboxed as this pipeline did it and once as YOLOX's own
+preprocessing does it. Reproducible with `scripts/detection/build-eval-set.py`
+and `make container-verify-accuracy`.
+
+| Padding | Recall | Precision | Large | Medium | Small |
+| --- | --- | --- | --- | --- | --- |
+| Centred, as shipped | 71.5% (128/179) | 87.1% (128/147) | 94.2% | 70.2% | 30.4% |
+| Top-left, YOLOX's own | **73.7%** (132/179) | **89.7%** (132/147) | 95.3% | 70.2% | **36.9%** |
+
+- **The placement was wrong, and it cost people.** Both runs produce 147 boxes;
+  four more of them are correct with the padding where the model was trained to
+  expect it. The gain concentrates in small subjects, 30.4% to 36.9%, which is
+  where a positional convention would be expected to matter most and where a
+  surveillance product can least afford to lose. The pipeline now pads at the
+  origin, and `LetterboxAlignment` drives both the `FFmpeg` filter and the
+  inverse from one value so they cannot disagree.
+- **This is the shape of defect this whole exercise exists to catch.** Centred
+  padding is self-consistent: the forward and inverse agree, every box lands
+  inside the frame, `DI.R8` passes, and the detections look right because they
+  are right. It is only wrong against the model's training distribution, and
+  only a measurement across a set with ground truth can see it. No test over
+  constructed tensors would have found this, and no single frame did.
+- **Recall is the number this product should watch.** 73.7% against COCO's
+  ground truth means roughly one person in four is not reported. Precision is
+  comfortably higher, which is the ordering a surveillance product wants only if
+  missing people is acceptable, and that is a product decision rather than an
+  engineering one.
+- Recall by subject size is reported separately because the aggregate hides it:
+  95.3% of large subjects against 36.9% of small ones is not one detector with
+  one accuracy, it is a 416-pixel input meeting subjects a few dozen pixels tall.
+  Camera placement and input geometry move this number far more than the model
+  does.
+
+This is **not** Phase 6's accuracy gate, and it does not close it. COCO is a
+benchmark of general photographs; this product's cameras produce surveillance
+footage, and nobody has agreed that one predicts the other. The thresholds
+`make container-verify-accuracy` enforces are regression guards chosen below the
+measurement, not criteria anyone has accepted.
+
 ## 4. Requirements status and open inputs
 
 ### 4.1 Accepted requirements
@@ -539,6 +581,19 @@ vacuously over an empty set. Inference duration is recorded.
 `make container-verify-model` runs it. Executed 2026-10-03; section 3.3 carries
 the result. This test is evidence that the adapter works end to end. It is not
 evidence of accuracy: one frame is an anecdote.
+
+### DI.R10 — Ground truth across a set
+
+An evaluation set generated from a public dataset with person annotations,
+measured at a stated overlap threshold, reporting recall, precision and recall
+by subject size. Both minimum thresholds are required inputs: a measurement
+that asserts nothing is a report, and reports cannot fail.
+
+Its purpose is not accuracy certification, which is a product gate. It is to
+catch the defects `DI.R8` structurally cannot: a preprocessing convention that
+is self-consistent and still wrong, a regression that moves the miss rate
+without moving any test, a model substitution that looks identical on one
+frame. Section 3.4 is the first run and found the first of those.
 
 ### DI.R9 — Isolation parity
 

@@ -412,10 +412,13 @@ Add sampled human detection as an independently degradable media consumer and pu
   A real backend now exists: ONNX Runtime behind the `onnx-inference` feature,
   with YOLOX as a reversible documented default (ADR 015,
   `docs/detection-inference/`). That changes nothing here. The dataset and the
-  criteria are what this item waits on. The adapter has since been run against a
-  real artifact and found three of the four people in one photograph, which
-  establishes that it detects and says nothing whatever about how well. The API
-  reports which backend is live so no reader has to assume.
+  criteria are what this item waits on. The adapter has since been measured
+  against COCO val2017 ground truth at 73.7% recall and 89.7% precision
+  (`make container-verify-accuracy`), which is a number on a public benchmark of
+  general photographs and not a grade on this product's cameras. It is enough to
+  say the adapter detects, and enough to catch a regression; it is not what this
+  item asks for. The API reports which backend is live so no reader has to
+  assume.
 
 ### Exit gate
 

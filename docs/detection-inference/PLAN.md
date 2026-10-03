@@ -336,6 +336,36 @@ Exit gate:
   transfer to the production target.
 - `make check` green with `DI.R8` ignored.
 
+## Slice 7a — Ground truth across a set
+
+Added after `DI.R8` passed, because a passing `DI.R8` cannot see the class of
+defect that was actually present.
+
+`scripts/detection/build-eval-set.py` builds an evaluation set from COCO
+val2017 person annotations, excluding crowd-flagged images because COCO marks
+those as one unbounded region and a detector that correctly finds six people
+inside one would be charged five false positives. `DI.R10`
+(`crates/detector/tests/onnx_accuracy.rs`) measures recall, precision and
+recall by subject size at a stated overlap, and requires both minimum
+thresholds as inputs so it cannot pass by reporting.
+
+- [x] Generate a set with real ground truth and measure the shipped pipeline:
+  71.5% recall, 87.1% precision over 60 frames and 179 people at IoU 0.5.
+- [x] Settle the padding placement by measurement rather than by argument.
+  YOLOX pads at the origin; this pipeline centred. The same set with the
+  padding moved gives 73.7% recall and 89.7% precision from the same 147
+  boxes — four more people found, concentrated in small subjects, 30.4% to
+  36.9%. `LetterboxAlignment` now drives the filter and the inverse from one
+  value. Specification section 3.4.
+
+Exit gate:
+
+- A measurement exists across a set with ground truth, reproducible by someone
+  who disputes it. Met: `make container-verify-accuracy`.
+- The measurement is labelled as what it is. Met: it is a public general-purpose
+  benchmark, not this product's cameras, and its thresholds are regression
+  guards rather than accepted criteria. Phase 6's accuracy item stays open.
+
 ## Slice 8 — Validation, measurement and handoff
 
 - [ ] Full `make check` and `make audit`.

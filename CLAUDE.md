@@ -70,14 +70,18 @@ and the API reports `results_are_fixture: true`; a build with the
 real ONNX model and reports production. Which one is running is taken from the
 live backend, never from what the build contains.
 
-The ONNX adapter has been run end to end against a real artifact once, on one
-frame (`make container-verify-model`; specification section 3.3). That proves
-the adapter and the letterbox inverse, and nothing else.
+The ONNX adapter has been run against a real artifact: one frame
+(`make container-verify-model`) and a 60-frame set with COCO ground truth
+(`make container-verify-accuracy`), at 73.7% recall and 89.7% precision —
+roughly one person in four not reported, and 36.9% recall on small subjects.
+Specification sections 3.3 and 3.4.
 
 **Detection accuracy is still unevaluated.** Phase 6's remaining item needs a
-labeled dataset and agreed criteria, and neither exists. A working backend is
-not a working capability: do not describe detection as accurate, and do not
-quote a camera count from it. One frame is an anecdote.
+labeled dataset and agreed criteria representing this product's cameras, and
+neither exists. COCO photographs are not surveillance footage and nobody has
+agreed that one predicts the other, so the numbers above are a regression guard
+and not a grade. A working backend is not a working capability: do not describe
+detection as accurate, and do not quote a camera count from it.
 
 ## Working conventions
 
