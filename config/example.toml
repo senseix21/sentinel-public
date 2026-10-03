@@ -69,6 +69,52 @@ segment_duration = "30s"
 enabled = true
 sample_fps = 5
 
+# --- Inference ---------------------------------------------------------------
+# No model ships in this repository. Weights are a deployment artifact: put the
+# .onnx file on the host and point model_path at it. Leaving model_path unset is
+# a legitimate state and the shipped one — the detector keeps its fixture
+# backend and the API continues to report results_are_fixture, so nothing claims
+# detections it cannot support. A model_path that is set but cannot be loaded
+# refuses startup rather than silently degrading (ADR 015).
+#
+# Apply-time: model_path, model_sha256, input_width, input_height,
+# execution_providers, intra_op_threads and inter_op_threads rebuild that
+# camera's pipeline, which interrupts its recording and is operator-triggered.
+# The thresholds and gate timings below take effect immediately, because their
+# consumer re-reads them on each use.
+#
+# model_path = "/srv/surveillance/models/yolox_tiny.onnx"
+# model_sha256 = "c789161ed43c8269fcd4e67c67eeeb4e80c622da2eb296a20bc6007bd18a0b7d"
+
+# The model's input geometry. The detector scales each frame to exactly this,
+# so these also set the decoded frame size and are checked against the camera's
+# memory budget.
+input_width = 416
+input_height = 416
+
+# Ordered, comma-separated. Availability reported by the runtime is not proof:
+# a provider is accepted only after a warm-up inference actually runs on it.
+execution_providers = "cpu"
+
+# One thread each. A session per camera with machine-sized pools would contend
+# through a single blocking pool; raise these only against measurements.
+intra_op_threads = 1
+inter_op_threads = 1
+
+# Fractions are whole percentages, as the storage watermarks are: the settings
+# value model has no float, and integers stay exact through TOML, the database
+# and JSON. Values above 100 are refused at startup, naming the key.
+score_threshold_percent = 30
+nms_iou_percent = 45
+
+# The motion gate. It reduces inference only: H.264 inter-frames cannot be
+# decoded in isolation, so the decoder runs regardless of how much this skips.
+# The cooldown keeps a person who stops moving from vanishing; the heartbeat
+# bounds the damage from a threshold set too high.
+motion_threshold_percent = 2
+gate_cooldown = "5s"
+gate_heartbeat = "10s"
+
 # --- Per-camera overrides ----------------------------------------------------
 # A camera's own value beats the template above. Within one layer, specific
 # beats general; across layers, the higher layer wins outright.

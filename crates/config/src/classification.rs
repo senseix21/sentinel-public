@@ -440,6 +440,39 @@ settings! {
     CameraDetectionDecodeTimeout =>
         "camera.detection.decode_timeout", Operational, PipelineRestart, Public, PerCamera,
         Duration, [];
+    CameraDetectionModelPath =>
+        "camera.detection.model_path", Operational, PipelineRestart, Public, PerCamera, Path, [];
+    CameraDetectionModelSha256 =>
+        "camera.detection.model_sha256", Operational, PipelineRestart, Public, PerCamera, Text, [];
+    CameraDetectionInputWidth =>
+        "camera.detection.input_width", Operational, PipelineRestart, Public, PerCamera, Unsigned,
+        [CameraMemoryBudget, DecodedFrameBudget];
+    CameraDetectionInputHeight =>
+        "camera.detection.input_height", Operational, PipelineRestart, Public, PerCamera, Unsigned,
+        [CameraMemoryBudget, DecodedFrameBudget];
+    CameraDetectionExecutionProviders =>
+        "camera.detection.execution_providers", Operational, PipelineRestart, Public, PerCamera,
+        Text, [];
+    CameraDetectionIntraOpThreads =>
+        "camera.detection.intra_op_threads", Operational, PipelineRestart, Public, PerCamera,
+        Unsigned, [];
+    CameraDetectionInterOpThreads =>
+        "camera.detection.inter_op_threads", Operational, PipelineRestart, Public, PerCamera,
+        Unsigned, [];
+    CameraDetectionScoreThresholdPercent =>
+        "camera.detection.score_threshold_percent", Operational, Immediate, Public, PerCamera,
+        Unsigned, [];
+    CameraDetectionNmsIouPercent =>
+        "camera.detection.nms_iou_percent", Operational, Immediate, Public, PerCamera, Unsigned,
+        [];
+    CameraDetectionMotionThresholdPercent =>
+        "camera.detection.motion_threshold_percent", Operational, Immediate, Public, PerCamera,
+        Unsigned, [];
+    CameraDetectionGateCooldown =>
+        "camera.detection.gate_cooldown", Operational, Immediate, Public, PerCamera, Duration, [];
+    CameraDetectionGateHeartbeat =>
+        "camera.detection.gate_heartbeat", Operational, Immediate, Public, PerCamera, Duration,
+        [];
     CameraLiveKitEndpoint =>
         "camera.livekit.endpoint", Operational, PipelineRestart, Public, PerCamera, Text, [];
     CameraLiveKitApiKey =>
@@ -698,7 +731,12 @@ mod tests {
                         "budget",
                         "gap",
                         "tolerance",
-                        "grace"
+                        "grace",
+                        // The detection gate's vocabulary. Both words denote
+                        // time as plainly as the rest of this list, so the
+                        // guard is extended rather than the keys contorted.
+                        "cooldown",
+                        "heartbeat"
                     ]
                     .iter()
                     .any(|marker| key.contains(marker)),
@@ -712,6 +750,6 @@ mod tests {
     fn table_covers_the_documented_setting_count() {
         // Guards against an accidental deletion of a table row. The number is
         // the contracts table's row count; changing it is a deliberate act.
-        assert_eq!(SettingId::ALL.len(), 80);
+        assert_eq!(SettingId::ALL.len(), 92);
     }
 }

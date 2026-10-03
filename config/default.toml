@@ -125,6 +125,27 @@ sample_fps = 5
 max_gap = "2s"
 decoder = "ffmpeg"
 decode_timeout = "2s"
+# Inference. model_path and model_sha256 have no default and are absent here on
+# purpose: an unset model path is how a deployment says it has not configured a
+# production model, so the detector keeps its fixture backend and the API keeps
+# reporting results_are_fixture. Set model_path to a deployed .onnx file, and
+# model_sha256 to its hash, to pin it. A configured path that cannot be loaded
+# refuses startup rather than silently degrading.
+input_width = 416
+input_height = 416
+execution_providers = "cpu"
+# One thread each: a session per camera with machine-sized pools would contend
+# through a single blocking pool on a small target.
+intra_op_threads = 1
+inter_op_threads = 1
+# Fractions are integer percentages, as the storage watermarks are: the value
+# model has no float, and this keeps the number exact through TOML, the
+# database and JSON.
+score_threshold_percent = 30
+nms_iou_percent = 45
+motion_threshold_percent = 2
+gate_cooldown = "5s"
+gate_heartbeat = "10s"
 
 [camera.livekit]
 queue_items = 8

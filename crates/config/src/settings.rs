@@ -11,7 +11,10 @@ use surveillance_camera::{
     supervisor::{ReconnectPolicy, ReconnectPolicyError},
 };
 use surveillance_common::types::{CameraId, IdentifierError};
-use surveillance_detector::sampler::{SampleRateHz, SamplerError};
+use surveillance_detector::{
+    backend::InferenceBackendConfig,
+    sampler::{SampleRateHz, SamplerError},
+};
 use surveillance_livekit::config::{LiveKitConfig, LiveKitConfigError, LiveKitSettings};
 use surveillance_media::distribution::{QueueCapacity, QueueCapacityError};
 use surveillance_recorder::{
@@ -51,6 +54,21 @@ pub struct OneCameraSettings {
     pub decoded_frame_max_bytes: usize,
     pub detection_decoder: PathBuf,
     pub detection_decode_timeout: Duration,
+    /// Absent means no production model is configured, so the detector keeps
+    /// its fixture backend and the API keeps reporting that it has one.
+    pub detection_model_path: Option<PathBuf>,
+    /// Absent means unpinned. Present, it must match the artifact's hash.
+    pub detection_model_sha256: Option<String>,
+    pub detection_input_width: u32,
+    pub detection_input_height: u32,
+    pub detection_execution_providers: String,
+    pub detection_intra_op_threads: u16,
+    pub detection_inter_op_threads: u16,
+    pub detection_score_threshold_percent: u8,
+    pub detection_nms_iou_percent: u8,
+    pub detection_motion_threshold_percent: u8,
+    pub detection_gate_cooldown: Duration,
+    pub detection_gate_heartbeat: Duration,
     pub width: u32,
     pub height: u32,
     pub segment_duration: Duration,
@@ -99,6 +117,18 @@ impl OneCameraSettings {
             decoded_frame_max_bytes: width as usize * height as usize * 3,
             detection_decoder: PathBuf::from("ffmpeg"),
             detection_decode_timeout: Duration::from_secs(2),
+            detection_model_path: None,
+            detection_model_sha256: None,
+            detection_input_width: 416,
+            detection_input_height: 416,
+            detection_execution_providers: "cpu".to_owned(),
+            detection_intra_op_threads: 1,
+            detection_inter_op_threads: 1,
+            detection_score_threshold_percent: 30,
+            detection_nms_iou_percent: 45,
+            detection_motion_threshold_percent: 2,
+            detection_gate_cooldown: Duration::from_secs(5),
+            detection_gate_heartbeat: Duration::from_secs(10),
             width,
             height,
             segment_duration: Duration::from_secs(30),
@@ -131,6 +161,8 @@ pub struct OneCameraConfig {
     pub decoded_frame_max_bytes: usize,
     pub detection_decoder: PathBuf,
     pub detection_decode_timeout: Duration,
+    /// Which inference backend this camera runs, and the model that defines it.
+    pub inference: InferenceBackendConfig,
     pub max_access_unit_bytes: usize,
     pub max_nals_per_access_unit: usize,
     pub recorder: Fmp4SinkConfig,
@@ -307,6 +339,23 @@ impl OneCameraConfig {
             detection_sample_rate,
             detection_max_gap: settings.detection_max_gap,
             decoded_frame_max_bytes: settings.decoded_frame_max_bytes,
+            inference: InferenceBackendConfig {
+                model_path: settings.detection_model_path,
+                model_sha256: settings.detection_model_sha256,
+                input_width: settings.detection_input_width,
+                input_height: settings.detection_input_height,
+                execution_providers: settings
+                    .detection_execution_providers
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|provider| !provider.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+                intra_op_threads: settings.detection_intra_op_threads,
+                inter_op_threads: settings.detection_inter_op_threads,
+                score_threshold_percent: settings.detection_score_threshold_percent,
+                nms_iou_percent: settings.detection_nms_iou_percent,
+            },
             detection_decoder: settings.detection_decoder,
             detection_decode_timeout: settings.detection_decode_timeout,
             max_access_unit_bytes: settings.max_access_unit_bytes,
@@ -390,6 +439,18 @@ mod tests {
             decoded_frame_max_bytes: 2560 * 1440 * 3,
             detection_decoder: PathBuf::from("ffmpeg"),
             detection_decode_timeout: Duration::from_secs(2),
+            detection_model_path: None,
+            detection_model_sha256: None,
+            detection_input_width: 416,
+            detection_input_height: 416,
+            detection_execution_providers: "cpu".to_owned(),
+            detection_intra_op_threads: 1,
+            detection_inter_op_threads: 1,
+            detection_score_threshold_percent: 30,
+            detection_nms_iou_percent: 45,
+            detection_motion_threshold_percent: 2,
+            detection_gate_cooldown: Duration::from_secs(5),
+            detection_gate_heartbeat: Duration::from_secs(10),
             width: 2560,
             height: 1440,
             segment_duration: Duration::from_secs(30),

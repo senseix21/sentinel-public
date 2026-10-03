@@ -31,6 +31,12 @@ pub const WITHOUT_DEFAULTS: &[SettingId] = &[
     SettingId::CameraVideoWidth,
     SettingId::CameraVideoHeight,
     SettingId::CameraDetectionDecodedFrameMaxBytes,
+    // No default on purpose: an unset model path is how a deployment says it
+    // has not configured a production model, and `Path` rejects the empty
+    // string. A configured path that cannot be loaded is a startup failure,
+    // which is a different condition entirely.
+    SettingId::CameraDetectionModelPath,
+    SettingId::CameraDetectionModelSha256,
     SettingId::CameraLiveKitEndpoint,
     SettingId::CameraLiveKitApiKey,
     SettingId::CameraLiveKitApiSecret,
@@ -313,6 +319,48 @@ fn camera_detection(layer: &mut Layer) {
     set(
         SettingId::CameraDetectionDecodeTimeout,
         SettingValue::Duration(Duration::from_secs(2)),
+    );
+    set(
+        SettingId::CameraDetectionInputWidth,
+        SettingValue::Unsigned(416),
+    );
+    set(
+        SettingId::CameraDetectionInputHeight,
+        SettingValue::Unsigned(416),
+    );
+    set(
+        SettingId::CameraDetectionExecutionProviders,
+        SettingValue::Text("cpu".to_owned()),
+    );
+    // One thread each by default: a session per camera with machine-sized
+    // pools would contend through one blocking pool on a small target.
+    set(
+        SettingId::CameraDetectionIntraOpThreads,
+        SettingValue::Unsigned(1),
+    );
+    set(
+        SettingId::CameraDetectionInterOpThreads,
+        SettingValue::Unsigned(1),
+    );
+    set(
+        SettingId::CameraDetectionScoreThresholdPercent,
+        SettingValue::Unsigned(30),
+    );
+    set(
+        SettingId::CameraDetectionNmsIouPercent,
+        SettingValue::Unsigned(45),
+    );
+    set(
+        SettingId::CameraDetectionMotionThresholdPercent,
+        SettingValue::Unsigned(2),
+    );
+    set(
+        SettingId::CameraDetectionGateCooldown,
+        SettingValue::Duration(Duration::from_secs(5)),
+    );
+    set(
+        SettingId::CameraDetectionGateHeartbeat,
+        SettingValue::Duration(Duration::from_secs(10)),
     );
 }
 
