@@ -473,6 +473,8 @@ settings! {
     CameraDetectionGateHeartbeat =>
         "camera.detection.gate_heartbeat", Operational, Immediate, Public, PerCamera, Duration,
         [];
+    CameraDetectionHwaccel =>
+        "camera.detection.hwaccel", Operational, PipelineRestart, Public, PerCamera, Text, [];
     CameraLiveKitEndpoint =>
         "camera.livekit.endpoint", Operational, PipelineRestart, Public, PerCamera, Text, [];
     CameraLiveKitApiKey =>
@@ -750,6 +752,6 @@ mod tests {
     fn table_covers_the_documented_setting_count() {
         // Guards against an accidental deletion of a table row. The number is
         // the contracts table's row count; changing it is a deliberate act.
-        assert_eq!(SettingId::ALL.len(), 92);
+        assert_eq!(SettingId::ALL.len(), 93);
     }
 }

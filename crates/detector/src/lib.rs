@@ -3,6 +3,7 @@
 pub mod backend;
 pub mod decoder;
 pub mod detector;
+pub mod gate;
 pub mod inference;
 pub mod letterbox;
 pub mod model_output;

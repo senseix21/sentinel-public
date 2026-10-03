@@ -22,6 +22,14 @@ use crate::inference::{DeterministicFakeInference, InferenceError, PersonInferen
 pub struct InferenceBackendConfig {
     pub model_path: Option<PathBuf>,
     pub model_sha256: Option<String>,
+    /// The camera's own geometry, which is not the frame's any more.
+    ///
+    /// The decoder now emits frames already scaled and padded to the model's
+    /// input, so a letterbox derived from the frame would map detections into
+    /// padded space and report coordinates relative to the padding. The mapping
+    /// back to what the camera saw has to come from the camera's dimensions.
+    pub source_width: u32,
+    pub source_height: u32,
     pub input_width: u32,
     pub input_height: u32,
     pub execution_providers: Vec<String>,
@@ -142,6 +150,8 @@ mod tests {
         InferenceBackendConfig {
             model_path: model.map(std::path::PathBuf::from),
             model_sha256: None,
+            source_width: 1280,
+            source_height: 720,
             input_width: 416,
             input_height: 416,
             execution_providers: vec!["cpu".to_owned()],

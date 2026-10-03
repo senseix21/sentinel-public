@@ -16,6 +16,7 @@ use surveillance_detector::{
     backend::PersonInferenceBackend,
     decoder::{FfmpegDecoderConfig, FfmpegH264Decoder},
     detector::{DetectionHealth, DetectionOwner},
+    gate::GatePolicy,
     sampler::TimestampSampler,
 };
 use surveillance_events::{
@@ -121,9 +122,13 @@ impl CameraPipeline {
             config.detection_queue,
         );
         let (detection, detection_health) = if config.detection_enabled {
+            // Frames are produced at the model's input geometry, not the
+            // camera's, so the bound is on what the detector actually holds.
+            // At 1080p into a 416x416 model this is roughly a fifth of what the
+            // camera's own geometry would have reserved.
             let limits = FrameLimits::new(
-                config.recorder.width(),
-                config.recorder.height(),
+                config.inference.input_width,
+                config.inference.input_height,
                 config.decoded_frame_max_bytes,
             )
             .map_err(|_| CameraPipelineError::DetectionConfiguration)?;
@@ -138,12 +143,19 @@ impl CameraPipeline {
                 .map_err(|error| CameraPipelineError::InferenceBackend(error.to_string()))?;
             let decoder = FfmpegH264Decoder::start(FfmpegDecoderConfig {
                 executable: config.detection_decoder.clone(),
-                width: config.recorder.width(),
-                height: config.recorder.height(),
+                width: config.inference.input_width,
+                height: config.inference.input_height,
+                hwaccel: config.detection_hwaccel.clone(),
                 frame_limits: limits,
                 response_timeout: config.detection_decode_timeout,
                 max_access_unit_bytes: config.max_access_unit_bytes,
             })
+            .map_err(|_| CameraPipelineError::DetectionConfiguration)?;
+            let gate_policy = GatePolicy::new(
+                config.detection_motion_threshold_percent,
+                config.detection_gate_cooldown,
+                config.detection_gate_heartbeat,
+            )
             .map_err(|_| CameraPipelineError::DetectionConfiguration)?;
             let (owner, health) = DetectionOwner::start_observed(
                 config.camera_id.clone(),
@@ -151,6 +163,7 @@ impl CameraPipeline {
                 sampler,
                 decoder,
                 inference,
+                gate_policy,
                 event_bus,
             );
             (Some(owner), health)

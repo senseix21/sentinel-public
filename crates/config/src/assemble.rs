@@ -88,6 +88,7 @@ pub fn one_camera_settings(
             .percentage(SettingId::CameraDetectionMotionThresholdPercent)?,
         detection_gate_cooldown: reader.duration(SettingId::CameraDetectionGateCooldown)?,
         detection_gate_heartbeat: reader.duration(SettingId::CameraDetectionGateHeartbeat)?,
+        detection_hwaccel: reader.optional_text(SettingId::CameraDetectionHwaccel),
         width: reader.u32(SettingId::CameraVideoWidth)?,
         height: reader.u32(SettingId::CameraVideoHeight)?,
         segment_duration: reader.duration(SettingId::CameraRecordingSegmentDuration)?,

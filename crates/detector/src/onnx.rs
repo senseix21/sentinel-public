@@ -128,6 +128,9 @@ pub struct OnnxPersonInference {
     version: ModelVersion,
     input_width: u32,
     input_height: u32,
+    /// Built once from the camera's geometry and the model's, because both are
+    /// configuration and neither changes while a session lives.
+    letterbox: Letterbox,
     input_name: String,
     scratch: Vec<f32>,
 }
@@ -163,6 +166,13 @@ impl OnnxPersonInference {
         let version = ModelVersion::new(artifact.sha256().get(..16).unwrap_or(artifact.sha256()))
             .map_err(|_| OnnxBackendError::Identity)?;
 
+        let letterbox = Letterbox::new(
+            config.source_width,
+            config.source_height,
+            config.input_width,
+            config.input_height,
+        )
+        .map_err(|_| OnnxBackendError::Identity)?;
         let mut backend = Self {
             session,
             decoder: YoloxDecoder,
@@ -172,6 +182,7 @@ impl OnnxPersonInference {
             version,
             input_width: config.input_width,
             input_height: config.input_height,
+            letterbox,
             input_name,
             scratch: vec![
                 0.0;
@@ -292,22 +303,15 @@ impl PersonInference for OnnxPersonInference {
     }
 
     fn infer(&mut self, frame: &DecodedFrame) -> Result<DetectionSet, InferenceError> {
-        // The frame must already be the model's input geometry. Slice 5 makes
-        // the decoder produce exactly that; resizing here would duplicate
-        // FFmpeg's scaler badly and put the resize back on the hot path.
+        // The decoder produces exactly the model's input geometry. Resizing
+        // here would duplicate FFmpeg's scaler badly and put the resize back on
+        // the hot path, so anything else is a configuration fault.
         if frame.width() != self.input_width || frame.height() != self.input_height {
             return Err(InferenceError::new(InferenceFailureKind::MalformedOutput));
         }
-        let letterbox = Letterbox::new(
-            frame.width(),
-            frame.height(),
-            self.input_width,
-            self.input_height,
-        )
-        .map_err(|_| InferenceError::new(InferenceFailureKind::MalformedOutput))?;
         let (shape, values) = self.run(frame.pixels(), frame.stride())?;
         self.decoder
-            .decode(&values, &shape, letterbox, self.thresholds)
+            .decode(&values, &shape, self.letterbox, self.thresholds)
             .map_err(|_| InferenceError::new(InferenceFailureKind::MalformedOutput))
     }
 
@@ -333,6 +337,8 @@ mod tests {
         InferenceBackendConfig {
             model_path: Some(path),
             model_sha256: pin.map(str::to_owned),
+            source_width: 1280,
+            source_height: 720,
             input_width: 416,
             input_height: 416,
             execution_providers: vec!["cpu".to_owned()],

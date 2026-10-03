@@ -100,22 +100,6 @@ impl InferenceDescriptor {
     }
 }
 
-/// Describes the inference implementation this build wires into the pipeline.
-///
-/// A build fact, not a runtime one: there is exactly one implementation of
-/// [`PersonInference`] in the workspace. When a real model lands this must
-/// change with it, and `the_compiled_backend_matches_what_the_pipeline_builds`
-/// in `apps/server` fails if it does not.
-///
-/// # Errors
-/// Returns an error only if the built-in model identity violates event
-/// invariants, which is the same condition
-/// [`DeterministicFakeInference::new`] reports.
-pub fn compiled_backend(
-) -> Result<InferenceDescriptor, surveillance_events::event::EventValidationError> {
-    Ok(InferenceDescriptor::of(&DeterministicFakeInference::new()?))
-}
-
 /// Test/local qualification adapter. It emits one deterministic person when the
 /// first RGB byte is odd and none when it is even.
 pub struct DeterministicFakeInference {

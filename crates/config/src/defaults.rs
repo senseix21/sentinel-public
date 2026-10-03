@@ -37,6 +37,9 @@ pub const WITHOUT_DEFAULTS: &[SettingId] = &[
     // which is a different condition entirely.
     SettingId::CameraDetectionModelPath,
     SettingId::CameraDetectionModelSha256,
+    // No default: unset means software decode, and `Text` would carry an empty
+    // string that reads like a configured accelerator named "".
+    SettingId::CameraDetectionHwaccel,
     SettingId::CameraLiveKitEndpoint,
     SettingId::CameraLiveKitApiKey,
     SettingId::CameraLiveKitApiSecret,

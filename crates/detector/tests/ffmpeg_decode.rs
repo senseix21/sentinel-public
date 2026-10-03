@@ -48,6 +48,7 @@ fn real_h264_keyframe_decodes_to_bounded_rgb() {
     let limits =
         FrameLimits::new(16, 16, 16 * 16 * 3).unwrap_or_else(|error| panic!("limits: {error}"));
     let mut decoder = FfmpegH264Decoder::start(FfmpegDecoderConfig {
+        hwaccel: None,
         executable: "ffmpeg".into(),
         width: 16,
         height: 16,
@@ -115,6 +116,7 @@ fn real_inter_frame_sequence_preserves_bounded_timestamp_order() {
     let limits =
         FrameLimits::new(16, 16, 16 * 16 * 3).unwrap_or_else(|error| panic!("limits: {error}"));
     let mut decoder = FfmpegH264Decoder::start(FfmpegDecoderConfig {
+        hwaccel: None,
         executable: "ffmpeg".into(),
         width: 16,
         height: 16,

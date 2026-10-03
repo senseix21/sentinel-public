@@ -69,6 +69,9 @@ pub struct OneCameraSettings {
     pub detection_motion_threshold_percent: u8,
     pub detection_gate_cooldown: Duration,
     pub detection_gate_heartbeat: Duration,
+    /// `None` is software decode. Set it to an `FFmpeg` accelerator name on a
+    /// target where one exists.
+    pub detection_hwaccel: Option<String>,
     pub width: u32,
     pub height: u32,
     pub segment_duration: Duration,
@@ -129,6 +132,7 @@ impl OneCameraSettings {
             detection_motion_threshold_percent: 2,
             detection_gate_cooldown: Duration::from_secs(5),
             detection_gate_heartbeat: Duration::from_secs(10),
+            detection_hwaccel: None,
             width,
             height,
             segment_duration: Duration::from_secs(30),
@@ -161,6 +165,10 @@ pub struct OneCameraConfig {
     pub decoded_frame_max_bytes: usize,
     pub detection_decoder: PathBuf,
     pub detection_decode_timeout: Duration,
+    pub detection_hwaccel: Option<String>,
+    pub detection_motion_threshold_percent: u8,
+    pub detection_gate_cooldown: Duration,
+    pub detection_gate_heartbeat: Duration,
     /// Which inference backend this camera runs, and the model that defines it.
     pub inference: InferenceBackendConfig,
     pub max_access_unit_bytes: usize,
@@ -342,6 +350,12 @@ impl OneCameraConfig {
             inference: InferenceBackendConfig {
                 model_path: settings.detection_model_path,
                 model_sha256: settings.detection_model_sha256,
+                // The camera's own geometry. The detector's frames are scaled
+                // to the model's input, so this is the only remaining record of
+                // what the camera actually sees, and detections are mapped back
+                // through it.
+                source_width: settings.width,
+                source_height: settings.height,
                 input_width: settings.detection_input_width,
                 input_height: settings.detection_input_height,
                 execution_providers: settings
@@ -357,6 +371,10 @@ impl OneCameraConfig {
                 nms_iou_percent: settings.detection_nms_iou_percent,
             },
             detection_decoder: settings.detection_decoder,
+            detection_hwaccel: settings.detection_hwaccel,
+            detection_motion_threshold_percent: settings.detection_motion_threshold_percent,
+            detection_gate_cooldown: settings.detection_gate_cooldown,
+            detection_gate_heartbeat: settings.detection_gate_heartbeat,
             detection_decode_timeout: settings.detection_decode_timeout,
             max_access_unit_bytes: settings.max_access_unit_bytes,
             max_nals_per_access_unit: settings.max_nals_per_access_unit,
@@ -451,6 +469,7 @@ mod tests {
             detection_motion_threshold_percent: 2,
             detection_gate_cooldown: Duration::from_secs(5),
             detection_gate_heartbeat: Duration::from_secs(10),
+            detection_hwaccel: None,
             width: 2560,
             height: 1440,
             segment_duration: Duration::from_secs(30),
