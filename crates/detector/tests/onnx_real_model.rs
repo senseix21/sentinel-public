@@ -71,6 +71,7 @@ fn a_real_model_produces_detections_from_a_real_frame() {
         source_height: dimension("DETECTION_SOURCE_HEIGHT"),
         input_width,
         input_height,
+        letterbox_alignment: surveillance_detector::model_output::YOLOX_LETTERBOX_ALIGNMENT,
         execution_providers: vec!["cpu".to_owned()],
         intra_op_threads: 1,
         inter_op_threads: 1,

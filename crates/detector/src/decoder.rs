@@ -1,6 +1,7 @@
 //! Owned `FFmpeg` H.264 decode-process adapter.
 
 use crate::detector::{DecodeError, H264Decoder};
+use crate::letterbox::LetterboxAlignment;
 use std::{
     io::{Read, Write},
     path::PathBuf,
@@ -31,6 +32,9 @@ pub struct FfmpegDecoderConfig {
     /// Passed to `FFmpeg` as `-hwaccel` when set. Software decode by default, so
     /// a development host behaves exactly as it did.
     pub hwaccel: Option<String>,
+    /// Where to put the padding. The inverse that reads boxes back is built
+    /// from the same value, so this is not a free choice.
+    pub letterbox_alignment: LetterboxAlignment,
     pub frame_limits: FrameLimits,
     pub response_timeout: Duration,
     pub max_access_unit_bytes: usize,
@@ -234,9 +238,10 @@ fn start_process(config: &FfmpegDecoderConfig, epoch: u64) -> Result<ActiveDecod
     // input geometry, so the adapter copies rather than resizes.
     let scale_filter = format!(
         "scale={width}:{height}:force_original_aspect_ratio=decrease,\
-         pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x727272",
+         pad={width}:{height}:{placement}:color=0x727272",
         width = config.width,
-        height = config.height
+        height = config.height,
+        placement = config.letterbox_alignment.pad_expression()
     );
     let mut child = Command::new(&config.executable)
         .args(["-hide_banner", "-loglevel", "error"])

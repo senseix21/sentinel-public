@@ -358,6 +358,7 @@ impl OneCameraConfig {
                 source_height: settings.height,
                 input_width: settings.detection_input_width,
                 input_height: settings.detection_input_height,
+                letterbox_alignment: surveillance_detector::model_output::YOLOX_LETTERBOX_ALIGNMENT,
                 execution_providers: settings
                     .detection_execution_providers
                     .split(',')

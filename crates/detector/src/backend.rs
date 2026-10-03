@@ -13,6 +13,7 @@ use surveillance_events::event::{DetectionSet, ModelName, ModelVersion};
 use surveillance_media::frame::DecodedFrame;
 
 use crate::inference::{DeterministicFakeInference, InferenceError, PersonInference};
+use crate::letterbox::LetterboxAlignment;
 
 /// Everything needed to decide and build a backend.
 ///
@@ -32,6 +33,10 @@ pub struct InferenceBackendConfig {
     pub source_height: u32,
     pub input_width: u32,
     pub input_height: u32,
+    /// Where the frame producer put the padding, which this side must undo
+    /// exactly. Supplied rather than assumed: the two have to agree, and a
+    /// default here would let them disagree silently.
+    pub letterbox_alignment: LetterboxAlignment,
     pub execution_providers: Vec<String>,
     pub intra_op_threads: u16,
     pub inter_op_threads: u16,
@@ -154,6 +159,7 @@ mod tests {
             source_height: 720,
             input_width: 416,
             input_height: 416,
+            letterbox_alignment: crate::model_output::YOLOX_LETTERBOX_ALIGNMENT,
             execution_providers: vec!["cpu".to_owned()],
             intra_op_threads: 1,
             inter_op_threads: 1,

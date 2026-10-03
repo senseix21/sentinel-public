@@ -10,6 +10,41 @@
 //! catches and no fixture without ground truth reveals. It lives here, away
 //! from any model runtime, so it can be tested as the pure function it is.
 
+/// Where the padding goes when the scaled frame does not fill the model's
+/// input rectangle.
+///
+/// This is not a preference and not an operator setting. The pipeline's padding
+/// and this type's inverse must agree or every box is displaced, and the
+/// placement a model handles best is the one its training preprocessing used —
+/// a property of an artifact, exactly as channel order turned out to be. One
+/// value therefore drives both the `FFmpeg` filter and the arithmetic here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LetterboxAlignment {
+    /// Scaled content centred, padding split between both sides. Symmetric, and
+    /// what a person reading a debug frame expects to see.
+    Centred,
+    /// Scaled content at the origin, padding on the right and bottom only. What
+    /// `YOLOX` preprocessing does: it writes the resized image into the
+    /// top-left of a 114-grey canvas.
+    TopLeft,
+}
+
+impl LetterboxAlignment {
+    /// The `FFmpeg` `pad` placement expression for this alignment.
+    ///
+    /// Produced here so the filter and the inverse cannot drift apart: a
+    /// placement added to one and forgotten in the other displaces every box by
+    /// half the padding, which looks like a model that is slightly wrong rather
+    /// than a pipeline that is.
+    #[must_use]
+    pub const fn pad_expression(self) -> &'static str {
+        match self {
+            Self::Centred => "(ow-iw)/2:(oh-ih)/2",
+            Self::TopLeft => "0:0",
+        }
+    }
+}
+
 /// The mapping between one source frame and the model's input rectangle.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Letterbox {
@@ -48,6 +83,7 @@ impl Letterbox {
         source_height: u32,
         target_width: u32,
         target_height: u32,
+        alignment: LetterboxAlignment,
     ) -> Result<Self, LetterboxError> {
         if source_width == 0 || source_height == 0 || target_width == 0 || target_height == 0 {
             return Err(LetterboxError::DegenerateDimension);
@@ -57,8 +93,13 @@ impl Letterbox {
         let target_width_f = f32::from(u16::try_from(target_width).unwrap_or(u16::MAX));
         let target_height_f = f32::from(u16::try_from(target_height).unwrap_or(u16::MAX));
         let scale = (target_width_f / source_width_f).min(target_height_f / source_height_f);
-        let pad_x = (target_width_f - source_width_f * scale) / 2.0;
-        let pad_y = (target_height_f - source_height_f * scale) / 2.0;
+        let (pad_x, pad_y) = match alignment {
+            LetterboxAlignment::Centred => (
+                (target_width_f - source_width_f * scale) / 2.0,
+                (target_height_f - source_height_f * scale) / 2.0,
+            ),
+            LetterboxAlignment::TopLeft => (0.0, 0.0),
+        };
         Ok(Self {
             source_width: source_width_f,
             source_height: source_height_f,
@@ -145,7 +186,7 @@ pub struct Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::{Letterbox, LetterboxError};
+    use super::{Letterbox, LetterboxAlignment, LetterboxError};
 
     #[test]
     fn rejects_a_degenerate_dimension_rather_than_dividing_by_zero() {
@@ -156,7 +197,7 @@ mod tests {
             (1280, 720, 416, 0),
         ] {
             assert_eq!(
-                Letterbox::new(sw, sh, tw, th),
+                Letterbox::new(sw, sh, tw, th, LetterboxAlignment::Centred),
                 Err(LetterboxError::DegenerateDimension),
                 "{sw}x{sh} -> {tw}x{th} must be refused"
             );
@@ -166,7 +207,7 @@ mod tests {
     #[test]
     fn matches_the_geometry_measured_against_the_real_model() {
         // 1280x720 into 416x416, the configuration the slice 0 probe used.
-        let letterbox = Letterbox::new(1280, 720, 416, 416)
+        let letterbox = Letterbox::new(1280, 720, 416, 416, LetterboxAlignment::Centred)
             .unwrap_or_else(|error| panic!("valid letterbox: {error}"));
         // f32 tolerances, not exact equality: pad_y computes to 91.00001 here.
         assert!((letterbox.scale() - 0.325).abs() < 1e-6);
@@ -186,8 +227,15 @@ mod tests {
             (1, 1, 416, 416),
             (4096, 17, 320, 320),
         ];
-        for (sw, sh, tw, th) in cases {
-            let letterbox = Letterbox::new(sw, sh, tw, th)
+        // Both placements: the inverse has to be exact for whichever one the
+        // frame producer used, and a round trip that only ever ran against
+        // centred padding would not have noticed the other being wrong.
+        let alignments = [LetterboxAlignment::Centred, LetterboxAlignment::TopLeft];
+        for ((sw, sh, tw, th), alignment) in cases
+            .into_iter()
+            .flat_map(|case| alignments.map(|alignment| (case, alignment)))
+        {
+            let letterbox = Letterbox::new(sw, sh, tw, th, alignment)
                 .unwrap_or_else(|error| panic!("valid letterbox: {error}"));
             for step in 0_u8..=20 {
                 let fraction = f32::from(step) / 20.0;
@@ -205,8 +253,30 @@ mod tests {
     }
 
     #[test]
+    fn each_placement_s_filter_expression_describes_the_canvas_its_arithmetic_assumes() {
+        // The FFmpeg expression and the pad offsets are two statements of one
+        // decision, in two languages, read by two different things. This is
+        // where they are held against each other: changing the filter to centre
+        // what the inverse treats as origin-aligned displaces every box by half
+        // the padding, and produces detections that look merely inaccurate.
+        let centred = Letterbox::new(1280, 720, 416, 416, LetterboxAlignment::Centred)
+            .unwrap_or_else(|error| panic!("valid letterbox: {error}"));
+        let (pad_x, pad_y) = centred.pad();
+        assert!(pad_x.abs() < 1e-4 && (pad_y - 91.0).abs() < 1e-3);
+        assert_eq!(
+            LetterboxAlignment::Centred.pad_expression(),
+            "(ow-iw)/2:(oh-ih)/2"
+        );
+
+        let origin = Letterbox::new(1280, 720, 416, 416, LetterboxAlignment::TopLeft)
+            .unwrap_or_else(|error| panic!("valid letterbox: {error}"));
+        assert_eq!(origin.pad(), (0.0, 0.0));
+        assert_eq!(LetterboxAlignment::TopLeft.pad_expression(), "0:0");
+    }
+
+    #[test]
     fn normalized_output_stays_inside_the_frame() {
-        let letterbox = Letterbox::new(1280, 720, 416, 416)
+        let letterbox = Letterbox::new(1280, 720, 416, 416, LetterboxAlignment::Centred)
             .unwrap_or_else(|error| panic!("valid letterbox: {error}"));
         // A box overhanging every edge of the model input.
         let rect = letterbox
@@ -219,7 +289,7 @@ mod tests {
 
     #[test]
     fn a_box_entirely_in_the_padding_is_discarded() {
-        let letterbox = Letterbox::new(1280, 720, 416, 416)
+        let letterbox = Letterbox::new(1280, 720, 416, 416, LetterboxAlignment::Centred)
             .unwrap_or_else(|error| panic!("valid letterbox: {error}"));
         // pad_y is 91, so this sits above the image entirely.
         assert!(letterbox
@@ -229,7 +299,7 @@ mod tests {
 
     #[test]
     fn non_finite_geometry_is_discarded_rather_than_propagated() {
-        let letterbox = Letterbox::new(1280, 720, 416, 416)
+        let letterbox = Letterbox::new(1280, 720, 416, 416, LetterboxAlignment::Centred)
             .unwrap_or_else(|error| panic!("valid letterbox: {error}"));
         assert!(letterbox
             .to_normalized_source(f32::NAN, 10.0, 20.0, 20.0)
@@ -241,7 +311,7 @@ mod tests {
 
     #[test]
     fn a_full_frame_box_round_trips_to_the_whole_frame() {
-        let letterbox = Letterbox::new(1280, 720, 416, 416)
+        let letterbox = Letterbox::new(1280, 720, 416, 416, LetterboxAlignment::Centred)
             .unwrap_or_else(|error| panic!("valid letterbox: {error}"));
         let (left, top) = letterbox.forward(0.0, 0.0);
         let (right, bottom) = letterbox.forward(1280.0, 720.0);

@@ -171,6 +171,7 @@ impl OnnxPersonInference {
             config.source_height,
             config.input_width,
             config.input_height,
+            config.letterbox_alignment,
         )
         .map_err(|_| OnnxBackendError::Identity)?;
         let mut backend = Self {
@@ -354,6 +355,7 @@ mod tests {
             source_height: 720,
             input_width: 416,
             input_height: 416,
+            letterbox_alignment: crate::model_output::YOLOX_LETTERBOX_ALIGNMENT,
             execution_providers: vec!["cpu".to_owned()],
             intra_op_threads: 1,
             inter_op_threads: 1,

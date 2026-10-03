@@ -10,7 +10,7 @@ use surveillance_events::event::{
     Confidence, DetectionSet, NormalizedBoundingBox, PersonDetection, MAX_DETECTIONS_PER_EVENT,
 };
 
-use crate::letterbox::Letterbox;
+use crate::letterbox::{Letterbox, LetterboxAlignment};
 
 /// The COCO class index this product cares about.
 const PERSON_CLASS: usize = 0;
@@ -114,6 +114,15 @@ pub struct YoloxDecoder;
 
 /// The feature-map strides YOLOX concatenates, in output order.
 const YOLOX_STRIDES: [u32; 3] = [8, 16, 32];
+
+/// Where YOLOX preprocessing puts the scaled image on the padded canvas.
+///
+/// Its own `preproc` writes the resized image at `[:h, :w]` of a 114-grey
+/// canvas, so the padding falls on the right and bottom. Exported here because
+/// the pipeline that produces frames and the inverse that reads boxes back must
+/// use the same value, and a family's preprocessing is the only thing that
+/// decides which value is right.
+pub const YOLOX_LETTERBOX_ALIGNMENT: LetterboxAlignment = LetterboxAlignment::TopLeft;
 
 impl YoloxDecoder {
     /// Rebuilds the anchor grid the raw export omits.
@@ -265,7 +274,7 @@ mod tests {
         DecodeThresholds, ModelDecodeError, ModelOutputDecoder, YoloxDecoder,
         BOX_AND_OBJECTNESS_COLUMNS,
     };
-    use crate::letterbox::Letterbox;
+    use crate::letterbox::{Letterbox, LetterboxAlignment};
     use surveillance_events::event::MAX_DETECTIONS_PER_EVENT;
 
     /// A 32x32 input decomposes to 4x4 + 2x2 + 1x1 = 21 rows.
@@ -273,7 +282,8 @@ mod tests {
     const COLUMNS: usize = BOX_AND_OBJECTNESS_COLUMNS + 2;
 
     fn small_letterbox() -> Letterbox {
-        Letterbox::new(64, 64, 32, 32).unwrap_or_else(|error| panic!("valid letterbox: {error}"))
+        Letterbox::new(64, 64, 32, 32, LetterboxAlignment::Centred)
+            .unwrap_or_else(|error| panic!("valid letterbox: {error}"))
     }
 
     fn decoder() -> YoloxDecoder {
@@ -299,7 +309,7 @@ mod tests {
     #[test]
     fn the_reconstructed_grid_matches_the_measured_row_count() {
         // The real artifact: 416x416 produced exactly 3549 rows.
-        let letterbox = Letterbox::new(1280, 720, 416, 416)
+        let letterbox = Letterbox::new(1280, 720, 416, 416, LetterboxAlignment::Centred)
             .unwrap_or_else(|error| panic!("valid letterbox: {error}"));
         assert_eq!(YoloxDecoder::grid(letterbox).len(), 3549);
         assert_eq!(YoloxDecoder::grid(small_letterbox()).len(), SMALL_ROWS);
@@ -386,7 +396,7 @@ mod tests {
 
     #[test]
     fn results_are_truncated_to_the_event_bound() {
-        let letterbox = Letterbox::new(1280, 720, 416, 416)
+        let letterbox = Letterbox::new(1280, 720, 416, 416, LetterboxAlignment::Centred)
             .unwrap_or_else(|error| panic!("valid letterbox: {error}"));
         let rows = YoloxDecoder::grid(letterbox).len();
         let mut values = vec![0.0; rows * COLUMNS];

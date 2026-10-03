@@ -17,6 +17,7 @@ use surveillance_detector::{
     decoder::{FfmpegDecoderConfig, FfmpegH264Decoder},
     detector::{DetectionHealth, DetectionOwner},
     gate::GatePolicy,
+    model_output::YOLOX_LETTERBOX_ALIGNMENT,
     sampler::TimestampSampler,
 };
 use surveillance_events::{
@@ -146,6 +147,7 @@ impl CameraPipeline {
                 width: config.inference.input_width,
                 height: config.inference.input_height,
                 hwaccel: config.detection_hwaccel.clone(),
+                letterbox_alignment: YOLOX_LETTERBOX_ALIGNMENT,
                 frame_limits: limits,
                 response_timeout: config.detection_decode_timeout,
                 max_access_unit_bytes: config.max_access_unit_bytes,
