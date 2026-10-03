@@ -13,9 +13,9 @@ use surveillance_camera::connection::{ConnectionState, StopReason};
 use surveillance_camera::supervisor::{JitterSource, SupervisorStopReason};
 use surveillance_config::settings::OneCameraConfig;
 use surveillance_detector::{
+    backend::PersonInferenceBackend,
     decoder::{FfmpegDecoderConfig, FfmpegH264Decoder},
     detector::{DetectionHealth, DetectionOwner},
-    inference::DeterministicFakeInference,
     sampler::TimestampSampler,
 };
 use surveillance_events::{
@@ -61,6 +61,10 @@ pub enum ActionableFailure {
 pub enum CameraPipelineError {
     Reconciliation,
     DetectionConfiguration,
+    /// A configured inference backend refused to come up. Carries the reason,
+    /// because "detection configuration is invalid" tells an operator nothing
+    /// about a missing model file or a hash that does not match.
+    InferenceBackend(String),
     PublicationConfiguration,
     JoinCancelled,
     JoinPanicked,
@@ -68,9 +72,16 @@ pub enum CameraPipelineError {
 
 impl fmt::Display for CameraPipelineError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Self::InferenceBackend(reason) = self {
+            return write!(
+                formatter,
+                "camera detection backend refused to start: {reason}"
+            );
+        }
         formatter.write_str(match self {
             Self::Reconciliation => "camera recording reconciliation discovery failed",
             Self::DetectionConfiguration => "camera detection configuration is invalid",
+            Self::InferenceBackend(_) => unreachable!("handled above"),
             Self::PublicationConfiguration => "camera live publication configuration is invalid",
             Self::JoinCancelled => "camera pipeline task was cancelled",
             Self::JoinPanicked => "camera pipeline task panicked",
@@ -119,8 +130,12 @@ impl CameraPipeline {
             let sampler =
                 TimestampSampler::new(config.detection_sample_rate, config.detection_max_gap)
                     .map_err(|_| CameraPipelineError::DetectionConfiguration)?;
-            let inference = DeterministicFakeInference::new()
-                .map_err(|_| CameraPipelineError::DetectionConfiguration)?;
+            // Selection, not construction: a configured model that cannot be
+            // loaded, or that this build has no backend for, refuses the
+            // pipeline rather than silently running the fixture. The error
+            // carries the reason so an operator can act on it.
+            let inference = PersonInferenceBackend::select(&config.inference)
+                .map_err(|error| CameraPipelineError::InferenceBackend(error.to_string()))?;
             let decoder = FfmpegH264Decoder::start(FfmpegDecoderConfig {
                 executable: config.detection_decoder.clone(),
                 width: config.recorder.width(),
