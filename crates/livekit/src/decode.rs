@@ -468,11 +468,28 @@ mod tests {
             "a cold decoder must be given more time than a warm one"
         );
 
-        // `yes` never reads its stdin and ignores the arguments it is handed, so
-        // the pipe fills and stays full. That is precisely a decoder that has
-        // not reached its input loop.
+        // A stand-in for a decoder that has not reached its input loop: it
+        // ignores the arguments it is handed, never reads its stdin, and —
+        // crucially — never writes its stdout.
+        //
+        // `yes` was the obvious choice and is the wrong one. It writes, so it
+        // races our stdin write: whichever happens first, the child filling a
+        // stdout pipe and taking SIGPIPE, or our 4 MiB write blocking. That
+        // race resolves differently per platform. On macOS the write blocks and
+        // the budget is measured; on Linux the child dies first and `feed`
+        // returns `Failed` after ~37 ms, so the test asserted the opposite of
+        // what it meant. A child that writes nothing cannot die that way.
+        let fixture = std::env::temp_dir().join(format!("cold-decoder-{}", std::process::id()));
+        std::fs::write(&fixture, "#!/bin/sh\nexec sleep 300\n")
+            .unwrap_or_else(|error| panic!("write the stalled decoder fixture: {error}"));
+        std::fs::set_permissions(
+            &fixture,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap_or_else(|error| panic!("mark the fixture runnable: {error}"));
+
         let mut decoder = H264ToI420::spawn(
-            "yes",
+            &fixture.to_string_lossy(),
             FrameSize::new(320, 240).unwrap_or_else(|error| panic!("{error}")),
             CollectingSink(Arc::new(Mutex::new(Vec::new()))),
             Arc::new(DecodeCounters::default()),
@@ -496,6 +513,7 @@ mod tests {
              budget rather than the startup budget"
         );
         decoder.shutdown().await;
+        let _ = std::fs::remove_file(&fixture);
     }
 
     #[tokio::test]
