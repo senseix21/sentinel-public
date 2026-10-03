@@ -129,6 +129,54 @@ reading documentation. None of these is visible on the development host, where
   succeeding on retry: the second non-hermetic build dependency, after
   `webrtc-sys`.
 
+### 3.3 Slice 7 real-model findings
+
+Established 2026-10-03 by running `DI.R8` in the container against the official
+`yolox_tiny.onnx` from the YOLOX 0.1.1rc0 release (20,219,662 bytes, SHA-256
+`427cc366…cc70b0f7`, Apache-2.0), on a photograph of a street containing four
+people: two unobstructed, one cropped by the right edge, one cropped by the left
+edge to an arm and a leg.
+
+- **The adapter detects.** Three detections at a 30% score threshold, each
+  landing on one of the three people that are more than a limb, each box inside
+  the frame, confidences 0.886, 0.876 and 0.862. The person cropped to an arm
+  was not found. This is the first evidence that any of this detects anything.
+- **The letterbox inverse is right on real output, not only on constructed
+  points.** The source is 810x1080, so the content occupies 312x416 of the
+  model's square with 52 columns of padding each side and none above or below.
+  A box reaching x=1.000 of the source therefore proves the inverse removes the
+  horizontal padding and rescales; a wrong inverse puts boxes consistently
+  beside the people rather than on them, which is exactly what a confidence
+  number cannot tell you.
+- **The released artifact is a raw export.** The decoder's grid and stride
+  reconstruction accepted its output shape, which it would not have done had the
+  export carried decoding inside it.
+- **Preprocessing belongs to an artifact, not to a family.** YOLOX 0.1.1rc0
+  preprocessing flips to RGB, divides by 255 and applies ImageNet mean and
+  standard deviation; from 0.2.0 it does none of that and feeds OpenCV's BGR
+  unchanged. This artifact is published under the earlier tag and behaves as the
+  later convention: unnormalized input produces the confident, correctly placed
+  boxes above.
+- **Channel order was measured, not assumed.** The control run with the channels
+  reversed scores at or below BGR on every box (0.886/0.862/0.844 against
+  0.886/0.875/0.861) with geometry unchanged to three decimal places. The
+  adapter feeds BGR as a result. The margin is small, as it should be for a
+  class identified by shape — which is why the wrong order would never have
+  announced itself, and why a comment in the adapter claiming this had been
+  established by running the artifact, written before any artifact had been run,
+  was worth more than the line it occupied.
+- **A passing `DI.R8` was not proof of detection.** Its per-box assertions hold
+  vacuously over an empty set, so a model that found nothing passed. It now
+  requires a stated minimum.
+- Load took 1.73 s and inference 133 ms, on one CPU thread, in a container, in
+  an **unoptimized debug build** with unoptimized preprocessing. The number is
+  recorded because it was observed. It is not a capacity figure, it is not from
+  the target hardware, and nothing may be divided by it.
+
+What this does not establish remains the larger part: accuracy on anything but
+this one frame, behaviour on the 114-grey padding this pipeline centres where
+YOLOX's own preprocessing puts it bottom-right, and every item in section 4.3.
+
 ## 4. Requirements status and open inputs
 
 ### 4.1 Accepted requirements
@@ -482,10 +530,15 @@ by this requirement, not deleted.
 ### DI.R8 — Real model through the full adapter
 
 Ignored by default, matching the repository convention for tests needing
-external artifacts. With a model file present, a fixture image extracted from a
-durable recording produces a decodable `DetectionSet`, the reported descriptor
-is production, and inference duration is recorded. This test is evidence that
-the adapter works; it is not evidence of accuracy.
+external artifacts. With a model file and a frame present, the frame produces a
+decodable `DetectionSet`, the reported descriptor is production, every box lies
+inside the frame, and the count meets a stated minimum — without which the test
+passes on a model that detects nothing, because its per-box assertions hold
+vacuously over an empty set. Inference duration is recorded.
+
+`make container-verify-model` runs it. Executed 2026-10-03; section 3.3 carries
+the result. This test is evidence that the adapter works end to end. It is not
+evidence of accuracy: one frame is an anecdote.
 
 ### DI.R9 — Isolation parity
 
@@ -528,8 +581,7 @@ Recorded in a dated `context/` snapshot at completion:
 
 - `DI.C1` through `DI.C13` hold.
 - `DI.R1` through `DI.R7`, `DI.R9` and `DI.R10` pass in CI.
-- `DI.R8` has been run once with its output recorded, or its non-execution is
-  stated explicitly.
+- `DI.R8` has been run once with its output recorded. Met: section 3.3.
 - `/api` reports production only for a build with loaded, warmed weights.
 - `ROADMAP.md` Phase 6 reflects the new state, with the accuracy item still
   open.

@@ -70,10 +70,14 @@ and the API reports `results_are_fixture: true`; a build with the
 real ONNX model and reports production. Which one is running is taken from the
 live backend, never from what the build contains.
 
+The ONNX adapter has been run end to end against a real artifact once, on one
+frame (`make container-verify-model`; specification section 3.3). That proves
+the adapter and the letterbox inverse, and nothing else.
+
 **Detection accuracy is still unevaluated.** Phase 6's remaining item needs a
 labeled dataset and agreed criteria, and neither exists. A working backend is
 not a working capability: do not describe detection as accurate, and do not
-quote a camera count from it.
+quote a camera count from it. One frame is an anecdote.
 
 ## Working conventions
 

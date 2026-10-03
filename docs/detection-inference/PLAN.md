@@ -309,21 +309,29 @@ number would hide which a change affected.
 
 `crates/detector/tests/onnx_real_model.rs` carries DI.R8, ignored by default and
 gated on the feature, taking the model and frame from the environment as the
-other external-artifact harnesses do. It asserts the backend reports production
-and that every box lands inside the frame, which is what catches a wrong inverse
-letterbox on real output. It is not evidence of accuracy.
+other external-artifact harnesses do. It asserts the backend reports production,
+that every box lands inside the frame, which is what catches a wrong inverse
+letterbox on real output, and that the count meets a stated minimum, without
+which a model detecting nothing passes. `make container-verify-model` runs it.
+It is not evidence of accuracy.
 
 
-- [ ] Add `DI.R8`, ignored by default, taking the model path from the
+- [x] Add `DI.R8`, ignored by default, taking the model path from the
   environment as the other external-artifact tests do.
-- [ ] Add the preprocess and decode duration counters.
-- [ ] Run `DI.R8` once with a real model and a frame from a durable recording;
-  record the detections produced and the durations measured.
+- [x] Add the preprocess and decode duration counters.
+- [x] Run `DI.R8` once with a real model and a frame; record the detections
+  produced and the durations measured. Run 2026-10-03 on `yolox_tiny.onnx`
+  from the YOLOX 0.1.1rc0 release against a street photograph holding four
+  people: three detections at 0.886, 0.876 and 0.862, each on one of the three
+  people that are more than a limb, each box inside the frame; load 1.73 s,
+  inference 133 ms, one CPU thread, container, debug build. The run also found
+  that the adapter was feeding the channels in the wrong order and that the
+  test could pass on a model detecting nothing. Specification section 3.3.
 
 Exit gate:
 
-- `DI.R8` has been run and its output recorded, or its non-execution is stated
-  explicitly with the reason.
+- `DI.R8` has been run and its output recorded. Met: specification section 3.3,
+  reproducible with `make container-verify-model`.
 - Durations are labelled as development-platform x86_64 CPU figures that do not
   transfer to the production target.
 - `make check` green with `DI.R8` ignored.
@@ -379,8 +387,10 @@ Exit gate:
 - The labeled dataset and accuracy criteria: absent. No slice depends on them,
   and no slice may substitute for them.
 - Cameras per unit and supported camera count: open. No slice claims either.
-- A physical camera: not required. `DI.R8` uses a frame from an existing
-  durable recording.
+- A physical camera: not required. `DI.R8` takes any still letterboxed to the
+  model's geometry; the run used a photograph, because what it proves is that
+  the adapter and the inverse are right, and a recording would prove the same
+  thing no better.
 
 ## 6. Completion statement template
 
@@ -388,7 +398,7 @@ Exit gate:
 > <counts>. The adapter loads <model file> with SHA-256 <hash> and resolves the
 > <provider> execution provider under ONNX Runtime <version>. Measured on
 > x86_64 CPU: preprocess <a> ms, inference <b> ms, decode <c> ms; these figures
-> do not transfer to the production target. `DI.R8` produced <detections> on a
-> frame from <recording>. Detection accuracy remains unevaluated: Phase 6's
+> do not transfer to the production target. `DI.R8` produced <detections> on
+> <frame>. Detection accuracy remains unevaluated: Phase 6's
 > accuracy item requires a labeled dataset and agreed criteria, neither of
 > which exists. No capacity claim is made or implied.
