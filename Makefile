@@ -21,7 +21,7 @@ RTSP_URL ?= $(SURVEILLANCE_RTSP_URL)
 RECORDING_ROOT ?= ./recordings
 HEALTH_BIND ?= 127.0.0.1:3000
 
-.PHONY: help prerequisites webcam-devices run run-release server direct-camera-qualification health live ready metrics recordings play verify-recordings check verify verify-onnx container-shell container-verify container-verify-onnx
+.PHONY: help prerequisites webcam-devices run run-release server direct-camera-qualification health live ready metrics recordings play verify-recordings check verify verify-onnx container-shell container-verify container-verify-onnx container-verify-model
 
 help: ## Show manual development commands and configurable values.
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-20s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -143,6 +143,42 @@ container-verify: container-image ## Run the deterministic gate in the container
 
 container-verify-onnx: container-image ## Run the ONNX gate in the container.
 	$(DOCKER_RUN) "$(IMAGE)" make verify-onnx
+
+# DI.R8: the adapter against a real model and a real frame. Neither input is
+# committed — the model is someone else's weights and the frame is a
+# photograph — so both are supplied, and the target names the missing one
+# rather than running a test that can pass by finding nothing.
+#
+# MODEL and FRAME are paths inside the repository, because the container sees
+# only what is mounted. SOURCE_WIDTH and SOURCE_HEIGHT are the camera geometry
+# the frame was letterboxed from, which is what the inverse needs; INPUT_WIDTH
+# and INPUT_HEIGHT are the model's. MINIMUM is how many detections the frame is
+# known to hold.
+MODEL ?=
+FRAME ?=
+SOURCE_WIDTH ?=
+SOURCE_HEIGHT ?=
+MODEL_SHA256 ?=
+INPUT_WIDTH ?= 416
+INPUT_HEIGHT ?= 416
+MINIMUM ?= 1
+
+container-verify-model: container-image ## Run DI.R8 on a real model. MODEL= FRAME= SOURCE_WIDTH= SOURCE_HEIGHT=
+	@test -n "$(MODEL)" || { echo "MODEL= is required: a path in this repository to an .onnx artifact" >&2; exit 1; }
+	@test -n "$(FRAME)" || { echo "FRAME= is required: a path in this repository to a raw RGB24 frame at the model's input geometry" >&2; exit 1; }
+	@test -n "$(SOURCE_WIDTH)" && test -n "$(SOURCE_HEIGHT)" || { echo "SOURCE_WIDTH= and SOURCE_HEIGHT= are required: the geometry the frame was letterboxed from" >&2; exit 1; }
+	$(DOCKER_RUN) \
+		-e DETECTION_MODEL_PATH="/work/$(MODEL)" \
+		-e DETECTION_FRAME_PATH="/work/$(FRAME)" \
+		-e DETECTION_FRAME_WIDTH="$(INPUT_WIDTH)" \
+		-e DETECTION_FRAME_HEIGHT="$(INPUT_HEIGHT)" \
+		-e DETECTION_SOURCE_WIDTH="$(SOURCE_WIDTH)" \
+		-e DETECTION_SOURCE_HEIGHT="$(SOURCE_HEIGHT)" \
+		-e DETECTION_MODEL_SHA256="$(MODEL_SHA256)" \
+		-e DETECTION_MINIMUM_DETECTIONS="$(MINIMUM)" \
+		"$(IMAGE)" cargo test -p surveillance-detector \
+		--features surveillance-detector/onnx-inference \
+		--test onnx_real_model -- --ignored --nocapture
 
 .PHONY: container-image
 .PHONY: audit

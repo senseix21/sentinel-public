@@ -227,15 +227,28 @@ impl OnnxPersonInference {
         if stride < width * CHANNELS || pixels.len() < stride * height {
             return Err(InferenceError::new(InferenceFailureKind::MalformedOutput));
         }
-        // YOLOX takes unnormalized 0-255 RGB in CHW order, established by
-        // running the artifact rather than from documentation.
+        // YOLOX takes unnormalized 0-255 values in CHW order with the channels
+        // in OpenCV's BGR sequence, which is what its own preprocessing feeds
+        // from 0.2.0 onward: it pads, transposes and casts, and never flips the
+        // channels of the BGR image OpenCV handed it. Earlier revisions did
+        // flip, and also divided by 255 and applied ImageNet mean and standard
+        // deviation, so preprocessing belongs to an artifact and not to a
+        // family.
+        //
+        // Established by running yolox_tiny against a frame holding people
+        // (DI.R8, specification section 3.3), including the control with the
+        // channels the other way round: unnormalized input produces confident
+        // correctly placed boxes, and BGR scores at or above RGB on every box.
+        // The margin is small, as it should be for a class identified by shape,
+        // which is also why the wrong order here would not have announced
+        // itself.
         for y in 0..height {
             let row = y * stride;
             for x in 0..width {
                 let source = row + x * CHANNELS;
                 for channel in 0..CHANNELS {
                     self.scratch[channel * plane + y * width + x] =
-                        f32::from(pixels[source + channel]);
+                        f32::from(pixels[source + (CHANNELS - 1 - channel)]);
                 }
             }
         }

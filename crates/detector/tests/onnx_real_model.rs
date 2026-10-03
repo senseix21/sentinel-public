@@ -18,6 +18,11 @@
 //!   --test onnx_real_model -- --ignored
 //! ```
 //!
+//! `DETECTION_MINIMUM_DETECTIONS` is how many the frame is known to contain,
+//! and defaults to one. Without it this test passes on a model that detects
+//! nothing at all: the per-box assertions below hold vacuously over an empty
+//! set, so silence would read as success.
+//!
 //! The frame is raw packed RGB24 at the model's input geometry, which is what
 //! the detector's decoder now produces. Create one with:
 //!
@@ -57,7 +62,11 @@ fn a_real_model_produces_detections_from_a_real_frame() {
     let input_height = dimension("DETECTION_FRAME_HEIGHT");
     let config = InferenceBackendConfig {
         model_path: Some(required("DETECTION_MODEL_PATH").into()),
-        model_sha256: std::env::var("DETECTION_MODEL_SHA256").ok(),
+        // An empty value is no pin, not a pin that nothing can match: the
+        // Makefile target passes the variable through whether or not it is set.
+        model_sha256: std::env::var("DETECTION_MODEL_SHA256")
+            .ok()
+            .filter(|value| !value.is_empty()),
         source_width: dimension("DETECTION_SOURCE_WIDTH"),
         source_height: dimension("DETECTION_SOURCE_HEIGHT"),
         input_width,
@@ -106,6 +115,18 @@ fn a_real_model_produces_detections_from_a_real_frame() {
         .infer(&frame)
         .unwrap_or_else(|error| panic!("inference must succeed: {error}"));
     let inference_duration = started.elapsed();
+
+    // The frame is supplied because it holds people. A model that loads, runs,
+    // and finds none of them has failed in the way that matters, and every
+    // assertion that follows is satisfied by an empty set.
+    let minimum: usize = std::env::var("DETECTION_MINIMUM_DETECTIONS")
+        .map_or(Ok(1), |value| value.parse())
+        .unwrap_or_else(|error| panic!("DETECTION_MINIMUM_DETECTIONS must be a number: {error}"));
+    assert!(
+        detections.as_slice().len() >= minimum,
+        "expected at least {minimum} detection(s), got {}: the adapter ran and found nothing",
+        detections.as_slice().len()
+    );
 
     // Every box must be inside the frame. A wrong inverse letterbox produces
     // boxes that look plausible and are consistently displaced, so this is the
