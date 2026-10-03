@@ -64,9 +64,16 @@ claim. `ROADMAP.md` is the authority on per-phase status.
 | `docs/phase-N/` | Per-phase contracts and evidence. |
 | `context/YYYY-MM-DD[-HHMM]/` | Dated session snapshots; `context/README.md` points at the latest. |
 
-Detection currently runs `DeterministicFakeInference` — the only implementation
-of the `PersonInference` trait. There is no production model. Do not describe
-detection as a working capability; it is a wired seam with a fixture behind it.
+Detection has two backends. A default build runs `DeterministicFakeInference`
+and the API reports `results_are_fixture: true`; a build with the
+`onnx-inference` feature and a configured `camera.detection.model_path` runs a
+real ONNX model and reports production. Which one is running is taken from the
+live backend, never from what the build contains.
+
+**Detection accuracy is still unevaluated.** Phase 6's remaining item needs a
+labeled dataset and agreed criteria, and neither exists. A working backend is
+not a working capability: do not describe detection as accurate, and do not
+quote a camera count from it.
 
 ## Working conventions
 

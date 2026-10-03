@@ -409,6 +409,12 @@ Add sampled human detection as an independently degradable media consumer and pu
 - [x] Event ordering and overflow tests for each event class.
 - [x] Subscriber crash/unsubscribe and graceful shutdown tests.
 - [!] Accuracy evaluation on an agreed labeled dataset, separated from systems throughput benchmarks. Production model/dataset/criteria remain external product gates; deterministic systems workload evidence is recorded separately.
+  A real backend now exists: ONNX Runtime behind the `onnx-inference` feature,
+  with YOLOX as a reversible documented default (ADR 015,
+  `docs/detection-inference/`). That changes nothing here. The dataset and the
+  criteria are what this item waits on, and a loaded model is not evidence about
+  what it detects. The API reports which backend is live so no reader has to
+  assume.
 
 ### Exit gate
 

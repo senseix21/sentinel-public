@@ -216,6 +216,19 @@ Findings that changed the design, recorded in specification section 3.2:
 
 ## Slice 4 — The production claim becomes runtime-sourced
 
+Implemented. `DetectionHealthSnapshot` carries the live backend's descriptor,
+taken from the object the owner was handed, and `GET /api/system` aggregates it
+from the camera registry instead of asking what the build contains.
+`compiled_backend()` is removed: its answer was a build fact, and a build can
+carry the ONNX backend and run with no weights.
+
+The aggregate under-claims on purpose. No detector running reports neither
+production nor fixture, because there are no results to characterise. Any
+fixture backend among the running detectors reports the whole deployment as
+fixture, because one stream of fabricated detections is enough to mislead
+whoever reads them.
+
+
 - [ ] Derive `InferenceDescriptor` from the live inference object.
 - [ ] Replace `compiled_backend()`'s build-fact meaning with the runtime
   invariant of `DI.C8`.
@@ -234,6 +247,17 @@ Exit gate:
 
 ## Slice 5 — Scale at decode
 
+Implemented. The detector's FFmpeg invocation scales to the model's input
+geometry with centred 114-grey padding, so frames arrive at roughly a fifth of
+their former size at 1080p and the adapter copies rather than resizes.
+`-hwaccel` is a per-camera setting, defaulting to software decode.
+
+One consequence needed handling rather than assuming: with frames arriving
+already padded, a letterbox derived from the frame would map detections into
+padded space. The adapter now builds it once from the camera's configured
+geometry, which is the only remaining record of what the camera actually sees.
+
+
 - [ ] Add the scale and pad filter to the detector's FFmpeg invocation, derived
   from configured input geometry.
 - [ ] Recompute the per-camera memory budget from scaled dimensions, including
@@ -251,6 +275,16 @@ Exit gate:
 
 ## Slice 6 — Motion gate
 
+Implemented. The gate decides after sampling and before inference, admitting on
+motion, within the cooldown of a recent detection, or on the heartbeat. State is
+per camera and resets on a connection epoch change, because a new connection is
+a new scene and comparing across it would report motion that never happened.
+
+Frame comparison samples every 64th byte: enough to separate a still scene from
+a moving one, where comparing whole frames would cost more than the inference it
+avoids.
+
+
 - [ ] Implement per-camera gate state: retained reference frame, cooldown
   deadline, heartbeat deadline, reset on `connection_epoch` change.
 - [ ] Implement the three-way decision of `DI.C9`.
@@ -267,6 +301,18 @@ Exit gate:
 - `make check` green.
 
 ## Slice 7 — Real model end to end
+
+Implemented. `gate_skipped`, `gate_heartbeat`, `preprocess_duration_micros` and
+`output_decode_duration_micros` join the detection counters; preprocessing and
+inference are counted apart because they scale with different things and one
+number would hide which a change affected.
+
+`crates/detector/tests/onnx_real_model.rs` carries DI.R8, ignored by default and
+gated on the feature, taking the model and frame from the environment as the
+other external-artifact harnesses do. It asserts the backend reports production
+and that every box lands inside the frame, which is what catches a wrong inverse
+letterbox on real output. It is not evidence of accuracy.
+
 
 - [ ] Add `DI.R8`, ignored by default, taking the model path from the
   environment as the other external-artifact tests do.

@@ -156,6 +156,7 @@ camera cardinality is already bounded by `supervision.maximum_cameras`.
 | `camera.detection.motion_threshold_percent` | `u8` | `Immediate` | Public |
 | `camera.detection.gate_cooldown` | `Duration` | `Immediate` | Public |
 | `camera.detection.gate_heartbeat` | `Duration` | `Immediate` | Public |
+| `camera.detection.hwaccel` | `String` | `PipelineRestart` | Public |
 | `camera.detection.decoded_frame_max_bytes` | `usize` | `PipelineRestart` | Public |
 | `camera.detection.decoder` | `PathBuf` | `PipelineRestart` | Public |
 | `camera.detection.decode_timeout` | `Duration` | `PipelineRestart` | Public |
