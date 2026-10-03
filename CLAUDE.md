@@ -16,13 +16,19 @@ make check    # the full gate: fmt --check, clippy -D warnings, test, release bu
 make help     # manual development targets and their overridable variables
 ```
 
+The ONNX inference backend is optional, behind the `onnx-inference` feature,
+because `ort` has no prebuilt for `x86_64-apple-darwin`. `make verify` covers
+default features and runs anywhere; `make verify-onnx` covers the backend and
+needs a platform `ort` supports. `make container-verify-onnx` provides one.
+See `docs/adr/015-onnx-person-inference.md`.
+
 `make check` is the completion gate. Run it before claiming a phase or slice is
 done. Individual steps:
 
 ```bash
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 cargo build --workspace --release
 ```
 
