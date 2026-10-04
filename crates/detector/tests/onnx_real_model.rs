@@ -29,7 +29,7 @@
 //! ```text
 //! ffmpeg -i frame.png -vf \
 //!   "scale=416:416:force_original_aspect_ratio=decrease,\
-//!    pad=416:416:(ow-iw)/2:(oh-ih)/2:color=0x727272" \
+//!    pad=416:416:0:0:color=0x727272" \
 //!   -pix_fmt rgb24 -f rawvideo frame.rgb
 //! ```
 
