@@ -2127,7 +2127,20 @@ async fn route_with_recordings(
             let backends: Vec<Option<InferenceDescriptor>> = registry
                 .snapshots()
                 .into_iter()
-                .map(|camera| camera.health.and_then(|health| health.detection.backend))
+                .map(|camera| {
+                    camera.health.and_then(|health| {
+                        use surveillance_detector::detector::DetectionState;
+                        match health.detection.state {
+                            DetectionState::Starting
+                            | DetectionState::Running
+                            | DetectionState::Degraded => health.detection.backend,
+                            DetectionState::Disabled
+                            | DetectionState::Terminal
+                            | DetectionState::Stopping
+                            | DetectionState::Stopped => None,
+                        }
+                    })
+                })
                 .collect();
             let surfaces = SurfaceAvailability {
                 recording_index: recordings.is_some(),
