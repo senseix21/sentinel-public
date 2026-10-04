@@ -208,7 +208,12 @@ impl OnnxPersonInference {
     fn warm_up(&mut self) -> Result<(), OnnxBackendError> {
         let pixels = vec![0_u8; CHANNELS * self.input_width as usize * self.input_height as usize];
         self.run(&pixels, self.input_width as usize * CHANNELS)
-            .map(|_| ())
+            .and_then(|(shape, values)| {
+                self.decoder
+                    .decode(&values, &shape, self.letterbox, self.thresholds)
+                    .map(|_| ())
+                    .map_err(|_| InferenceError::new(InferenceFailureKind::MalformedOutput))
+            })
             .map_err(|error| OnnxBackendError::WarmUp(format!("{error}")))
     }
 
