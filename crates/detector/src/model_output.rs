@@ -212,7 +212,10 @@ impl ModelOutputDecoder for YoloxDecoder {
 
         let kept = suppress(&mut candidates, thresholds.nms_iou);
         let mut detections = Vec::new();
-        for candidate in kept.into_iter().take(MAX_DETECTIONS_PER_EVENT) {
+        for candidate in kept {
+            if detections.len() == MAX_DETECTIONS_PER_EVENT {
+                break;
+            }
             let Some(rect) = letterbox.to_normalized_source(
                 candidate.left,
                 candidate.top,
