@@ -479,17 +479,18 @@ mod tests {
         // the budget is measured; on Linux the child dies first and `feed`
         // returns `Failed` after ~37 ms, so the test asserted the opposite of
         // what it meant. A child that writes nothing cannot die that way.
-        let fixture = std::env::temp_dir().join(format!("cold-decoder-{}", std::process::id()));
-        std::fs::write(&fixture, "#!/bin/sh\nexec sleep 300\n")
-            .unwrap_or_else(|error| panic!("write the stalled decoder fixture: {error}"));
-        std::fs::set_permissions(
-            &fixture,
-            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
-        )
-        .unwrap_or_else(|error| panic!("mark the fixture runnable: {error}"));
+        //
+        // It is committed rather than written here, which is the second race
+        // this test lost. Creating an executable and immediately running it is
+        // safe only in a single-threaded process: any sibling thread spawning a
+        // child forks a copy of the write descriptor that `fs::write` has not
+        // closed yet, and the kernel refuses to exec a file held open for
+        // writing. It failed as ETXTBSY about once in 120 runs under spawn
+        // pressure, and reported it as a missing decoder binary.
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/stalled-decoder.sh");
 
         let mut decoder = H264ToI420::spawn(
-            &fixture.to_string_lossy(),
+            fixture,
             FrameSize::new(320, 240).unwrap_or_else(|error| panic!("{error}")),
             CollectingSink(Arc::new(Mutex::new(Vec::new()))),
             Arc::new(DecodeCounters::default()),
@@ -513,7 +514,6 @@ mod tests {
              budget rather than the startup budget"
         );
         decoder.shutdown().await;
-        let _ = std::fs::remove_file(&fixture);
     }
 
     #[tokio::test]
