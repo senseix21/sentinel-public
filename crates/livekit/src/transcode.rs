@@ -276,24 +276,7 @@ impl Session {
             counters: Arc::clone(counters),
         };
         let decoder = H264ToI420::spawn(program, track.size, sink, Arc::clone(decode_counters))
-            .map_err(|error| {
-                AdapterError::new(match error {
-                    // A missing or unrunnable decoder binary will still be
-                    // missing next time, so this stops the publication once
-                    // instead of entering a reconnect loop over a deployment
-                    // fault.
-                    DecodeError::Unavailable => AdapterErrorKind::Unavailable,
-                    // Exhaustive rather than a wildcard: the difference between
-                    // these two arms is a camera that comes back on its own and
-                    // one that does not, so a variant added later should have
-                    // to be placed here deliberately instead of inheriting
-                    // whichever answer happened to be the default.
-                    DecodeError::StartFailed
-                    | DecodeError::Geometry
-                    | DecodeError::Failed
-                    | DecodeError::Overloaded => AdapterErrorKind::Transport,
-                })
-            })?;
+            .map_err(|error| AdapterError::new(start_failure_kind(error)))?;
         track.decoder = Some(decoder);
         Ok(())
     }
@@ -526,6 +509,28 @@ impl PublicationAdapter for TranscodePublicationAdapter {
             }
             Ok(())
         })
+    }
+}
+
+/// How a failed decoder start is reported to the publication loop.
+///
+/// A missing or unrunnable decoder binary will still be missing next time, so
+/// it stops the publication once instead of entering a reconnect loop over a
+/// deployment fault. Everything else is a fault of the moment and is retried.
+///
+/// Exhaustive rather than a wildcard: the difference between these two arms is
+/// a camera that comes back on its own and one that does not, so a variant
+/// added later has to be placed here deliberately instead of inheriting
+/// whichever answer happened to be the default. Named rather than inline so the
+/// recovery test can produce an error through the real decoder and send it
+/// through this exact mapping, instead of asserting against a copy of it.
+pub(crate) const fn start_failure_kind(error: DecodeError) -> AdapterErrorKind {
+    match error {
+        DecodeError::Unavailable => AdapterErrorKind::Unavailable,
+        DecodeError::StartFailed
+        | DecodeError::Geometry
+        | DecodeError::Failed
+        | DecodeError::Overloaded => AdapterErrorKind::Transport,
     }
 }
 
