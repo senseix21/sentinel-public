@@ -12,6 +12,8 @@ workspace = true
 
 [dependencies]
 livekit.workspace = true
+# To pull frames off the subscriber's video stream, which is a `Stream`.
+futures-util.workspace = true
 livekit-api.workspace = true
 serde.workspace = true
 surveillance-common = { path = "../common" }
@@ -28,3 +30,5 @@ http.workspace = true
 # prove a track reached one. The library already depends on this; a test can
 # only reach it through a development dependency.
 livekit.workspace = true
+# To pull frames off the subscriber's video stream, which is a `Stream`.
+futures-util.workspace = true
