@@ -278,11 +278,20 @@ impl Session {
         let decoder = H264ToI420::spawn(program, track.size, sink, Arc::clone(decode_counters))
             .map_err(|error| {
                 AdapterError::new(match error {
-                    // A missing decoder binary will still be missing next time,
-                    // so this stops the publication once instead of entering a
-                    // reconnect loop over a deployment fault.
+                    // A missing or unrunnable decoder binary will still be
+                    // missing next time, so this stops the publication once
+                    // instead of entering a reconnect loop over a deployment
+                    // fault.
                     DecodeError::Unavailable => AdapterErrorKind::Unavailable,
-                    _ => AdapterErrorKind::Transport,
+                    // Exhaustive rather than a wildcard: the difference between
+                    // these two arms is a camera that comes back on its own and
+                    // one that does not, so a variant added later should have
+                    // to be placed here deliberately instead of inheriting
+                    // whichever answer happened to be the default.
+                    DecodeError::StartFailed
+                    | DecodeError::Geometry
+                    | DecodeError::Failed
+                    | DecodeError::Overloaded => AdapterErrorKind::Transport,
                 })
             })?;
         track.decoder = Some(decoder);
