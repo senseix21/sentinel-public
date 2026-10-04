@@ -444,7 +444,7 @@ impl CameraSupervisor {
                 self.operations.spawn(async move {
                     OperationCompletion::Started {
                         camera_id,
-                        result: CameraPipeline::start(config, metadata_writer, event_bus),
+                        result: CameraPipeline::start(config, metadata_writer, event_bus).await,
                     }
                 });
             }

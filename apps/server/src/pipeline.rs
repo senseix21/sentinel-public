@@ -67,6 +67,7 @@ pub enum CameraPipelineError {
     /// because "detection configuration is invalid" tells an operator nothing
     /// about a missing model file or a hash that does not match.
     InferenceBackend(String),
+    InferenceBackendTask,
     PublicationConfiguration,
     JoinCancelled,
     JoinPanicked,
@@ -84,6 +85,7 @@ impl fmt::Display for CameraPipelineError {
             Self::Reconciliation => "camera recording reconciliation discovery failed",
             Self::DetectionConfiguration => "camera detection configuration is invalid",
             Self::InferenceBackend(_) => unreachable!("handled above"),
+            Self::InferenceBackendTask => "camera detection backend initialization task failed",
             Self::PublicationConfiguration => "camera live publication configuration is invalid",
             Self::JoinCancelled => "camera pipeline task was cancelled",
             Self::JoinPanicked => "camera pipeline task panicked",
@@ -111,7 +113,7 @@ impl CameraPipeline {
         clippy::too_many_lines,
         reason = "one construction boundary keeps child ownership explicit"
     )]
-    pub fn start(
+    pub async fn start(
         config: Arc<OneCameraConfig>,
         metadata_writer: Option<MetadataWriterHandle>,
         event_bus: EventBus,
@@ -140,8 +142,13 @@ impl CameraPipeline {
             // loaded, or that this build has no backend for, refuses the
             // pipeline rather than silently running the fixture. The error
             // carries the reason so an operator can act on it.
-            let inference = PersonInferenceBackend::select(&config.inference)
-                .map_err(|error| CameraPipelineError::InferenceBackend(error.to_string()))?;
+            let inference_config = config.inference.clone();
+            let inference = tokio::task::spawn_blocking(move || {
+                PersonInferenceBackend::select(&inference_config)
+            })
+            .await
+            .map_err(|_| CameraPipelineError::InferenceBackendTask)?
+            .map_err(|error| CameraPipelineError::InferenceBackend(error.to_string()))?;
             let decoder = FfmpegH264Decoder::start(FfmpegDecoderConfig {
                 executable: config.detection_decoder.clone(),
                 width: config.inference.input_width,
