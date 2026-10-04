@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use surveillance_media::frame::DecodedFrame;
 
-/// How the gate is tuned. All three are immediate settings.
+/// How the gate is tuned. All three settings require a pipeline restart.
 #[derive(Clone, Copy, Debug)]
 pub struct GatePolicy {
     motion_threshold_percent: u8,
@@ -125,6 +125,12 @@ impl MotionGate {
         self.last_detection = Some(now);
     }
 
+    /// Clears media-time deadlines after the sampler detects a timeline reset.
+    pub fn reset_timing(&mut self) {
+        self.last_inference = None;
+        self.last_detection = None;
+    }
+
     fn decide(&self, changed_percent: u8, now: Duration) -> GateDecision {
         if self.reference.is_none() {
             // The first frame of a connection has nothing to compare against.
@@ -172,9 +178,58 @@ impl MotionGate {
                 differing += 1;
             }
         }
+
         if examined == 0 {
             return 0;
         }
         u8::try_from(differing.saturating_mul(100) / examined).unwrap_or(100)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GateDecision, GatePolicy, MotionGate};
+    use std::{
+        sync::Arc,
+        time::{Duration, SystemTime},
+    };
+    use surveillance_common::types::CameraId;
+    use surveillance_media::{
+        frame::{DecodedFrame, FrameLimits, PixelFormat},
+        packet::MediaTimestamp,
+    };
+
+    fn frame() -> DecodedFrame {
+        DecodedFrame::new(
+            CameraId::new("camera-01").unwrap_or_else(|error| panic!("camera: {error}")),
+            1,
+            MediaTimestamp::new(0, 90_000).unwrap_or_else(|error| panic!("timestamp: {error}")),
+            SystemTime::UNIX_EPOCH,
+            2,
+            2,
+            6,
+            PixelFormat::Rgb24,
+            Arc::from([0_u8; 12]),
+            FrameLimits::new(2, 2, 12).unwrap_or_else(|error| panic!("limits: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("frame: {error}"))
+    }
+
+    #[test]
+    fn timing_reset_restarts_heartbeat_after_backward_media_time() {
+        let policy = GatePolicy::new(100, Duration::from_secs(5), Duration::from_secs(10))
+            .unwrap_or_else(|error| panic!("policy: {error}"));
+        let mut gate = MotionGate::new(policy);
+        let frame = frame();
+
+        assert_eq!(
+            gate.admit(&frame, Duration::from_secs(120)),
+            GateDecision::Heartbeat
+        );
+        assert_eq!(gate.admit(&frame, Duration::ZERO), GateDecision::Skip);
+
+        gate.reset_timing();
+
+        assert_eq!(gate.admit(&frame, Duration::ZERO), GateDecision::Heartbeat);
     }
 }

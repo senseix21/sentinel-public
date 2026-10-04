@@ -80,8 +80,8 @@ sample_fps = 5
 # Apply-time: model_path, model_sha256, input_width, input_height,
 # execution_providers, intra_op_threads and inter_op_threads rebuild that
 # camera's pipeline, which interrupts its recording and is operator-triggered.
-# The thresholds and gate timings below take effect immediately, because their
-# consumer re-reads them on each use.
+# Thresholds and gate timings are captured by the detector at startup. Changes
+# require an operator-triggered camera pipeline restart, which interrupts recording.
 #
 # model_path = "/srv/surveillance/models/yolox_tiny.onnx"
 # model_sha256 = "427cc366d34e27ff7a03e2899b5e3671425c262ea2291f88bb942bc1cc70b0f7"
@@ -92,8 +92,9 @@ sample_fps = 5
 input_width = 416
 input_height = 416
 
-# Ordered, comma-separated. Availability reported by the runtime is not proof:
-# a provider is accepted only after a warm-up inference actually runs on it.
+# Ordered, comma-separated: cpu, cuda, or tensorrt. Unknown or unavailable
+# providers refuse startup rather than silently falling back. Availability
+# reported by the runtime is not proof: warm-up inference validates the session.
 execution_providers = "cpu"
 
 # One thread each. A session per camera with machine-sized pools would contend

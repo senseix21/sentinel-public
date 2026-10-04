@@ -382,10 +382,10 @@ settings! {
         Duration, [];
     CameraVideoWidth =>
         "camera.video.width", Operational, PipelineRestart, Public, PerCamera, Unsigned,
-        [CameraMemoryBudget, DecodedFrameBudget];
+        [CameraMemoryBudget];
     CameraVideoHeight =>
         "camera.video.height", Operational, PipelineRestart, Public, PerCamera, Unsigned,
-        [CameraMemoryBudget, DecodedFrameBudget];
+        [CameraMemoryBudget];
     CameraQueueRecorderItems =>
         "camera.queue.recorder_items", Operational, PipelineRestart, Public, PerCamera, Unsigned,
         [CameraMemoryBudget];
@@ -460,18 +460,19 @@ settings! {
         "camera.detection.inter_op_threads", Operational, PipelineRestart, Public, PerCamera,
         Unsigned, [];
     CameraDetectionScoreThresholdPercent =>
-        "camera.detection.score_threshold_percent", Operational, Immediate, Public, PerCamera,
+        "camera.detection.score_threshold_percent", Operational, PipelineRestart, Public, PerCamera,
         Unsigned, [];
     CameraDetectionNmsIouPercent =>
-        "camera.detection.nms_iou_percent", Operational, Immediate, Public, PerCamera, Unsigned,
+        "camera.detection.nms_iou_percent", Operational, PipelineRestart, Public, PerCamera, Unsigned,
         [];
     CameraDetectionMotionThresholdPercent =>
-        "camera.detection.motion_threshold_percent", Operational, Immediate, Public, PerCamera,
+        "camera.detection.motion_threshold_percent", Operational, PipelineRestart, Public, PerCamera,
         Unsigned, [];
     CameraDetectionGateCooldown =>
-        "camera.detection.gate_cooldown", Operational, Immediate, Public, PerCamera, Duration, [];
+        "camera.detection.gate_cooldown", Operational, PipelineRestart, Public, PerCamera, Duration,
+        [];
     CameraDetectionGateHeartbeat =>
-        "camera.detection.gate_heartbeat", Operational, Immediate, Public, PerCamera, Duration,
+        "camera.detection.gate_heartbeat", Operational, PipelineRestart, Public, PerCamera, Duration,
         [];
     CameraDetectionHwaccel =>
         "camera.detection.hwaccel", Operational, PipelineRestart, Public, PerCamera, Text, [];
@@ -595,6 +596,19 @@ mod tests {
                 );
                 assert!(!id.api_editable(), "{id} is bootstrap but API-editable");
             }
+        }
+    }
+
+    #[test]
+    fn captured_detection_thresholds_and_gate_settings_require_pipeline_restart() {
+        for id in [
+            SettingId::CameraDetectionScoreThresholdPercent,
+            SettingId::CameraDetectionNmsIouPercent,
+            SettingId::CameraDetectionMotionThresholdPercent,
+            SettingId::CameraDetectionGateCooldown,
+            SettingId::CameraDetectionGateHeartbeat,
+        ] {
+            assert_eq!(id.boundary(), ApplicationBoundary::PipelineRestart, "{id}");
         }
     }
 

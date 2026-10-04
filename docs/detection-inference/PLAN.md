@@ -277,8 +277,8 @@ Exit gate:
 
 Implemented. The gate decides after sampling and before inference, admitting on
 motion, within the cooldown of a recent detection, or on the heartbeat. State is
-per camera and resets on a connection epoch change, because a new connection is
-a new scene and comparing across it would report motion that never happened.
+per camera and resets on a connection epoch change. Its timing also resets when
+the sampler detects backward media time or a timebase discontinuity.
 
 Frame comparison samples every 64th byte: enough to separate a still scene from
 a moving one, where comparing whole frames would cost more than the inference it
@@ -288,8 +288,8 @@ avoids.
 - [ ] Implement per-camera gate state: retained reference frame, cooldown
   deadline, heartbeat deadline, reset on `connection_epoch` change.
 - [ ] Implement the three-way decision of `DI.C9`.
-- [ ] Add `detection_inference_gate_skipped_total` and
-  `detection_inference_heartbeat_total`.
+- [x] Export `surveillance_detector_gate_skipped_total` and
+  `surveillance_detector_gate_heartbeat_total` with bounded per-camera labels.
 - [ ] `DI.R3` state-machine tests.
 
 Exit gate:

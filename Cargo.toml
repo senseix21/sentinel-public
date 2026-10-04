@@ -47,6 +47,8 @@ ort = { version = "=2.0.0-rc.13", default-features = false, features = [
     # fails with `undefined symbol: OrtGetApiBase`.
     "download-binaries",
     "copy-dylibs",
+    "cuda",
+    "tensorrt",
     # Loaded at runtime rather than linked. ONNX Runtime and libwebrtc each
     # statically vendor protobuf and Abseil, and `crates/config` depends on both
     # `surveillance-detector` and `surveillance-livekit`, so every binary above

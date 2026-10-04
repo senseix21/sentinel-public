@@ -769,6 +769,21 @@ fn detection_capability(backends: &[Option<InferenceDescriptor>]) -> DetectionCa
     }
 }
 
+fn live_detection_backend(
+    detection: &surveillance_detector::detector::DetectionHealthSnapshot,
+) -> Option<InferenceDescriptor> {
+    use surveillance_detector::detector::DetectionState;
+    match detection.state {
+        DetectionState::Starting | DetectionState::Running | DetectionState::Degraded => {
+            detection.backend.clone()
+        }
+        DetectionState::Disabled
+        | DetectionState::Terminal
+        | DetectionState::Stopping
+        | DetectionState::Stopped => None,
+    }
+}
+
 /// Describes what this deployment can and cannot do.
 ///
 /// This endpoint exists for one reason above the others: **detection results
@@ -2128,18 +2143,9 @@ async fn route_with_recordings(
                 .snapshots()
                 .into_iter()
                 .map(|camera| {
-                    camera.health.and_then(|health| {
-                        use surveillance_detector::detector::DetectionState;
-                        match health.detection.state {
-                            DetectionState::Starting
-                            | DetectionState::Running
-                            | DetectionState::Degraded => health.detection.backend,
-                            DetectionState::Disabled
-                            | DetectionState::Terminal
-                            | DetectionState::Stopping
-                            | DetectionState::Stopped => None,
-                        }
-                    })
+                    camera
+                        .health
+                        .and_then(|health| live_detection_backend(&health.detection))
                 })
                 .collect();
             let surfaces = SurfaceAvailability {
@@ -3443,6 +3449,7 @@ fn render_metrics(
                 surveillance_detector::detector::DetectionState::Stopped => 6,
             },
         );
+        detection_gate_metrics(&mut output, camera, detection.counters);
         for (name, value) in [
             (
                 "surveillance_detector_encoded_considered_total",
@@ -3693,6 +3700,25 @@ const fn publication_state_value(state: surveillance_livekit::domain::Publicatio
 
 fn metric(output: &mut String, name: &str, camera: &str, value: impl std::fmt::Display) {
     let _ = writeln!(output, "{name}{{camera_id=\"{camera}\"}} {value}");
+}
+
+fn detection_gate_metrics(
+    output: &mut String,
+    camera: &str,
+    counters: surveillance_detector::detector::DetectionCounters,
+) {
+    metric(
+        output,
+        "surveillance_detector_gate_skipped_total",
+        camera,
+        counters.gate_skipped,
+    );
+    metric(
+        output,
+        "surveillance_detector_gate_heartbeat_total",
+        camera,
+        counters.gate_heartbeat,
+    );
 }
 
 fn queue_metrics(
@@ -4864,6 +4890,43 @@ mod tests {
         );
         assert!(mixed.results_are_fixture);
         assert_eq!(mixed.model_name, "mixed");
+    }
+
+    #[test]
+    fn terminal_detector_is_excluded_from_live_backend_status() {
+        use super::live_detection_backend;
+        use surveillance_detector::{
+            detector::{DetectionHealth, DetectionState},
+            inference::{DeterministicFakeInference, InferenceDescriptor},
+        };
+
+        let descriptor = InferenceDescriptor::of(
+            &DeterministicFakeInference::new().expect("the fixture backend builds"),
+        );
+        let mut terminal = DetectionHealth::disabled_snapshot();
+        terminal.state = DetectionState::Terminal;
+        terminal.backend = Some(descriptor.clone());
+
+        assert!(live_detection_backend(&terminal).is_none());
+
+        terminal.state = DetectionState::Running;
+        assert_eq!(live_detection_backend(&terminal), Some(descriptor));
+    }
+
+    #[test]
+    fn detector_gate_counters_are_exported_with_bounded_camera_labels() {
+        let mut counters = surveillance_detector::detector::DetectionCounters::default();
+        counters.gate_skipped = 7;
+        counters.gate_heartbeat = 2;
+        let mut output = String::new();
+
+        super::detection_gate_metrics(&mut output, "camera-01", counters);
+
+        assert!(
+            output.contains("surveillance_detector_gate_skipped_total{camera_id=\"camera-01\"} 7")
+        );
+        assert!(output
+            .contains("surveillance_detector_gate_heartbeat_total{camera_id=\"camera-01\"} 2"));
     }
 
     /// The capabilities endpoint is authenticated like every other read.
