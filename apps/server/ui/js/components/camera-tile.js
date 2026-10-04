@@ -21,6 +21,7 @@ function cameraTile(camera, options) {
       </div>
       <div class="stage">
         ${element}
+        <span class="detection-badge hidden">detection unavailable</span>
         <div class="idle" data-live-idle="${id}" >
           ${canWatch ? "" : `${icon("cam", "lg")}<div>This camera does not publish to LiveKit.</div>`}
         </div>
