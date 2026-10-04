@@ -227,7 +227,10 @@ impl PublisherTokenIssuer {
             room: identity.room.as_str().to_owned(),
             can_publish: true,
             can_subscribe: false,
-            can_publish_data: false,
+            // The publisher sends `DetectionPacket`s on the room's data
+            // channel so the viewer can overlay boxes. The server grants this
+            // once because `publish_data` would otherwise be silently rejected.
+            can_publish_data: true,
             ..VideoGrants::default()
         };
         let token = AccessToken::with_api_key(&self.api_key, &self.api_secret)

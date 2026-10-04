@@ -16,7 +16,9 @@ livekit.workspace = true
 futures-util.workspace = true
 livekit-api.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 surveillance-common = { path = "../common" }
+surveillance-events = { path = "../events" }
 surveillance-media = { path = "../media" }
 tokio.workspace = true
 tracing.workspace = true

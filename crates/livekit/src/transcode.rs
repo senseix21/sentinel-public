@@ -80,6 +80,35 @@ pub struct TranscodeCounters {
     pub reconnections: AtomicU64,
 }
 
+/// Subscribes to the event bus and spawns a `DetectionRelay` on the room's
+/// local participant. Returns the join handle and shutdown sender when
+/// subscription succeeds; both `None` when the bus refused another subscriber
+/// (closed) or when `SubscriptionCapacity` could not be constructed. In those
+/// cases a `warn!` is emitted and the publisher runs without an overlay —
+/// recording and live viewing are unaffected.
+fn spawn_detection_relay(
+    bus: &surveillance_events::bus::EventBus,
+    participant: livekit::participant::LocalParticipant,
+) -> (
+    Option<tokio::task::JoinHandle<()>>,
+    Option<tokio::sync::watch::Sender<bool>>,
+) {
+    use crate::relay::DetectionRelay;
+    use surveillance_events::bus::SubscriptionCapacity;
+    let Ok(capacity) = SubscriptionCapacity::new(32) else {
+        tracing::warn!("DetectionRelay: invalid subscription capacity");
+        return (None, None);
+    };
+    let Ok(sub) = bus.subscribe(capacity) else {
+        tracing::warn!("DetectionRelay: event bus refused subscription");
+        return (None, None);
+    };
+    let relay = DetectionRelay::new(sub, participant);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(relay.run(rx));
+    (Some(handle), Some(tx))
+}
+
 /// Publishes a camera into a `LiveKit` room by decoding and re-encoding it.
 pub struct TranscodePublicationAdapter {
     identity: PublicationIdentity,
@@ -91,6 +120,10 @@ pub struct TranscodePublicationAdapter {
     decode_counters: Arc<DecodeCounters>,
     counters: Arc<TranscodeCounters>,
     session: Option<Session>,
+    /// Optional event-bus handle. When present, each session spawns a
+    /// `DetectionRelay` that pumps `PersonDetectionObserved` events onto the
+    /// room's data channel. Absent in builds without detection.
+    event_bus: Option<surveillance_events::bus::EventBus>,
 }
 
 /// One connected room, its event stream, and the track while a viewer is here.
@@ -100,6 +133,12 @@ struct Session {
     viewers: usize,
     track: Option<PublishedTrack>,
     idle_deadline: Option<Instant>,
+    /// Join handle for the running `DetectionRelay`. `None` when no event
+    /// bus was configured, or during the window between construction and the
+    /// relay starting (never observable to callers).
+    relay_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Shutdown sender for the relay owned by `relay_handle`.
+    relay_shutdown: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 /// A published track, the source feeding it, and the decode session behind it.
@@ -131,6 +170,19 @@ impl TranscodePublicationAdapter {
     /// [`AdapterErrorKind::Unavailable`] when the requested token lifetime is
     /// outside the permitted range.
     pub fn new(config: &LiveKitConfig, token_ttl: Duration) -> Result<Self, AdapterError> {
+        Self::with_event_bus(config, token_ttl, None)
+    }
+
+    /// Variant of [`Self::new`] that wires an event bus into each session so a
+    /// `DetectionRelay` can run alongside the publisher.
+    ///
+    /// # Errors
+    /// Same conditions as [`Self::new`].
+    pub fn with_event_bus(
+        config: &LiveKitConfig,
+        token_ttl: Duration,
+        event_bus: Option<surveillance_events::bus::EventBus>,
+    ) -> Result<Self, AdapterError> {
         let tokens = PublisherTokenIssuer::new(config, token_ttl).map_err(|error| {
             AdapterError::new(match error {
                 TokenIssueError::InvalidLifetime => AdapterErrorKind::Unavailable,
@@ -147,6 +199,7 @@ impl TranscodePublicationAdapter {
             decode_counters: Arc::new(DecodeCounters::default()),
             counters: Arc::new(TranscodeCounters::default()),
             session: None,
+            event_bus,
         })
     }
 
@@ -378,12 +431,26 @@ impl PublicationAdapter for TranscodePublicationAdapter {
             // first keyframe, not wait for the next join event that will never
             // come.
             let viewers = room.remote_participants().len();
+
+            // Start the DetectionRelay for this session, if we have an
+            // event bus to subscribe to. The handle is owned by the Session
+            // so `disconnect` can await its shutdown. A failed subscribe is
+            // logged and the publication proceeds without an overlay.
+            // `LocalParticipant` is `Clone`; `Room` is not, so we hand the
+            // relay the participant handle instead of a `Room` reference.
+            let (relay_handle, relay_shutdown) = match self.event_bus.as_ref() {
+                Some(bus) => spawn_detection_relay(bus, room.local_participant()),
+                None => (None, None),
+            };
+
             self.session = Some(Session {
                 room,
                 events,
                 viewers,
                 track: None,
                 idle_deadline: None,
+                relay_handle,
+                relay_shutdown,
             });
             Ok(())
         })
@@ -526,6 +593,18 @@ impl PublicationAdapter for TranscodePublicationAdapter {
     fn disconnect(&mut self) -> AdapterFuture<'_, ()> {
         Box::pin(async move {
             if let Some(mut session) = self.session.take() {
+                // Signal the detection relay to stop before we close the room;
+                // ordering matters, because `publish_data` on a dropped room
+                // would log noise about a disconnected session. The join is
+                // then safe to await.
+                if let Some(tx) = session.relay_shutdown.take() {
+                    let _ = tx.send(true);
+                }
+                if let Some(handle) = session.relay_handle.take() {
+                    if let Err(error) = handle.await {
+                        tracing::warn!(?error, "DetectionRelay: join failed");
+                    }
+                }
                 session.stop_publishing().await;
                 // Dropping the room closes it; awaiting the explicit close lets
                 // the server see the participant leave rather than time it out.

@@ -119,6 +119,10 @@ impl CameraPipeline {
         event_bus: EventBus,
     ) -> Result<Self, CameraPipelineError> {
         let lifecycle_bus = event_bus.clone();
+        // Second clone for the publisher-side DetectionRelay. The detector
+        // consumes `event_bus` by value further down, which would otherwise
+        // leave nothing to subscribe with here.
+        let publication_bus = event_bus.clone();
         let (distributor, subscriptions) = MediaDistributor::new_with_detection(
             config.recorder_queue,
             config.live_queue,
@@ -193,9 +197,10 @@ impl CameraPipeline {
             //
             // Nothing decodes until a viewer joins the room, so a deployment
             // with no operator watching pays nothing for this.
-            let adapter = TranscodePublicationAdapter::new(
+            let adapter = TranscodePublicationAdapter::with_event_bus(
                 &livekit,
                 TranscodePublicationAdapter::DEFAULT_TOKEN_TTL,
+                Some(publication_bus),
             )
             .map_err(|_| CameraPipelineError::PublicationConfiguration)?;
             let (owner, health) = LivePublicationOwner::new(livekit, adapter, subscriptions.live);

@@ -7,6 +7,7 @@ pub mod domain;
 pub mod native;
 pub mod owner;
 pub mod publisher;
+pub mod relay;
 pub mod rtp;
 pub mod token;
 pub mod transcode;
