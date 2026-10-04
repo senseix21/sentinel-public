@@ -232,6 +232,7 @@ impl ModelOutputDecoder for YoloxDecoder {
             detections.push(PersonDetection {
                 confidence,
                 bounding_box,
+                track_id: None,
             });
         }
         DetectionSet::new(detections).map_err(|_| ModelDecodeError::InvalidGeometry)

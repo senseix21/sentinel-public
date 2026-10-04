@@ -10,3 +10,4 @@ pub mod model_output;
 #[cfg(feature = "onnx-inference")]
 pub mod onnx;
 pub mod sampler;
+pub mod tracker;

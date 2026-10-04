@@ -136,6 +136,7 @@ impl PersonInference for DeterministicFakeInference {
         DetectionSet::new(vec![PersonDetection {
             confidence,
             bounding_box,
+            track_id: None,
         }])
         .map_err(|_| InferenceError::new(InferenceFailureKind::MalformedOutput))
     }

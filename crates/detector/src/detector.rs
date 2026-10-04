@@ -620,6 +620,11 @@ impl DetectionOwner {
                 state_sequence,
             );
             let mut last_media: Option<(u64, surveillance_media::packet::MediaTimestamp)> = None;
+            // One tracker instance per detection session. Ids reset when the
+            // owner restarts (camera reconnect, inference failure); that is
+            // acceptable because the visual session resets too.
+            let mut tracker =
+                crate::tracker::PersonTracker::new(crate::tracker::TrackerConfig::default());
             task_health.update(
                 DetectionState::Running,
                 counters,
@@ -807,6 +812,9 @@ impl DetectionOwner {
                         continue;
                     }
                 };
+                // Assign stable cross-frame ids. The tracker returns a
+                // `DetectionSet` where every entry has `track_id: Some(_)`.
+                let detections = tracker.update_detections(&detections);
                 counters.detections_produced = counters
                     .detections_produced
                     .saturating_add(u64::try_from(detections.as_slice().len()).unwrap_or(u64::MAX));
@@ -846,6 +854,7 @@ impl DetectionOwner {
                         },
                         model: inference.model_name().clone(),
                         model_version: inference.model_version().clone(),
+                        results_are_fixture: !inference.is_production_model(),
                         detections,
                     },
                 ) else {
