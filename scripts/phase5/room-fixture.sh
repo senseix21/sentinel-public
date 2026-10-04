@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 
-# Runs the real-room publication fixture against a LiveKit server it owns.
+# Runs the real-room publication fixtures.
 #
-# The server's lifetime belongs here rather than to the test, so a failing test
-# cannot leave one listening and a second run cannot silently qualify against a
-# server left over from the first.
+# This encodes the media and runs the tests; each test starts and stops its own
+# server, because qualifying a restart means killing the server at a chosen
+# moment and a wrapper cannot do that.
 
 set -euo pipefail
 
@@ -13,37 +13,11 @@ livekit_bin="${LIVEKIT_SERVER_BIN:-livekit-server}"
 port="${PHASE5_LIVEKIT_PORT:-7880}"
 key="devkey"
 secret="local-development-secret-not-for-deployment"
-log="${TMPDIR:-/tmp}/phase5-room-fixture-livekit.log"
 
 command -v "${livekit_bin}" >/dev/null || {
     echo "missing LiveKit server: ${livekit_bin}" >&2
     exit 1
 }
-
-cleanup() {
-    if [[ -n "${server_pid:-}" ]] && kill -0 "${server_pid}" 2>/dev/null; then
-        kill "${server_pid}" 2>/dev/null || true
-        wait "${server_pid}" 2>/dev/null || true
-    fi
-}
-trap cleanup EXIT
-
-"${livekit_bin}" --dev --bind 0.0.0.0 \
-    --config-body "port: ${port}" \
-    --keys "${key}: ${secret}" >"${log}" 2>&1 &
-server_pid=$!
-
-for _ in $(seq 1 100); do
-    if (echo >"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
-        break
-    fi
-    kill -0 "${server_pid}" 2>/dev/null || {
-        echo "LiveKit server exited during startup; see ${log}" >&2
-        tail -20 "${log}" >&2
-        exit 1
-    }
-    sleep 0.2
-done
 
 # Real encoded media, so the fixture proves pictures rather than a track.
 # Generated here rather than committed: it is 2 seconds of colour bars, it
@@ -64,10 +38,16 @@ test -s "${media}" || {
 }
 
 cd "${repo_root}"
+# Serially: each test starts its own server, and two would collide on the RTC
+# ports rather than only the signalling one.
+# PHASE5_FIXTURE_FILTER is optional. When unset, all ignored tests run.
 PHASE5_LIVEKIT_MEDIA="${media}" \
 PHASE5_LIVEKIT_URL="ws://127.0.0.1:${port}" \
 PHASE5_LIVEKIT_KEY="${key}" \
 PHASE5_LIVEKIT_SECRET="${secret}" \
-    cargo test -p surveillance-livekit --test room_fixture -- --ignored --nocapture
+LIVEKIT_SERVER_BIN="${livekit_bin}" \
+    cargo test -p surveillance-livekit --test room_fixture \
+    -- --ignored --nocapture --test-threads=1 \
+    ${PHASE5_FIXTURE_FILTER+"${PHASE5_FIXTURE_FILTER}"}
 
-echo "Phase 5 real-room publication fixture passed"
+echo "Phase 5 real-room fixture passed"

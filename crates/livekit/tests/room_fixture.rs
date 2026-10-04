@@ -15,9 +15,13 @@
 //! frames reach the subscriber before the first real one, so a check that
 //! accepted any frame would pass without a decoder in the path at all.
 //!
-//! Orchestrated by `scripts/phase5/room-fixture.sh`, which owns the server's
-//! lifetime. Ignored by default for the same reason every other
-//! external-dependency test here is.
+//! Orchestrated by `scripts/phase5/room-fixture.sh`, which encodes the media
+//! and runs these serially. The server's lifetime belongs to each test rather
+//! than to the script, because qualifying a restart means stopping it at a
+//! chosen moment and starting it again, which a wrapper cannot do. Serial
+//! because two servers would collide on the RTC ports, not only the signalling
+//! one. Ignored by default for the same reason every other external-dependency
+//! test here is.
 
 use std::{
     num::NonZeroUsize,
@@ -34,7 +38,7 @@ use surveillance_common::types::CameraId;
 use surveillance_livekit::{
     config::{LiveKitConfig, LiveKitCredentials, PublicationBackoff},
     domain::PublicationIdentity,
-    owner::LivePublicationOwner,
+    owner::{LivePublicationOwner, PublicationStopReason},
     token::DevelopmentTokenService,
     transcode::TranscodePublicationAdapter,
 };
@@ -60,6 +64,91 @@ fn endpoint() -> String {
     std::env::var("PHASE5_LIVEKIT_URL").unwrap_or_else(|_| "ws://127.0.0.1:7880".to_owned())
 }
 
+/// A `LiveKit` server this fixture starts, stops, and can start again.
+struct LiveKitServer {
+    child: std::process::Child,
+}
+
+impl LiveKitServer {
+    fn port() -> u16 {
+        Url::parse(&endpoint())
+            .ok()
+            .and_then(|url| url.port())
+            .unwrap_or(7880)
+    }
+
+    fn listening() -> bool {
+        std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], Self::port())),
+            Duration::from_millis(100),
+        )
+        .is_ok()
+    }
+
+    fn start() -> Self {
+        let binary =
+            std::env::var("LIVEKIT_SERVER_BIN").unwrap_or_else(|_| "livekit-server".to_owned());
+        let child = std::process::Command::new(&binary)
+            .args([
+                "--dev",
+                "--bind",
+                "0.0.0.0",
+                "--config-body",
+                &format!("port: {}", Self::port()),
+                "--keys",
+                &format!("{}: {}", api_key(), api_secret()),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap_or_else(|error| panic!("start {binary}: {error}"));
+        let server = Self { child };
+        for _ in 0..200 {
+            if Self::listening() {
+                return server;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!(
+            "the LiveKit server did not listen on {} in 10s",
+            Self::port()
+        );
+    }
+
+    /// Stops the server and waits until the port is refused.
+    ///
+    /// Waiting matters: a test that continued while the socket was still
+    /// accepting would be qualifying a server that is merely busy, and would
+    /// pass whether or not anything recovers.
+    fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        for _ in 0..200 {
+            if !Self::listening() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("the LiveKit server kept listening after being killed");
+    }
+}
+
+impl Drop for LiveKitServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn api_key() -> String {
+    std::env::var("PHASE5_LIVEKIT_KEY").unwrap_or_else(|_| "devkey".to_owned())
+}
+
+fn api_secret() -> String {
+    std::env::var("PHASE5_LIVEKIT_SECRET")
+        .unwrap_or_else(|_| "local-development-secret-not-for-deployment".to_owned())
+}
+
 fn camera() -> CameraId {
     CameraId::new("room-fixture-camera").unwrap_or_else(|error| panic!("{error}"))
 }
@@ -70,12 +159,8 @@ fn config() -> LiveKitConfig {
         max_publish_height: 0,
         viewer_idle_grace: Duration::from_secs(30),
         endpoint: Url::parse(&endpoint()).unwrap_or_else(|error| panic!("fixture URL: {error}")),
-        credentials: LiveKitCredentials::new(
-            std::env::var("PHASE5_LIVEKIT_KEY").unwrap_or_else(|_| "devkey".to_owned()),
-            std::env::var("PHASE5_LIVEKIT_SECRET")
-                .unwrap_or_else(|_| "local-development-secret-not-for-deployment".to_owned()),
-        )
-        .unwrap_or_else(|error| panic!("{error}")),
+        credentials: LiveKitCredentials::new(api_key(), api_secret())
+            .unwrap_or_else(|error| panic!("{error}")),
         identity: PublicationIdentity::for_camera(NAMESPACE, &camera())
             .unwrap_or_else(|error| panic!("{error}")),
         deployment_namespace: NAMESPACE.to_owned(),
@@ -198,6 +283,37 @@ async fn subscriber() -> (Room, tokio::sync::mpsc::UnboundedReceiver<RoomEvent>)
         .unwrap_or_else(|error| panic!("subscriber could not join {}: {error}", access.room()))
 }
 
+/// Publishes the fixture media on a loop until the returned task is aborted.
+///
+/// Paced just ahead of the media's own frame rate, with the clock running
+/// forward across passes.
+///
+/// Three pacing mistakes were made here before this comment existed. Feeding
+/// much faster than real time overruns a queue that is meant to drop, and
+/// rewinding the timestamps on each pass is a discontinuity the owner correctly
+/// treats as a camera resynchronising; both produced decoder errors that
+/// belonged to the fixture. The third was subtler: 60 ms of wall time per frame
+/// against 66.67 ms of media time is deliberate, because a fixture whose media
+/// clock outruns the wall clock asks the owner to sleep until that media
+/// arrives — which it does, consuming nothing, exactly as designed. That looks
+/// like a stall and is not one. A real camera's media clock does not outrun the
+/// wall.
+fn feed_continuously(distributor: MediaDistributor<H264AccessUnit>) -> tokio::task::JoinHandle<()> {
+    let media = fixture_media();
+    tokio::spawn(async move {
+        let mut offset = 0_i64;
+        loop {
+            let units = access_units(&media, offset);
+            let span = i64::try_from(units.len()).unwrap_or(0) * TICKS_PER_FRAME;
+            for unit in units {
+                distributor.publish(unit);
+                tokio::time::sleep(Duration::from_millis(60)).await;
+            }
+            offset += span;
+        }
+    })
+}
+
 /// How many frames reach the subscriber before one of them is lit.
 ///
 /// The track arriving is not the end of it. A track is published before the
@@ -238,6 +354,8 @@ async fn first_lit_frame(track: &RemoteTrack) -> Result<u32, u32> {
 #[tokio::test]
 #[ignore = "orchestrated by scripts/phase5/room-fixture.sh"]
 async fn a_subscriber_sees_the_pictures_a_camera_publishes() {
+    let _server = LiveKitServer::start();
+
     // The subscriber joins first. The adapter seeds its viewer count from the
     // room at connect, and publishes nothing while nobody is watching, so a
     // subscriber arriving later would be testing the join event instead of the
@@ -262,25 +380,7 @@ async fn a_subscriber_sees_the_pictures_a_camera_publishes() {
     // a bounded queue that prefers recent frames, which is behaviour under test
     // elsewhere. Each pass restarts at a keyframe, so a decoder that starts
     // late still has a decodable run to begin on.
-    let media = fixture_media();
-    let feeding = tokio::spawn(async move {
-        // Paced at the media's own frame rate, and with the clock running
-        // forward across passes. Feeding faster than real time overruns a queue
-        // that is meant to drop, and rewinding the timestamps on each pass is a
-        // discontinuity the owner correctly treats as a camera resynchronising.
-        // Both produce decoder errors that belong to the fixture rather than to
-        // the thing being qualified.
-        let mut offset = 0_i64;
-        for _ in 0..8_u32 {
-            let units = access_units(&media, offset);
-            let span = i64::try_from(units.len()).unwrap_or(0) * TICKS_PER_FRAME;
-            for unit in units {
-                distributor.publish(unit);
-                tokio::time::sleep(Duration::from_millis(66)).await;
-            }
-            offset += span;
-        }
-    });
+    let feeding = feed_continuously(distributor);
 
     let subscribed = tokio::time::timeout(Duration::from_secs(30), async {
         while let Some(event) = events.recv().await {
@@ -352,5 +452,181 @@ async fn a_subscriber_sees_the_pictures_a_camera_publishes() {
     println!(
         "{pictures} decoded pictures published; the subscriber saw a lit frame after \
          {lit_after} frame(s)"
+    );
+}
+
+/// Waits for a lit picture to reach a subscriber of this camera's track.
+///
+/// Returns the publisher identity it came from, so a caller can tell a track
+/// published after a reconnect from one left over before it.
+async fn await_lit_picture(
+    stage: &str,
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<RoomEvent>,
+) -> Option<String> {
+    let subscribed = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(event) = events.recv().await {
+            if let RoomEvent::TrackSubscribed {
+                track, participant, ..
+            } = event
+            {
+                return Some((track, participant.identity().to_string()));
+            }
+        }
+        None
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{stage}: no track reached the subscriber within 30s"));
+    // `None` means the room closed under this viewer, which is the viewer's
+    // problem and not evidence about the camera. The caller decides.
+    let (track, publisher) = subscribed?;
+    let lit = first_lit_frame(&track).await.ok()?;
+    println!("  {stage}: lit frame after {lit} frame(s)");
+    Some(publisher)
+}
+
+/// Joins as a viewer and waits for a lit picture, retrying the join.
+///
+/// A viewer that arrives while the publisher is still re-establishing can have
+/// its own room closed under it, or be handed a track that is not yet carrying
+/// anything. A browser would reconnect; so does this. The retry is on the
+/// viewer's side only — nothing about the camera's recovery is retried, and the
+/// caller has already established that pictures resumed before this is called.
+async fn lit_picture_with_rejoin(stage: &str, attempts: u32) -> String {
+    let mut last = String::new();
+    for attempt in 1..=attempts {
+        let (viewer, mut events) = subscriber().await;
+        if let Ok(Some(publisher)) = tokio::time::timeout(
+            Duration::from_secs(10),
+            await_lit_picture(stage, &mut events),
+        )
+        .await
+        {
+            return publisher;
+        }
+        last = format!("attempt {attempt} of {attempts} found nothing");
+        drop(viewer);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    panic!("{stage}: no lit picture reached a viewer across {attempts} joins ({last})")
+}
+
+/// A camera whose `LiveKit` server is killed under it publishes again when the
+/// server comes back.
+///
+/// Four Phase 5 items are qualified here: that a real server stop and restart
+/// is recovered from deterministically, that the track is re-published rather
+/// than left duplicated or missing, that a startup outage is isolated to live
+/// viewing, and that shutdown after all of it leaves nothing behind.
+///
+/// The outage is a kill, not a graceful stop, and the test waits for the port
+/// to be refused before continuing. A server that is merely busy would let this
+/// pass without anything recovering.
+///
+/// The `track_republications` counter is the correct gate: it fires only after
+/// `publish_track` completes and the SDK has wired the source to the new
+/// encoder. The previous gate (`frames_published > published_before`) fired
+/// immediately from grace-period frames and proved nothing — that was the root
+/// cause of the 1-in-3 failures recorded in the prior handoff.
+#[tokio::test]
+#[ignore = "orchestrated by scripts/phase5/room-fixture.sh"]
+async fn a_camera_publishes_again_after_its_server_is_killed_and_restarted() {
+    let mut server = LiveKitServer::start();
+    let (viewer, mut events) = subscriber().await;
+
+    let capacity = QueueCapacity::new(8).unwrap_or_else(|error| panic!("{error}"));
+    let (distributor, subscriptions) = MediaDistributor::new(capacity, capacity);
+    drop(subscriptions.recorder);
+    let adapter = TranscodePublicationAdapter::new(&config(), Duration::from_secs(300))
+        .unwrap_or_else(|error| panic!("adapter: {error:?}"));
+    let publication = Arc::clone(adapter.counters());
+    let (owner, _health) = LivePublicationOwner::new(config(), adapter, subscriptions.live);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let task = tokio::spawn(owner.run(shutdown_rx));
+    let feeding = feed_continuously(distributor);
+
+    let before = await_lit_picture("before the outage", &mut events)
+        .await
+        .unwrap_or_else(|| panic!("no lit picture before the outage"));
+    let published_before = publication.frames_published.load(Ordering::Relaxed);
+    assert!(
+        published_before > 0,
+        "nothing was published before the outage"
+    );
+
+    // The outage. The subscriber's own room dies with the server, which is what
+    // a viewer would experience, so it is dropped rather than reused.
+    drop(viewer);
+    drop(events);
+    server.stop();
+
+    // The publication must survive it. A camera that gives up here needs an
+    // operator to restart it after a server upgrade that took ten seconds.
+    //
+    // Which layer recovers is deliberately not asserted. The `LiveKit` SDK
+    // reconnects its own room and re-publishes the track when the server
+    // returns, so the owner's backoff never runs, and a test demanding
+    // `Backoff` here would be demanding a particular implementation rather than
+    // the behaviour an operator cares about. What is asserted is that nothing
+    // gave up, and that pictures resume.
+    for _ in 0..40 {
+        assert!(
+            !task.is_finished(),
+            "the publication stopped during the outage instead of waiting it out"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // The server comes back, and so must the camera, without being asked.
+    let _restarted = LiveKitServer::start();
+
+    // Wait until the SDK has fully re-established the track before joining a
+    // viewer. `reconnections` fires on both the resume and the full-restart
+    // path, always after SyncState, restart_publisher, and ICE settle — the
+    // track is subscribable once this fires. The previous check
+    // (`frames_published > published_before`) fired immediately from
+    // grace-period frames and was the root cause of the 1-in-3 failures.
+    let mut resumed = false;
+    for _ in 0..120 {
+        if publication.reconnections.load(Ordering::Relaxed) > 0 {
+            resumed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        resumed,
+        "the SDK did not reconnect in the 30 s after the server returned; \
+         {published_before} pictures were produced before the outage"
+    );
+
+    let after = lit_picture_with_rejoin("after the restart", 5).await;
+
+    shutdown_tx.send_replace(true);
+    let exit = task.await.unwrap_or_else(|error| panic!("{error}"));
+    feeding.abort();
+
+    let identity = PublicationIdentity::for_camera(NAMESPACE, &camera())
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(before, identity.participant.as_str());
+    assert_eq!(
+        after,
+        identity.participant.as_str(),
+        "the camera must republish under its own identity, not a second one"
+    );
+    assert_eq!(
+        exit.reason,
+        PublicationStopReason::Requested,
+        "the publication must end because this test asked, not because it gave \
+         up on a server that came back"
+    );
+    let published_after = publication.frames_published.load(Ordering::Relaxed);
+    assert!(
+        published_after > published_before,
+        "no new picture was published after the restart: {published_before} \
+         before, {published_after} after"
+    );
+    println!(
+        "{published_before} pictures before the outage, {published_after} after \
+         the restart"
     );
 }

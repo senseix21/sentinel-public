@@ -21,7 +21,7 @@ RTSP_URL ?= $(SURVEILLANCE_RTSP_URL)
 RECORDING_ROOT ?= ./recordings
 HEALTH_BIND ?= 127.0.0.1:3000
 
-.PHONY: help prerequisites webcam-devices run run-release server direct-camera-qualification health live ready metrics recordings play verify-recordings check verify verify-onnx container-shell container-verify container-verify-onnx container-verify-model container-verify-accuracy container-verify-livekit
+.PHONY: help prerequisites webcam-devices run run-release server direct-camera-qualification health live ready metrics recordings play verify-recordings check verify verify-onnx container-shell container-verify container-verify-onnx container-verify-model container-verify-accuracy container-verify-livekit container-reproduce-livekit-restart
 
 help: ## Show manual development commands and configurable values.
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-20s %s\n", $$1, $$2}' $(MAKEFILE_LIST)

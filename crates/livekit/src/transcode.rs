@@ -68,6 +68,16 @@ pub struct TranscodeCounters {
     /// could not be copied whole. Nonzero here means the decoder and the
     /// pinned geometry disagree, which is a defect rather than backpressure.
     pub frames_malformed: AtomicU64,
+    /// Times the SDK tore down and republished our track during a room
+    /// reconnect. Each increment means `publish_track` completed: the new
+    /// encoder is registered with the source and frames are flowing again.
+    /// Only incremented on the full-restart path; zero on resume.
+    pub track_republications: AtomicU64,
+    /// Times the SDK completed a reconnect of any kind (resume or full
+    /// restart). Fires after `SyncState`, `restart_publisher`, ICE settle,
+    /// and (on the restart path) all `LocalTrackRepublished` dispatches.
+    /// Safe to gate a re-join on: once this fires, the track is subscribable.
+    pub reconnections: AtomicU64,
 }
 
 /// Publishes a camera into a `LiveKit` room by decoding and re-encoding it.
@@ -189,17 +199,31 @@ impl Session {
     /// The count is re-read from the room rather than incremented and
     /// decremented, so a missed or duplicated event cannot leave a permanent
     /// drift that either burns CPU forever or blacks out every viewer.
-    fn refresh_viewers(&mut self) {
+    fn refresh_viewers(&mut self, counters: &Arc<TranscodeCounters>) {
         let mut changed = false;
         for _ in 0..Self::MAX_EVENTS_PER_ACCESS_UNIT {
             match self.events.try_recv() {
-                Ok(
-                    RoomEvent::ParticipantConnected(_)
-                    | RoomEvent::ParticipantDisconnected(_)
-                    | RoomEvent::Disconnected { .. }
-                    | RoomEvent::Reconnected,
-                ) => changed = true,
-                Ok(_) => {}
+                Ok(RoomEvent::LocalTrackRepublished { publication, .. }) => {
+                    // The SDK tore down and rebuilt our track on the full-restart
+                    // path. Update the stored SID so stop_publishing uses the new
+                    // one, and count the event as evidence the encoder is wired.
+                    if let Some(track) = self.track.as_mut() {
+                        track.publication = publication;
+                    }
+                    counters
+                        .track_republications
+                        .fetch_add(1, Ordering::Relaxed);
+                    changed = true;
+                }
+                Ok(RoomEvent::Reconnected) => {
+                    // Fires on both resume and full-restart paths, always after
+                    // SyncState, restart_publisher, ICE settle, and (on restart)
+                    // all LocalTrackRepublished dispatches. The track is
+                    // subscribable once this fires.
+                    counters.reconnections.fetch_add(1, Ordering::Relaxed);
+                    changed = true;
+                }
+                Ok(_) => changed = true,
                 Err(_) => break,
             }
         }
@@ -385,7 +409,7 @@ impl PublicationAdapter for TranscodePublicationAdapter {
             let Some(session) = session.as_mut() else {
                 return Err(AdapterError::new(AdapterErrorKind::Connection));
             };
-            session.refresh_viewers();
+            session.refresh_viewers(counters);
 
             if should_stop_publishing(
                 session.viewers,
