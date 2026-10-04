@@ -368,18 +368,26 @@ Exit gate:
 
 ## Slice 8 — Validation, measurement and handoff
 
-- [ ] Full `make check` and `make audit`.
-- [ ] Update `ROADMAP.md` Phase 6 from evidence, leaving the accuracy item
-  open and using `[!]` where it is blocked on the dataset and criteria.
-- [ ] Write a dated `context/` snapshot carrying the evidence package of
+- [x] Full `make check` and `make audit`. 2026-10-04: `make verify` 536 passed,
+  `make container-verify-onnx` 543 passed, `make audit` exit 0 with
+  duplicate-crate and unencountered-licence warnings only.
+- [x] Update `ROADMAP.md` Phase 6 from evidence, leaving the accuracy item
+  open and using `[!]` where it is blocked on the dataset and criteria. It
+  carries the measured figures and says why they do not close it.
+- [x] Write a dated `context/` snapshot carrying the evidence package of
   specification section 11, and repoint `context/README.md`.
-- [ ] Restate every open input from specification section 4.3 in that snapshot.
+  `context/2026-10-04-2021/`.
+- [x] Restate every open input from specification section 4.3 in that snapshot.
 
 Exit gate:
 
-- The specification's section 13 exit gate holds, item by item.
-- The snapshot names what was measured and what was assumed, separately.
-- No artifact produced by this work claims accuracy or capacity.
+- The specification's section 13 exit gate holds, item by item. Met.
+- The snapshot names what was measured and what was assumed, separately. Met:
+  the evidence package is one section and what remains unverified is another,
+  and the durations carry the four facts that stop them being capacity figures.
+- No artifact produced by this work claims accuracy or capacity. Met. The COCO
+  measurement is stated as a regression guard on a public benchmark of general
+  photographs, and Phase 6's accuracy item stays `[!]`.
 
 ## 3. Focused verification map
 
