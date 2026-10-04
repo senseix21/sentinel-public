@@ -50,6 +50,24 @@ RUN curl -fsSL -o /tmp/onnxruntime.tgz \
 # path is fixed here instead of being discovered.
 ENV ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so
 
+# A LiveKit server, so publication can be qualified against a real room rather
+# than against a test double.
+#
+# The publication path was previously provable only up to the point where it
+# hands media to a `Room`, because a `Session` holds a connected one: recovery
+# after a failure could be tested, re-publishing a track after that recovery
+# could not. `--dev` mode needs no TURN, no certificates and no external
+# network, which is what makes this runnable inside the gate.
+#
+# Pinned for the same reason the ONNX runtime is: a server version is part of
+# what an integration result means.
+ARG LIVEKIT_VERSION=1.13.7
+RUN curl -fsSL -o /tmp/livekit.tgz \
+        "https://github.com/livekit/livekit/releases/download/v${LIVEKIT_VERSION}/livekit_${LIVEKIT_VERSION}_linux_amd64.tar.gz" \
+    && tar -xzf /tmp/livekit.tgz -C /usr/local/bin livekit-server \
+    && rm /tmp/livekit.tgz \
+    && livekit-server --version
+
 # The toolchain file pins the compiler; fetch it at build time so a container
 # run does not pay for it, and fail the image build rather than the gate if the
 # pin is unavailable.

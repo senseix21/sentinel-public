@@ -24,3 +24,7 @@ url.workspace = true
 # Only to build the signal-client status codes the retry classification keys
 # off; nothing in the library takes an HTTP dependency.
 http.workspace = true
+# The room fixture joins a real room as a subscriber, which is the only way to
+# prove a track reached one. The library already depends on this; a test can
+# only reach it through a development dependency.
+livekit.workspace = true

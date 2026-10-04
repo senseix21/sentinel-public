@@ -21,7 +21,7 @@ RTSP_URL ?= $(SURVEILLANCE_RTSP_URL)
 RECORDING_ROOT ?= ./recordings
 HEALTH_BIND ?= 127.0.0.1:3000
 
-.PHONY: help prerequisites webcam-devices run run-release server direct-camera-qualification health live ready metrics recordings play verify-recordings check verify verify-onnx container-shell container-verify container-verify-onnx container-verify-model container-verify-accuracy
+.PHONY: help prerequisites webcam-devices run run-release server direct-camera-qualification health live ready metrics recordings play verify-recordings check verify verify-onnx container-shell container-verify container-verify-onnx container-verify-model container-verify-accuracy container-verify-livekit
 
 help: ## Show manual development commands and configurable values.
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-20s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -179,6 +179,9 @@ container-verify-model: container-image ## Run DI.R8 on a real model. MODEL= FRA
 		"$(IMAGE)" cargo test -p surveillance-detector \
 		--features surveillance-detector/onnx-inference \
 		--test onnx_real_model -- --ignored --nocapture
+
+container-verify-livekit: container-image ## Qualify publication against a real LiveKit room.
+	$(DOCKER_RUN) "$(IMAGE)" bash scripts/phase5/room-fixture.sh
 
 # DI.R10: the adapter across a set with ground truth. Build the set first with
 # scripts/detection/build-eval-set.py. MIN_RECALL and MIN_PRECISION have no
