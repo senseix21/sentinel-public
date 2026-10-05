@@ -33,7 +33,7 @@ const liveKit = createLiveKitOwner({ ApiError, api, banner, errorBanner });
 const {
   live, liveVideos,
   startLive, startVisibleLive, stopLive, stopAllLive,
-  reattachLive, reattachOverlays,
+  reattachLive, reattachOverlays, restorePersonCounts,
   liveIdle,
 } = liveKit;
 const cameraTile = createCameraTile({ cameraLabel, pipelinePill, recordingDot, livekitChip });
@@ -359,6 +359,10 @@ async function render() {
   // Detection canvases get wiped by the re-render; put them back next to the
   // carried-over <video> nodes without forgetting the last packet.
   reattachOverlays();
+  // Person-count span is in the fresh markup and starts hidden; refill it
+  // from the overlay's remembered counts so the readout doesn't blink to
+  // empty between reconciles.
+  restorePersonCounts();
   if (currentScreen().id === "live") await startVisibleLive();
 }
 

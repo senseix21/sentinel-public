@@ -85,6 +85,7 @@ async function teardownLive(cameraId) {
     video.removeAttribute("src");
   }
   setFixtureBadge(cameraId, false);
+  setPersonCount(cameraId, { active: 0, cumulative: 0 }, false);
   liveIdle(cameraId, true);
   liveNote(cameraId, "");
   if (!session) return;
@@ -103,6 +104,32 @@ function setFixtureBadge(cameraId, show) {
     if (!tile) continue;
     const badge = tile.querySelector(".detection-badge");
     if (badge) badge.classList.toggle("hidden", !show);
+  }
+}
+
+// Writes the "active · cumulative" person count into the tile. Hidden while
+// no counts have been reported (empty session) OR while the detector is in
+// fixture mode (counts would be meaningless).
+function setPersonCount(cameraId, counts, fixture) {
+  for (const video of liveVideos(cameraId)) {
+    if (typeof video.closest !== "function") continue;
+    const tile = video.closest(".stage");
+    if (!tile) continue;
+    const el = tile.querySelector(".person-count");
+    if (!el) continue;
+    const hide = fixture || counts.cumulative === 0;
+    el.classList.toggle("hidden", hide);
+    if (!hide) el.textContent = `${counts.active} · ${counts.cumulative}`;
+  }
+}
+
+// Refreshes the "N · M" readout for every active watch session. Invoked by
+// app.js after each reconcile tick so the span is restored on the fresh
+// `.stage` subtree even before the next data packet arrives.
+function restorePersonCounts() {
+  for (const [cameraId, session] of live.rooms) {
+    if (!session.overlay) continue;
+    setPersonCount(cameraId, session.overlay.personCounts(), session.overlay.isFixture());
   }
 }
 
@@ -250,6 +277,7 @@ async function startLive(cameraId, video, retryAttempt = 0) {
     catch (error) { return; }
     overlay.onPacket(packet);
     setFixtureBadge(cameraId, !!packet.results_are_fixture);
+    setPersonCount(cameraId, overlay.personCounts(), overlay.isFixture());
   });
 
   room.on(sdk.RoomEvent.Disconnected, () => {
@@ -295,7 +323,7 @@ async function startVisibleLive() {
   return {
     live, liveVideos,
     startLive, startVisibleLive, stopLive, stopAllLive,
-    reattachLive, reattachOverlays,
+    reattachLive, reattachOverlays, restorePersonCounts,
     liveIdle,
   };
 }

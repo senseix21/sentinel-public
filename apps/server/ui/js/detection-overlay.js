@@ -75,6 +75,11 @@ export class DetectionOverlay {
     this._lastPacket = null;
     this._lastReceivedAt = 0;
     this._now = () => Date.now();
+    // Track-id bookkeeping for the person-count readout. `_sessionTrackIds`
+    // grows across the lifetime of this overlay instance (one Watch session),
+    // and is reset on `detach`.
+    this._activeTrackIds = new Set();
+    this._sessionTrackIds = new Set();
   }
 
   // Injected in tests to simulate elapsed time without wall-clock drift.
@@ -95,6 +100,8 @@ export class DetectionOverlay {
     this._video = null;
     this._lastPacket = null;
     this._lastReceivedAt = 0;
+    this._activeTrackIds.clear();
+    this._sessionTrackIds.clear();
   }
 
   // Re-point the overlay at a new <video> element without forgetting the
@@ -155,10 +162,32 @@ export class DetectionOverlay {
     if (!packet || !Array.isArray(packet.detections)) return;
     this._lastPacket = packet;
     this._lastReceivedAt = this._now();
+    // Refresh active-id set from this frame; accumulate into session set.
+    // Fixture packets would include fake track_ids; ignore them so counts
+    // reflect only real detections.
+    this._activeTrackIds.clear();
+    if (!packet.results_are_fixture) {
+      for (const d of packet.detections) {
+        if (d.track_id !== null && d.track_id !== undefined) {
+          this._activeTrackIds.add(d.track_id);
+          this._sessionTrackIds.add(d.track_id);
+        }
+      }
+    }
   }
 
   isFixture() {
     return !!(this._lastPacket && this._lastPacket.results_are_fixture);
+  }
+
+  // {active, cumulative} — distinct track IDs in the latest packet, and
+  // distinct track IDs ever seen since this overlay was attached.
+  personCounts() {
+    const stale = this._now() - this._lastReceivedAt > DETECTION_MAX_AGE_MS;
+    return {
+      active: stale ? 0 : this._activeTrackIds.size,
+      cumulative: this._sessionTrackIds.size,
+    };
   }
 
   _resize() {
