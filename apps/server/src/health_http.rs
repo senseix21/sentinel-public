@@ -4915,9 +4915,11 @@ mod tests {
 
     #[test]
     fn detector_gate_counters_are_exported_with_bounded_camera_labels() {
-        let mut counters = surveillance_detector::detector::DetectionCounters::default();
-        counters.gate_skipped = 7;
-        counters.gate_heartbeat = 2;
+        let counters = surveillance_detector::detector::DetectionCounters {
+            gate_skipped: 7,
+            gate_heartbeat: 2,
+            ..Default::default()
+        };
         let mut output = String::new();
 
         super::detection_gate_metrics(&mut output, "camera-01", counters);
