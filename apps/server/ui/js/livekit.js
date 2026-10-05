@@ -163,6 +163,20 @@ function reattachLive() {
   }
 }
 
+// Detection canvases live in the DOM beside the `<video>` and are therefore
+// casualties of the live-screen re-render even though the video itself is
+// carried across. This re-inserts the canvas next to each attached video
+// without disturbing the overlay's packet state, so a detection that arrived
+// one tick ago is not forgotten over the next render.
+function reattachOverlays() {
+  for (const [cameraId, session] of live.rooms) {
+    if (!session.overlay) continue;
+    const video = liveVideos(cameraId)[0];
+    if (!video) continue;
+    session.overlay.reattach(video);
+  }
+}
+
 async function startLive(cameraId, video, retryAttempt = 0) {
   live.stopped.delete(cameraId);
   live.desired.add(cameraId);
@@ -278,5 +292,10 @@ async function startVisibleLive() {
   }));
 }
 
-  return { live, liveVideos, startLive, startVisibleLive, stopLive, stopAllLive, reattachLive };
+  return {
+    live, liveVideos,
+    startLive, startVisibleLive, stopLive, stopAllLive,
+    reattachLive, reattachOverlays,
+    liveIdle,
+  };
 }

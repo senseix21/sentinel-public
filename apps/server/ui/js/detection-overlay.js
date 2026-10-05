@@ -83,22 +83,7 @@ export class DetectionOverlay {
   attach(videoEl) {
     if (this._video) this.detach();
     this._video = videoEl;
-
-    const canvas = document.createElement("canvas");
-    canvas.className = "detection-overlay";
-    canvas.style.cssText =
-      "position:absolute;inset:0;pointer-events:none";
-    // The parent must be `position:relative` for `inset:0` to pin to it.
-    // `.stage` already is in screens.css; this is defensive for other hosts.
-    if (videoEl.parentElement) {
-      const current = window.getComputedStyle(videoEl.parentElement).position;
-      if (current === "static") {
-        videoEl.parentElement.style.position = "relative";
-      }
-      videoEl.parentElement.insertBefore(canvas, videoEl.nextSibling);
-    }
-    this._canvas = canvas;
-
+    this._insertCanvas(videoEl);
     this._resizeObserver = new ResizeObserver(() => this._resize());
     this._resizeObserver.observe(videoEl);
     this._resize();
@@ -106,6 +91,30 @@ export class DetectionOverlay {
   }
 
   detach() {
+    this._tearDownDom();
+    this._video = null;
+    this._lastPacket = null;
+    this._lastReceivedAt = 0;
+  }
+
+  // Re-point the overlay at a new <video> element without forgetting the
+  // packet it last received. Called by the live-screen reconcile loop, which
+  // carries the <video> node across re-renders but cannot carry the sibling
+  // canvas. A packet that arrived moments before the reconcile stays visible
+  // through it rather than blanking for the full staleness window.
+  reattach(videoEl) {
+    if (!videoEl) return;
+    if (videoEl === this._video && this._canvas && this._canvas.parentNode) return;
+    this._tearDownDom();
+    this._video = videoEl;
+    this._insertCanvas(videoEl);
+    this._resizeObserver = new ResizeObserver(() => this._resize());
+    this._resizeObserver.observe(videoEl);
+    this._resize();
+    this._schedule();
+  }
+
+  _tearDownDom() {
     if (this._raf !== null) {
       cancelAnimationFrame(this._raf);
       this._raf = null;
@@ -118,9 +127,20 @@ export class DetectionOverlay {
       this._canvas.remove();
       this._canvas = null;
     }
-    this._video = null;
-    this._lastPacket = null;
-    this._lastReceivedAt = 0;
+  }
+
+  _insertCanvas(videoEl) {
+    const canvas = document.createElement("canvas");
+    canvas.className = "detection-overlay";
+    canvas.style.cssText = "position:absolute;inset:0;pointer-events:none";
+    if (videoEl.parentElement) {
+      const current = window.getComputedStyle(videoEl.parentElement).position;
+      if (current === "static") {
+        videoEl.parentElement.style.position = "relative";
+      }
+      videoEl.parentElement.insertBefore(canvas, videoEl.nextSibling);
+    }
+    this._canvas = canvas;
   }
 
   onPacket(packet) {

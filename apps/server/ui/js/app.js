@@ -30,7 +30,12 @@ const metricSum = metrics.sum;
 const metricWhere = metrics.where;
 const theme = createThemeController();
 const liveKit = createLiveKitOwner({ ApiError, api, banner, errorBanner });
-const { live, liveVideos, startLive, startVisibleLive, stopLive, stopAllLive, reattachLive } = liveKit;
+const {
+  live, liveVideos,
+  startLive, startVisibleLive, stopLive, stopAllLive,
+  reattachLive, reattachOverlays,
+  liveIdle,
+} = liveKit;
 const cameraTile = createCameraTile({ cameraLabel, pipelinePill, recordingDot, livekitChip });
 const screenEvents = createEventsScreen({ metric, metricSamples, metricSum, kpi, sparkline, trend });
 const liveScreen = createLiveScreen({ cameraTile, fleetCounts, fleetProblem, live });
@@ -351,6 +356,9 @@ async function render() {
   }
   renderGauges();
   reattachLive();
+  // Detection canvases get wiped by the re-render; put them back next to the
+  // carried-over <video> nodes without forgetting the last packet.
+  reattachOverlays();
   if (currentScreen().id === "live") await startVisibleLive();
 }
 

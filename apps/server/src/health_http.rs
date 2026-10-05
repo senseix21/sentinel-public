@@ -990,6 +990,11 @@ const UI_ASSETS: &[UiAsset] = &[
         include_str!("../ui/js/livekit.js"),
     ),
     ui_asset(
+        "/ui/js/detection-overlay.js",
+        JAVASCRIPT,
+        include_str!("../ui/js/detection-overlay.js"),
+    ),
+    ui_asset(
         "/ui/js/playback.js",
         JAVASCRIPT,
         include_str!("../ui/js/playback.js"),
