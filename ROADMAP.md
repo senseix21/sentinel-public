@@ -400,6 +400,9 @@ Add sampled human detection as an independently degradable media consumer and pu
 - [x] Separate immutable past-tense events from commands.
 - [x] Publish camera, recording, storage, and detection lifecycle events without transporting media payloads.
 - [x] Persist externally relevant event versions where required.
+- [x] Assign stable cross-frame identities to detections via an IoU tracker and surface them on `PersonDetectionObserved` alongside a `results_are_fixture` flag. `crates/detector/src/tracker.rs`, `docs/superpowers/specs/2026-10-04-detection-overlay-design.md`.
+- [x] Relay tracked detections to the live-view client over the LiveKit data channel (topic `det/v1`, lossy), with session-owned shutdown so no stale relay survives a reconnect. `crates/livekit/src/relay.rs`.
+- [x] Draw tracked bounding boxes client-side on a canvas over each tile with letterbox-aware coordinate mapping, a 3-second staleness blank, and a server-authoritative `results_are_fixture` guard that shows a "detection unavailable" badge instead of boxes. Browser-verified against mocked packets; full-pipeline session awaits a configured camera. `apps/server/ui/js/detection-overlay.js`.
 
 ### Tests
 
