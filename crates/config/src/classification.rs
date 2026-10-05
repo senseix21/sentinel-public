@@ -459,15 +459,18 @@ settings! {
     CameraDetectionInterOpThreads =>
         "camera.detection.inter_op_threads", Operational, PipelineRestart, Public, PerCamera,
         Unsigned, [];
-    // Immediate: `DecodeThresholds` is reconstructed from configuration on
-    // every inference call rather than captured once at pipeline start, so a
-    // change here is visible on the next frame. See the comment at the top of
-    // `crates/detector/src/model_output.rs::DecodeThresholds`.
+    // PipelineRestart (not Immediate): `OnnxPersonInference` captures a
+    // `DecodeThresholds` at construction (crates/detector/src/onnx.rs:134 and
+    // :158) and reuses it in every call to `infer` (:371). Reclassifying
+    // as Immediate without threading a live config source into `infer`
+    // would make the config system report "applied immediately" for a knob
+    // that only takes effect on restart — the specific lie the settings
+    // domain is designed to avoid. Make the field live first, then flip.
     CameraDetectionScoreThresholdPercent =>
-        "camera.detection.score_threshold_percent", Operational, Immediate, Public, PerCamera,
+        "camera.detection.score_threshold_percent", Operational, PipelineRestart, Public, PerCamera,
         Unsigned, [];
     CameraDetectionNmsIouPercent =>
-        "camera.detection.nms_iou_percent", Operational, Immediate, Public, PerCamera, Unsigned,
+        "camera.detection.nms_iou_percent", Operational, PipelineRestart, Public, PerCamera, Unsigned,
         [];
     CameraDetectionMotionThresholdPercent =>
         "camera.detection.motion_threshold_percent", Operational, PipelineRestart, Public, PerCamera,
@@ -604,25 +607,16 @@ mod tests {
     }
 
     #[test]
-    fn score_and_nms_thresholds_take_effect_immediately() {
-        // Rebuilt per-inference from configuration via `DecodeThresholds`, so
-        // reporting Immediate here matches the live code path.
+    fn captured_detection_thresholds_and_gate_settings_require_pipeline_restart() {
+        // All five are captured at pipeline construction (inference thresholds
+        // in `OnnxPersonInference`, gate settings in `GatePolicy`) and are
+        // never re-read for the life of the pipeline. Reclassifying to
+        // Immediate without a code-path refactor would make the config system
+        // report "applied immediately" for knobs that only take effect on
+        // restart — the exact lie the settings domain is designed to avoid.
         for id in [
             SettingId::CameraDetectionScoreThresholdPercent,
             SettingId::CameraDetectionNmsIouPercent,
-        ] {
-            assert_eq!(id.boundary(), ApplicationBoundary::Immediate, "{id}");
-        }
-    }
-
-    #[test]
-    fn captured_gate_settings_require_pipeline_restart() {
-        // `GatePolicy` is constructed once at pipeline start and holds these
-        // values as fields. Reclassifying to Immediate without a MotionGate
-        // refactor would make the config system LIE to the operator —
-        // "applied immediately" would be reported for a knob that only takes
-        // effect on restart.
-        for id in [
             SettingId::CameraDetectionMotionThresholdPercent,
             SettingId::CameraDetectionGateCooldown,
             SettingId::CameraDetectionGateHeartbeat,
