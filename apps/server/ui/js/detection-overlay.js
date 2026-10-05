@@ -104,7 +104,15 @@ export class DetectionOverlay {
   // through it rather than blanking for the full staleness window.
   reattach(videoEl) {
     if (!videoEl) return;
-    if (videoEl === this._video && this._canvas && this._canvas.parentNode) return;
+    // Only skip the full teardown when the canvas is still in the live DOM
+    // under the same video. After a `.stage` subtree is replaced, the old
+    // canvas's parentNode is a detached node that still passes a truthiness
+    // check — hence the explicit `isConnected`.
+    const canvasLive =
+      this._canvas &&
+      this._canvas.isConnected &&
+      this._canvas.parentNode === videoEl.parentNode;
+    if (videoEl === this._video && canvasLive) return;
     this._tearDownDom();
     this._video = videoEl;
     this._insertCanvas(videoEl);
