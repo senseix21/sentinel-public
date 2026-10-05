@@ -181,7 +181,11 @@ lsof -nP -iTCP:"${livekit_port}" -sTCP:LISTEN -t 2>/dev/null | grep -q . \
 status "READY" "LiveKit · ws://127.0.0.1:${livekit_port}"
 
 status "BUILD" "surveillance-server · ${build_profile}"
-(cd "${repo_root}" && cargo build -p surveillance-server "${cargo_profile[@]}") \
+cargo_features=()
+if [[ -n "${SURVEILLANCE_CARGO_FEATURES:-}" ]]; then
+  cargo_features=(--features "${SURVEILLANCE_CARGO_FEATURES}")
+fi
+(cd "${repo_root}" && cargo build -p surveillance-server "${cargo_profile[@]}" "${cargo_features[@]}") \
   >"${log_dir}/build.log" 2>&1 \
   || fail "server build failed; see ${log_dir}/build.log"
 status "READY" "Binary · ${server_binary}"
@@ -200,7 +204,7 @@ export SURVEILLANCE_VIDEO_HEIGHT="${video_height}"
 export SURVEILLANCE_RECORDING_ROOT="${recording_root}"
 export SURVEILLANCE_HEALTH_BIND="127.0.0.1:${server_port}"
 export SURVEILLANCE_DATABASE_URL="${database_url}"
-export SURVEILLANCE_DETECTION_ENABLED="false"
+export SURVEILLANCE_DETECTION_ENABLED="${SURVEILLANCE_DETECTION_ENABLED:-false}"
 export SURVEILLANCE_TRUSTED_PROXY_PEERS="127.0.0.1"
 export SURVEILLANCE_PROXY_PROOF_SECRET="${proof_secret}"
 export SURVEILLANCE_API_MUTATING_SURFACE_ENABLED="true"

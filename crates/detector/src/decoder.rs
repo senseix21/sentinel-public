@@ -1,6 +1,7 @@
 //! Owned `FFmpeg` H.264 decode-process adapter.
 
 use crate::detector::{DecodeError, H264Decoder};
+use crate::letterbox::LetterboxAlignment;
 use std::{
     io::{Read, Write},
     path::PathBuf,
@@ -18,8 +19,22 @@ use surveillance_media::{
 #[derive(Clone, Debug)]
 pub struct FfmpegDecoderConfig {
     pub executable: PathBuf,
+    /// The geometry frames are produced at: the model's input size, not the
+    /// camera's.
+    ///
+    /// Decoding at source resolution to feed a 416x416 model cost 6.2 MB per
+    /// 1080p frame to produce roughly 0.5 MB of tensor, and put the resize on
+    /// the hot path in Rust. Scaling here hands it to `swscale`, which is
+    /// vectorised and can be hardware-backed, and makes the letterbox factors
+    /// constants derived from configuration rather than per-frame work.
     pub width: u32,
     pub height: u32,
+    /// Passed to `FFmpeg` as `-hwaccel` when set. Software decode by default, so
+    /// a development host behaves exactly as it did.
+    pub hwaccel: Option<String>,
+    /// Where to put the padding. The inverse that reads boxes back is built
+    /// from the same value, so this is not a free choice.
+    pub letterbox_alignment: LetterboxAlignment,
     pub frame_limits: FrameLimits,
     pub response_timeout: Duration,
     pub max_access_unit_bytes: usize,
@@ -218,11 +233,25 @@ fn decode_one(
 }
 
 fn start_process(config: &FfmpegDecoderConfig, epoch: u64) -> Result<ActiveDecoder, DecodeError> {
+    // Aspect-preserving scale with centred padding, filled with the 114 grey
+    // the `YOLOX` family letterboxes with. The decoder emits exactly the model's
+    // input geometry, so the adapter copies rather than resizes.
+    let scale_filter = format!(
+        "scale={width}:{height}:force_original_aspect_ratio=decrease,\
+         pad={width}:{height}:{placement}:color=0x727272",
+        width = config.width,
+        height = config.height,
+        placement = config.letterbox_alignment.pad_expression()
+    );
     let mut child = Command::new(&config.executable)
+        .args(["-hide_banner", "-loglevel", "error"])
+        .args(
+            config
+                .hwaccel
+                .as_deref()
+                .map_or_else(Vec::new, |accelerator| vec!["-hwaccel", accelerator]),
+        )
         .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
             "-probesize",
             "32",
             "-analyzeduration",
@@ -232,6 +261,8 @@ fn start_process(config: &FfmpegDecoderConfig, epoch: u64) -> Result<ActiveDecod
             "-i",
             "pipe:0",
             "-an",
+            "-vf",
+            &scale_filter,
             "-pix_fmt",
             "rgb24",
             "-f",

@@ -74,6 +74,24 @@ pub fn one_camera_settings(
         decoded_frame_max_bytes: reader.usize(SettingId::CameraDetectionDecodedFrameMaxBytes)?,
         detection_decoder: reader.path(SettingId::CameraDetectionDecoder)?,
         detection_decode_timeout: reader.duration(SettingId::CameraDetectionDecodeTimeout)?,
+        detection_model_path: reader.optional_path(SettingId::CameraDetectionModelPath),
+        detection_model_sha256: reader.optional_text(SettingId::CameraDetectionModelSha256),
+        detection_input_width: reader.u32(SettingId::CameraDetectionInputWidth)?,
+        detection_input_height: reader.u32(SettingId::CameraDetectionInputHeight)?,
+        detection_execution_providers: reader.text(SettingId::CameraDetectionExecutionProviders)?,
+        detection_intra_op_threads: reader.u16(SettingId::CameraDetectionIntraOpThreads)?,
+        detection_inter_op_threads: reader.u16(SettingId::CameraDetectionInterOpThreads)?,
+        detection_score_threshold_percent: reader
+            .percentage(SettingId::CameraDetectionScoreThresholdPercent)?,
+        detection_nms_iou_percent: reader.percentage(SettingId::CameraDetectionNmsIouPercent)?,
+        detection_motion_threshold_percent: reader
+            .percentage(SettingId::CameraDetectionMotionThresholdPercent)?,
+        detection_gate_cooldown: reader.duration(SettingId::CameraDetectionGateCooldown)?,
+        detection_gate_heartbeat: reader.duration(SettingId::CameraDetectionGateHeartbeat)?,
+        detection_hwaccel: reader.optional_text(SettingId::CameraDetectionHwaccel),
+        // No TOML surface for the ROI exclude yet; env-only until the ROI
+        // product semantics are decided. See docs/adr/*.
+        detection_roi_exclude: None,
         width: reader.u32(SettingId::CameraVideoWidth)?,
         height: reader.u32(SettingId::CameraVideoHeight)?,
         segment_duration: reader.duration(SettingId::CameraRecordingSegmentDuration)?,
@@ -200,6 +218,34 @@ impl Reader<'_> {
         }
     }
 
+    /// A path only when one was configured. Absence is a legitimate state for
+    /// a setting with no compiled default, not an error to report.
+    fn optional_path(&self, id: SettingId) -> Option<PathBuf> {
+        match self.resolved.effective(id, self.camera)?.value() {
+            SettingValue::Path(value) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    /// Text only when configured and non-empty.
+    fn optional_text(&self, id: SettingId) -> Option<String> {
+        match self.resolved.effective(id, self.camera)?.value() {
+            SettingValue::Text(value) if !value.is_empty() => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    /// A whole percentage, refused above 100 so the caller never divides a
+    /// fraction out of range. The error names the setting, which is what an
+    /// operator needs to fix it.
+    fn percentage(&self, id: SettingId) -> Result<u8, AssemblyError> {
+        let value = self.u64(id)?;
+        u8::try_from(value)
+            .ok()
+            .filter(|percent| *percent <= 100)
+            .ok_or(AssemblyError::OutOfRange(id))
+    }
+
     fn optional_secret(&self, id: SettingId) -> Option<String> {
         match self.resolved.effective(id, self.camera)?.value() {
             SettingValue::Secret(value) => Some(value.expose().clone()),
@@ -295,6 +341,89 @@ mod tests {
             SettingValue::Unsigned(1920 * 1080 * 3),
         );
         vec![defaults::layer(), deployment]
+    }
+
+    /// Layers a deployment value on top of the defaults.
+    fn with(id: SettingId, value: SettingValue) -> Vec<Layer> {
+        let mut layers = deployable();
+        let mut deployment = Layer::new(Origin::File);
+        deployment
+            .insert(SettingKey::unscoped(id), value)
+            .expect("valid test entry");
+        layers.push(deployment);
+        layers
+    }
+
+    #[test]
+    fn detection_inference_defaults_assemble() {
+        let resolved = ResolvedSettings::resolve(deployable());
+        let settings = one_camera_settings(&resolved, &camera()).expect("assembles");
+        // No model configured is the shipped state, and it is a legitimate one:
+        // the detector keeps its fixture backend and says so.
+        assert_eq!(settings.detection_model_path, None);
+        assert_eq!(settings.detection_model_sha256, None);
+        assert_eq!(settings.detection_input_width, 416);
+        assert_eq!(settings.detection_input_height, 416);
+        assert_eq!(settings.detection_execution_providers, "cpu");
+        assert_eq!(settings.detection_intra_op_threads, 1);
+        assert_eq!(settings.detection_inter_op_threads, 1);
+        assert_eq!(settings.detection_score_threshold_percent, 30);
+        assert_eq!(settings.detection_nms_iou_percent, 45);
+        assert_eq!(settings.detection_motion_threshold_percent, 2);
+    }
+
+    #[test]
+    fn a_configured_model_path_and_pin_reach_the_typed_settings() {
+        let mut layers = deployable();
+        let mut deployment = Layer::new(Origin::File);
+        for (id, value) in [
+            (
+                SettingId::CameraDetectionModelPath,
+                SettingValue::Path(std::path::PathBuf::from("/srv/models/yolox_tiny.onnx")),
+            ),
+            (
+                SettingId::CameraDetectionModelSha256,
+                SettingValue::Text("c789161e".to_owned()),
+            ),
+        ] {
+            deployment
+                .insert(SettingKey::unscoped(id), value)
+                .expect("valid test entry");
+        }
+        layers.push(deployment);
+        let resolved = ResolvedSettings::resolve(layers);
+        let settings = one_camera_settings(&resolved, &camera()).expect("assembles");
+        assert_eq!(
+            settings.detection_model_path,
+            Some(std::path::PathBuf::from("/srv/models/yolox_tiny.onnx"))
+        );
+        assert_eq!(settings.detection_model_sha256, Some("c789161e".to_owned()));
+    }
+
+    #[test]
+    fn a_percentage_above_one_hundred_is_refused_by_name() {
+        for id in [
+            SettingId::CameraDetectionScoreThresholdPercent,
+            SettingId::CameraDetectionNmsIouPercent,
+            SettingId::CameraDetectionMotionThresholdPercent,
+        ] {
+            let resolved = ResolvedSettings::resolve(with(id, SettingValue::Unsigned(101)));
+            match one_camera_settings(&resolved, &camera()) {
+                Err(AssemblyError::OutOfRange(reported)) => assert_eq!(reported, id),
+                Err(other) => panic!("{id} above 100 produced the wrong error: {other:?}"),
+                Ok(_) => panic!("{id} above 100 must be refused"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_model_hash_reads_as_unpinned_rather_than_an_empty_pin() {
+        let resolved = ResolvedSettings::resolve(with(
+            SettingId::CameraDetectionModelSha256,
+            SettingValue::Text(String::new()),
+        ));
+        let settings = one_camera_settings(&resolved, &camera()).expect("assembles");
+        assert_eq!(settings.detection_model_sha256, None);
     }
 
     #[test]

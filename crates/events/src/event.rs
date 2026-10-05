@@ -1,8 +1,16 @@
 //! Immutable, versioned domain-event contracts.
 
 use serde::{Deserialize, Serialize};
-use std::{error::Error, fmt, num::NonZeroU64};
+use std::{
+    error::Error,
+    fmt,
+    num::{NonZeroU32, NonZeroU64},
+};
 use surveillance_common::types::{CameraId, RecordingId};
+
+/// Stable cross-frame identity assigned by the tracker to one person.
+/// `None` in a `PersonDetection` means no tracker is running for this camera.
+pub type TrackId = NonZeroU32;
 
 pub const CURRENT_SCHEMA_VERSION: u16 = 1;
 pub const MAX_DETECTIONS_PER_EVENT: usize = 64;
@@ -227,6 +235,9 @@ impl NormalizedBoundingBox {
 pub struct PersonDetection {
     pub confidence: Confidence,
     pub bounding_box: NormalizedBoundingBox,
+    /// Stable cross-frame identity. `None` when no tracker is active.
+    #[serde(default)]
+    pub track_id: Option<TrackId>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -357,6 +368,9 @@ pub enum EventPayload {
         media_time: SourceMediaTime,
         model: ModelName,
         model_version: ModelVersion,
+        /// `true` when detections come from a fixture backend, not a real model.
+        /// The UI must not render boxes when this is set.
+        results_are_fixture: bool,
         detections: DetectionSet,
     },
     DetectorStateChanged {
@@ -537,6 +551,7 @@ mod tests {
             confidence: Confidence::new(0.75).unwrap_or_else(|error| panic!("confidence: {error}")),
             bounding_box: NormalizedBoundingBox::new(0.1, 0.2, 0.3, 0.4)
                 .unwrap_or_else(|error| panic!("box: {error}")),
+            track_id: None,
         }
     }
 
@@ -574,6 +589,7 @@ mod tests {
                     .unwrap_or_else(|error| panic!("model: {error}")),
                 model_version: ModelVersion::new("1.0.0")
                     .unwrap_or_else(|error| panic!("version: {error}")),
+                results_are_fixture: true,
                 detections: DetectionSet::new(vec![person()])
                     .unwrap_or_else(|error| panic!("detections: {error}")),
             },

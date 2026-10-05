@@ -13,9 +13,11 @@ use surveillance_camera::connection::{ConnectionState, StopReason};
 use surveillance_camera::supervisor::{JitterSource, SupervisorStopReason};
 use surveillance_config::settings::OneCameraConfig;
 use surveillance_detector::{
+    backend::PersonInferenceBackend,
     decoder::{FfmpegDecoderConfig, FfmpegH264Decoder},
     detector::{DetectionHealth, DetectionOwner},
-    inference::DeterministicFakeInference,
+    gate::GatePolicy,
+    model_output::YOLOX_LETTERBOX_ALIGNMENT,
     sampler::TimestampSampler,
 };
 use surveillance_events::{
@@ -61,6 +63,11 @@ pub enum ActionableFailure {
 pub enum CameraPipelineError {
     Reconciliation,
     DetectionConfiguration,
+    /// A configured inference backend refused to come up. Carries the reason,
+    /// because "detection configuration is invalid" tells an operator nothing
+    /// about a missing model file or a hash that does not match.
+    InferenceBackend(String),
+    InferenceBackendTask,
     PublicationConfiguration,
     JoinCancelled,
     JoinPanicked,
@@ -68,9 +75,17 @@ pub enum CameraPipelineError {
 
 impl fmt::Display for CameraPipelineError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Self::InferenceBackend(reason) = self {
+            return write!(
+                formatter,
+                "camera detection backend refused to start: {reason}"
+            );
+        }
         formatter.write_str(match self {
             Self::Reconciliation => "camera recording reconciliation discovery failed",
             Self::DetectionConfiguration => "camera detection configuration is invalid",
+            Self::InferenceBackend(_) => unreachable!("handled above"),
+            Self::InferenceBackendTask => "camera detection backend initialization task failed",
             Self::PublicationConfiguration => "camera live publication configuration is invalid",
             Self::JoinCancelled => "camera pipeline task was cancelled",
             Self::JoinPanicked => "camera pipeline task panicked",
@@ -98,37 +113,62 @@ impl CameraPipeline {
         clippy::too_many_lines,
         reason = "one construction boundary keeps child ownership explicit"
     )]
-    pub fn start(
+    pub async fn start(
         config: Arc<OneCameraConfig>,
         metadata_writer: Option<MetadataWriterHandle>,
         event_bus: EventBus,
     ) -> Result<Self, CameraPipelineError> {
         let lifecycle_bus = event_bus.clone();
+        // Second clone for the publisher-side DetectionRelay. The detector
+        // consumes `event_bus` by value further down, which would otherwise
+        // leave nothing to subscribe with here.
+        let publication_bus = event_bus.clone();
         let (distributor, subscriptions) = MediaDistributor::new_with_detection(
             config.recorder_queue,
             config.live_queue,
             config.detection_queue,
         );
         let (detection, detection_health) = if config.detection_enabled {
+            // Frames are produced at the model's input geometry, not the
+            // camera's, so the bound is on what the detector actually holds.
+            // At 1080p into a 416x416 model this is roughly a fifth of what the
+            // camera's own geometry would have reserved.
             let limits = FrameLimits::new(
-                config.recorder.width(),
-                config.recorder.height(),
+                config.inference.input_width,
+                config.inference.input_height,
                 config.decoded_frame_max_bytes,
             )
             .map_err(|_| CameraPipelineError::DetectionConfiguration)?;
             let sampler =
                 TimestampSampler::new(config.detection_sample_rate, config.detection_max_gap)
                     .map_err(|_| CameraPipelineError::DetectionConfiguration)?;
-            let inference = DeterministicFakeInference::new()
-                .map_err(|_| CameraPipelineError::DetectionConfiguration)?;
+            // Selection, not construction: a configured model that cannot be
+            // loaded, or that this build has no backend for, refuses the
+            // pipeline rather than silently running the fixture. The error
+            // carries the reason so an operator can act on it.
+            let inference_config = config.inference.clone();
+            let inference = tokio::task::spawn_blocking(move || {
+                PersonInferenceBackend::select(&inference_config)
+            })
+            .await
+            .map_err(|_| CameraPipelineError::InferenceBackendTask)?
+            .map_err(|error| CameraPipelineError::InferenceBackend(error.to_string()))?;
             let decoder = FfmpegH264Decoder::start(FfmpegDecoderConfig {
                 executable: config.detection_decoder.clone(),
-                width: config.recorder.width(),
-                height: config.recorder.height(),
+                width: config.inference.input_width,
+                height: config.inference.input_height,
+                hwaccel: config.detection_hwaccel.clone(),
+                letterbox_alignment: YOLOX_LETTERBOX_ALIGNMENT,
                 frame_limits: limits,
                 response_timeout: config.detection_decode_timeout,
                 max_access_unit_bytes: config.max_access_unit_bytes,
             })
+            .map_err(|_| CameraPipelineError::DetectionConfiguration)?;
+            let gate_policy = GatePolicy::new(
+                config.detection_motion_threshold_percent,
+                config.detection_gate_cooldown,
+                config.detection_gate_heartbeat,
+            )
             .map_err(|_| CameraPipelineError::DetectionConfiguration)?;
             let (owner, health) = DetectionOwner::start_observed(
                 config.camera_id.clone(),
@@ -136,7 +176,9 @@ impl CameraPipeline {
                 sampler,
                 decoder,
                 inference,
+                gate_policy,
                 event_bus,
+                config.detection_roi_exclude,
             );
             (Some(owner), health)
         } else {
@@ -156,9 +198,10 @@ impl CameraPipeline {
             //
             // Nothing decodes until a viewer joins the room, so a deployment
             // with no operator watching pays nothing for this.
-            let adapter = TranscodePublicationAdapter::new(
+            let adapter = TranscodePublicationAdapter::with_event_bus(
                 &livekit,
                 TranscodePublicationAdapter::DEFAULT_TOKEN_TTL,
+                Some(publication_bus),
             )
             .map_err(|_| CameraPipelineError::PublicationConfiguration)?;
             let (owner, health) = LivePublicationOwner::new(livekit, adapter, subscriptions.live);

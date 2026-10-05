@@ -868,6 +868,178 @@ mod tests {
         );
     }
 
+    /// Evidence from a publication that met a decoder binary mid-replacement.
+    #[cfg(target_os = "linux")]
+    #[derive(Default)]
+    struct SwapEvidence {
+        refused: Vec<AdapterErrorKind>,
+        published_after_swap: usize,
+    }
+
+    /// Starts a real decoder on every access unit, so the error the publication
+    /// loop sees is the one the operating system actually produced.
+    ///
+    /// Nothing here names a failure. The fixture is held open for writing while
+    /// the test begins, which is what a deployment rewriting the decoder binary
+    /// looks like to `exec`, and the resulting `io::Error` goes through the
+    /// same classification and the same mapping the adapter uses in
+    /// production. Only the room is absent, because a `Session` holds a
+    /// connected `Room` and there is no server here.
+    #[cfg(target_os = "linux")]
+    struct DeploymentSwapAdapter {
+        program: String,
+        evidence: Arc<Mutex<SwapEvidence>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    struct NullSink;
+
+    #[cfg(target_os = "linux")]
+    impl crate::decode::DecodedFrameSink for NullSink {
+        fn accept(&mut self, _yuv420p: &[u8], _size: crate::decode::FrameSize) {}
+    }
+
+    #[cfg(target_os = "linux")]
+    impl PublicationAdapter for DeploymentSwapAdapter {
+        fn timestamp_authority(&self) -> TimestampAuthority {
+            TimestampAuthority::Media
+        }
+
+        fn connect(&mut self) -> AdapterFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn send_access_unit<'a>(
+            &'a mut self,
+            _access_unit: EncodedAccessUnit<'a>,
+        ) -> AdapterFuture<'a, SendOutcome> {
+            Box::pin(async move {
+                let size = crate::decode::FrameSize::new(320, 240)
+                    .unwrap_or_else(|error| panic!("{error}"));
+                match crate::decode::H264ToI420::spawn(
+                    &self.program,
+                    size,
+                    NullSink,
+                    Arc::new(crate::decode::DecodeCounters::default()),
+                ) {
+                    Ok(decoder) => {
+                        decoder.shutdown().await;
+                        lock(&self.evidence).published_after_swap += 1;
+                        Ok(SendOutcome::Published)
+                    }
+                    Err(error) => {
+                        let kind = crate::transcode::start_failure_kind(error);
+                        lock(&self.evidence).refused.push(kind);
+                        Err(crate::adapter::AdapterError::new(kind))
+                    }
+                }
+            })
+        }
+
+        fn disconnect(&mut self) -> AdapterFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A camera whose decoder binary is replaced underneath it keeps publishing.
+    ///
+    /// This is the failure the classification exists for, assembled end to end:
+    /// a real `exec` refused by the kernel, the real mapping into the adapter
+    /// contract, and the real publication loop deciding what to do about it.
+    /// Before the classification existed the loop reached `Terminal` here and
+    /// the camera stayed dark until something else restarted it, which is why
+    /// the assertion below is about the state and not only the counters.
+    ///
+    /// Linux only: macOS permits the `exec` outright, so there is no refusal to
+    /// recover from. Linux is the deployment target.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_decoder_binary_replaced_mid_publication_recovers_on_its_own() {
+        let fixture = std::env::temp_dir().join(format!("swapped-decoder-{}", std::process::id()));
+        std::fs::write(&fixture, "#!/bin/sh\nexec sleep 300\n")
+            .unwrap_or_else(|error| panic!("write the fixture: {error}"));
+        std::fs::set_permissions(
+            &fixture,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap_or_else(|error| panic!("mark the fixture runnable: {error}"));
+        // The deployment, in progress: the file exists and is executable, and
+        // the writer has not finished with it.
+        let deployment = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture)
+            .unwrap_or_else(|error| panic!("hold the fixture open: {error}"));
+
+        let capacity = QueueCapacity::new(4).unwrap_or_else(|error| panic!("{error}"));
+        let (distributor, subscriptions) = MediaDistributor::new(capacity, capacity);
+        drop(subscriptions.recorder);
+        let evidence = Arc::new(Mutex::new(SwapEvidence::default()));
+        let (owner, health) = LivePublicationOwner::new(
+            config(),
+            DeploymentSwapAdapter {
+                program: fixture.to_string_lossy().into_owned(),
+                evidence: Arc::clone(&evidence),
+            },
+            subscriptions.live,
+        );
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(owner.run(shutdown_rx));
+
+        distributor.publish(keyframe());
+        for _ in 0..500 {
+            if !lock(&evidence).refused.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let refusals = lock(&evidence).refused.clone();
+        assert!(
+            !refusals.is_empty(),
+            "the decoder must have been refused while its binary was held open"
+        );
+        assert!(
+            refusals
+                .iter()
+                .all(|kind| *kind == AdapterErrorKind::Transport),
+            "a binary being replaced is a fault of the moment: {refusals:?}"
+        );
+
+        // The deployment finishes.
+        drop(deployment);
+        for _ in 0..1000 {
+            if lock(&evidence).published_after_swap > 0 {
+                break;
+            }
+            distributor.publish(keyframe());
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        shutdown_tx.send_replace(true);
+        let exit = task.await.unwrap_or_else(|error| panic!("{error}"));
+        let _ = std::fs::remove_file(&fixture);
+
+        assert!(
+            lock(&evidence).published_after_swap > 0,
+            "the camera must publish again once the binary is readable"
+        );
+        // The stop reason, not the state: a publication that gives up still
+        // ends in `Stopped`, so asserting on the state would have passed
+        // whatever happened here. `Terminal` is the one that needs an operator
+        // to notice a camera went dark over a deployment that already
+        // finished, and `a_non_retryable_send_failure_stops_publication_
+        // instead_of_reconnecting` is what that looks like.
+        assert_eq!(
+            exit.reason,
+            PublicationStopReason::Requested,
+            "this publication must end because the test asked it to, not \
+             because it gave up on a decoder that came back"
+        );
+        assert!(
+            health.snapshot().counters.reconnects > 0,
+            "recovery is the reconnect, so it should be visible as one"
+        );
+    }
+
     #[tokio::test]
     async fn retry_owns_disconnect_and_starts_a_fresh_timestamp_epoch() {
         let capacity = QueueCapacity::new(4).unwrap_or_else(|error| panic!("{error}"));

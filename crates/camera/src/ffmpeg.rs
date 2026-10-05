@@ -1218,7 +1218,10 @@ mod tests {
         /// earlier version cancelled on a timer and only then looked for the
         /// child, so the observation raced the kill it was meant to detect and
         /// the test passed whether or not the fix was present.
-        async fn settled_pid(pid_path: &Path) -> String {
+        async fn settled_pid(
+            pid_path: &Path,
+            startup: &tokio::task::JoinHandle<Result<(), String>>,
+        ) -> String {
             for _ in 0..400 {
                 if let Ok(contents) = std::fs::read_to_string(pid_path) {
                     let pid = contents.trim().to_owned();
@@ -1226,9 +1229,20 @@ mod tests {
                         return pid;
                     }
                 }
+                // Startup finishing before a pid appears means no child was
+                // ever created -- a spawn that failed, which under a loaded
+                // `--workspace` run is usually fork returning EAGAIN. Reporting
+                // "never reported its pid" for that blames the fixture for an
+                // environment failure and sends the reader to the wrong place.
+                assert!(
+                    !startup.is_finished(),
+                    "the session ended before its child reported a pid, so the \
+                     process was never spawned; this is an environment failure, \
+                     not a leak"
+                );
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            panic!("stalled executable never reported its pid");
+            panic!("stalled executable never reported its pid within ten seconds");
         }
 
         fn failing_executable(directory: &Path, message: &str) -> PathBuf {
@@ -1304,9 +1318,13 @@ mod tests {
             // Start without a deadline, then cancel by aborting the task. The
             // future is dropped at its await point, which is exactly what a
             // supervisor shutdown inside the startup window does.
-            let startup =
-                tokio::spawn(async move { FfmpegH264Session::start(&config).await.map(|_| ()) });
-            let pid = settled_pid(&pid_path).await;
+            let startup = tokio::spawn(async move {
+                FfmpegH264Session::start(&config)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            });
+            let pid = settled_pid(&pid_path, &startup).await;
             assert!(
                 running(&pid),
                 "the fixture child must be alive before cancellation, or this test proves nothing"

@@ -10,8 +10,22 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# The ONNX inference backend. Off by default so the workspace builds, tests and
+# ships on any platform with the fixture backend, including those `ort` has no
+# prebuilt runtime for.
+onnx-inference = ["dep:ort", "dep:sha2"]
+
 [dependencies]
+ort = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 surveillance-common = { path = "../common" }
 surveillance-events = { path = "../events" }
 surveillance-media = { path = "../media" }
 tokio.workspace = true
+
+[dev-dependencies]
+# The accuracy harness reads a generated manifest of frames and ground-truth
+# boxes. Development only: nothing in the crate parses JSON.
+serde.workspace = true
+serde_json.workspace = true

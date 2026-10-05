@@ -10,6 +10,11 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# Passes the detector's optional ONNX backend through, so a build either has
+# real inference everywhere or nowhere.
+onnx-inference = ["surveillance-detector/onnx-inference"]
+
 [dependencies]
 jiff.workspace = true
 chrono = { workspace = true }

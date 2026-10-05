@@ -144,6 +144,19 @@ camera cardinality is already bounded by `supervision.maximum_cameras`.
 | `camera.detection.queue_items` | `usize` | `PipelineRestart` | Public |
 | `camera.detection.sample_fps` | `u16` | `PipelineRestart` | Public |
 | `camera.detection.max_gap` | `Duration` | `PipelineRestart` | Public |
+| `camera.detection.model_path` | `PathBuf` | `PipelineRestart` | Public |
+| `camera.detection.model_sha256` | `String` | `PipelineRestart` | Public |
+| `camera.detection.input_width` | `u32` | `PipelineRestart` | Public |
+| `camera.detection.input_height` | `u32` | `PipelineRestart` | Public |
+| `camera.detection.execution_providers` | `String` | `PipelineRestart` | Public |
+| `camera.detection.intra_op_threads` | `u16` | `PipelineRestart` | Public |
+| `camera.detection.inter_op_threads` | `u16` | `PipelineRestart` | Public |
+| `camera.detection.score_threshold_percent` | `u8` | `PipelineRestart` | Public |
+| `camera.detection.nms_iou_percent` | `u8` | `PipelineRestart` | Public |
+| `camera.detection.motion_threshold_percent` | `u8` | `PipelineRestart` | Public |
+| `camera.detection.gate_cooldown` | `Duration` | `PipelineRestart` | Public |
+| `camera.detection.gate_heartbeat` | `Duration` | `PipelineRestart` | Public |
+| `camera.detection.hwaccel` | `String` | `PipelineRestart` | Public |
 | `camera.detection.decoded_frame_max_bytes` | `usize` | `PipelineRestart` | Public |
 | `camera.detection.decoder` | `PathBuf` | `PipelineRestart` | Public |
 | `camera.detection.decode_timeout` | `Duration` | `PipelineRestart` | Public |
@@ -199,7 +212,7 @@ of a group re-validates the whole group against current effective values.
 | Storage watermarks | the four `storage.watermark_*` keys | strictly increasing, `< 100`, hysteresis below the first gap |
 | Retention | `retention.max_age`, `retention.protected_recent` | protected window strictly shorter than max age |
 | Camera memory budget | all `camera.queue.*`, `camera.detection.*`, `camera.video.*`, `camera.rtsp.max_access_unit_bytes`, `camera.recording.max_fragment_bytes`, `camera.memory.max_pipeline_bytes` | computed bound `<=` budget, per the existing `OneCameraConfig::validate` arithmetic |
-| Decoded frame budget | `camera.video.width`, `camera.video.height`, `camera.detection.decoded_frame_max_bytes` | `decoded_frame_max_bytes >= width * height * 3` |
+| Decoded frame budget | `camera.detection.input_width`, `camera.detection.input_height`, `camera.detection.decoded_frame_max_bytes` | `decoded_frame_max_bytes >= input_width * input_height * 3` |
 | Reconnect policy | `camera.reconnect.initial`, `camera.reconnect.maximum` | initial `<=` maximum |
 
 The camera memory group is why per-field validation is insufficient: raising

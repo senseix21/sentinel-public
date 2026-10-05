@@ -68,6 +68,45 @@ pub struct TranscodeCounters {
     /// could not be copied whole. Nonzero here means the decoder and the
     /// pinned geometry disagree, which is a defect rather than backpressure.
     pub frames_malformed: AtomicU64,
+    /// Times the SDK tore down and republished our track during a room
+    /// reconnect. Each increment means `publish_track` completed: the new
+    /// encoder is registered with the source and frames are flowing again.
+    /// Only incremented on the full-restart path; zero on resume.
+    pub track_republications: AtomicU64,
+    /// Times the SDK completed a reconnect of any kind (resume or full
+    /// restart). Fires after `SyncState`, `restart_publisher`, ICE settle,
+    /// and (on the restart path) all `LocalTrackRepublished` dispatches.
+    /// Safe to gate a re-join on: once this fires, the track is subscribable.
+    pub reconnections: AtomicU64,
+}
+
+/// Subscribes to the event bus and spawns a `DetectionRelay` on the room's
+/// local participant. Returns the join handle and shutdown sender when
+/// subscription succeeds; both `None` when the bus refused another subscriber
+/// (closed) or when `SubscriptionCapacity` could not be constructed. In those
+/// cases a `warn!` is emitted and the publisher runs without an overlay —
+/// recording and live viewing are unaffected.
+fn spawn_detection_relay(
+    bus: &surveillance_events::bus::EventBus,
+    participant: livekit::participant::LocalParticipant,
+) -> (
+    Option<tokio::task::JoinHandle<()>>,
+    Option<tokio::sync::watch::Sender<bool>>,
+) {
+    use crate::relay::DetectionRelay;
+    use surveillance_events::bus::SubscriptionCapacity;
+    let Ok(capacity) = SubscriptionCapacity::new(32) else {
+        tracing::warn!("DetectionRelay: invalid subscription capacity");
+        return (None, None);
+    };
+    let Ok(sub) = bus.subscribe(capacity) else {
+        tracing::warn!("DetectionRelay: event bus refused subscription");
+        return (None, None);
+    };
+    let relay = DetectionRelay::new(sub, participant);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(relay.run(rx));
+    (Some(handle), Some(tx))
 }
 
 /// Publishes a camera into a `LiveKit` room by decoding and re-encoding it.
@@ -81,6 +120,10 @@ pub struct TranscodePublicationAdapter {
     decode_counters: Arc<DecodeCounters>,
     counters: Arc<TranscodeCounters>,
     session: Option<Session>,
+    /// Optional event-bus handle. When present, each session spawns a
+    /// `DetectionRelay` that pumps `PersonDetectionObserved` events onto the
+    /// room's data channel. Absent in builds without detection.
+    event_bus: Option<surveillance_events::bus::EventBus>,
 }
 
 /// One connected room, its event stream, and the track while a viewer is here.
@@ -90,6 +133,12 @@ struct Session {
     viewers: usize,
     track: Option<PublishedTrack>,
     idle_deadline: Option<Instant>,
+    /// Join handle for the running `DetectionRelay`. `None` when no event
+    /// bus was configured, or during the window between construction and the
+    /// relay starting (never observable to callers).
+    relay_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Shutdown sender for the relay owned by `relay_handle`.
+    relay_shutdown: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 /// A published track, the source feeding it, and the decode session behind it.
@@ -121,6 +170,19 @@ impl TranscodePublicationAdapter {
     /// [`AdapterErrorKind::Unavailable`] when the requested token lifetime is
     /// outside the permitted range.
     pub fn new(config: &LiveKitConfig, token_ttl: Duration) -> Result<Self, AdapterError> {
+        Self::with_event_bus(config, token_ttl, None)
+    }
+
+    /// Variant of [`Self::new`] that wires an event bus into each session so a
+    /// `DetectionRelay` can run alongside the publisher.
+    ///
+    /// # Errors
+    /// Same conditions as [`Self::new`].
+    pub fn with_event_bus(
+        config: &LiveKitConfig,
+        token_ttl: Duration,
+        event_bus: Option<surveillance_events::bus::EventBus>,
+    ) -> Result<Self, AdapterError> {
         let tokens = PublisherTokenIssuer::new(config, token_ttl).map_err(|error| {
             AdapterError::new(match error {
                 TokenIssueError::InvalidLifetime => AdapterErrorKind::Unavailable,
@@ -137,6 +199,7 @@ impl TranscodePublicationAdapter {
             decode_counters: Arc::new(DecodeCounters::default()),
             counters: Arc::new(TranscodeCounters::default()),
             session: None,
+            event_bus,
         })
     }
 
@@ -189,17 +252,31 @@ impl Session {
     /// The count is re-read from the room rather than incremented and
     /// decremented, so a missed or duplicated event cannot leave a permanent
     /// drift that either burns CPU forever or blacks out every viewer.
-    fn refresh_viewers(&mut self) {
+    fn refresh_viewers(&mut self, counters: &Arc<TranscodeCounters>) {
         let mut changed = false;
         for _ in 0..Self::MAX_EVENTS_PER_ACCESS_UNIT {
             match self.events.try_recv() {
-                Ok(
-                    RoomEvent::ParticipantConnected(_)
-                    | RoomEvent::ParticipantDisconnected(_)
-                    | RoomEvent::Disconnected { .. }
-                    | RoomEvent::Reconnected,
-                ) => changed = true,
-                Ok(_) => {}
+                Ok(RoomEvent::LocalTrackRepublished { publication, .. }) => {
+                    // The SDK tore down and rebuilt our track on the full-restart
+                    // path. Update the stored SID so stop_publishing uses the new
+                    // one, and count the event as evidence the encoder is wired.
+                    if let Some(track) = self.track.as_mut() {
+                        track.publication = publication;
+                    }
+                    counters
+                        .track_republications
+                        .fetch_add(1, Ordering::Relaxed);
+                    changed = true;
+                }
+                Ok(RoomEvent::Reconnected) => {
+                    // Fires on both resume and full-restart paths, always after
+                    // SyncState, restart_publisher, ICE settle, and (on restart)
+                    // all LocalTrackRepublished dispatches. The track is
+                    // subscribable once this fires.
+                    counters.reconnections.fetch_add(1, Ordering::Relaxed);
+                    changed = true;
+                }
+                Ok(_) => changed = true,
                 Err(_) => break,
             }
         }
@@ -276,15 +353,7 @@ impl Session {
             counters: Arc::clone(counters),
         };
         let decoder = H264ToI420::spawn(program, track.size, sink, Arc::clone(decode_counters))
-            .map_err(|error| {
-                AdapterError::new(match error {
-                    // A missing decoder binary will still be missing next time,
-                    // so this stops the publication once instead of entering a
-                    // reconnect loop over a deployment fault.
-                    DecodeError::Unavailable => AdapterErrorKind::Unavailable,
-                    _ => AdapterErrorKind::Transport,
-                })
-            })?;
+            .map_err(|error| AdapterError::new(start_failure_kind(error)))?;
         track.decoder = Some(decoder);
         Ok(())
     }
@@ -362,12 +431,26 @@ impl PublicationAdapter for TranscodePublicationAdapter {
             // first keyframe, not wait for the next join event that will never
             // come.
             let viewers = room.remote_participants().len();
+
+            // Start the DetectionRelay for this session, if we have an
+            // event bus to subscribe to. The handle is owned by the Session
+            // so `disconnect` can await its shutdown. A failed subscribe is
+            // logged and the publication proceeds without an overlay.
+            // `LocalParticipant` is `Clone`; `Room` is not, so we hand the
+            // relay the participant handle instead of a `Room` reference.
+            let (relay_handle, relay_shutdown) = match self.event_bus.as_ref() {
+                Some(bus) => spawn_detection_relay(bus, room.local_participant()),
+                None => (None, None),
+            };
+
             self.session = Some(Session {
                 room,
                 events,
                 viewers,
                 track: None,
                 idle_deadline: None,
+                relay_handle,
+                relay_shutdown,
             });
             Ok(())
         })
@@ -393,7 +476,7 @@ impl PublicationAdapter for TranscodePublicationAdapter {
             let Some(session) = session.as_mut() else {
                 return Err(AdapterError::new(AdapterErrorKind::Connection));
             };
-            session.refresh_viewers();
+            session.refresh_viewers(counters);
 
             if should_stop_publishing(
                 session.viewers,
@@ -510,6 +593,18 @@ impl PublicationAdapter for TranscodePublicationAdapter {
     fn disconnect(&mut self) -> AdapterFuture<'_, ()> {
         Box::pin(async move {
             if let Some(mut session) = self.session.take() {
+                // Signal the detection relay to stop before we close the room;
+                // ordering matters, because `publish_data` on a dropped room
+                // would log noise about a disconnected session. The join is
+                // then safe to await.
+                if let Some(tx) = session.relay_shutdown.take() {
+                    let _ = tx.send(true);
+                }
+                if let Some(handle) = session.relay_handle.take() {
+                    if let Err(error) = handle.await {
+                        tracing::warn!(?error, "DetectionRelay: join failed");
+                    }
+                }
                 session.stop_publishing().await;
                 // Dropping the room closes it; awaiting the explicit close lets
                 // the server see the participant leave rather than time it out.
@@ -517,6 +612,28 @@ impl PublicationAdapter for TranscodePublicationAdapter {
             }
             Ok(())
         })
+    }
+}
+
+/// How a failed decoder start is reported to the publication loop.
+///
+/// A missing or unrunnable decoder binary will still be missing next time, so
+/// it stops the publication once instead of entering a reconnect loop over a
+/// deployment fault. Everything else is a fault of the moment and is retried.
+///
+/// Exhaustive rather than a wildcard: the difference between these two arms is
+/// a camera that comes back on its own and one that does not, so a variant
+/// added later has to be placed here deliberately instead of inheriting
+/// whichever answer happened to be the default. Named rather than inline so the
+/// recovery test can produce an error through the real decoder and send it
+/// through this exact mapping, instead of asserting against a copy of it.
+pub(crate) const fn start_failure_kind(error: DecodeError) -> AdapterErrorKind {
+    match error {
+        DecodeError::Unavailable => AdapterErrorKind::Unavailable,
+        DecodeError::StartFailed
+        | DecodeError::Geometry
+        | DecodeError::Failed
+        | DecodeError::Overloaded => AdapterErrorKind::Transport,
     }
 }
 

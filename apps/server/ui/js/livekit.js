@@ -1,4 +1,5 @@
 import { esc } from "./formatting.js";
+import { DetectionOverlay, DETECTION_TOPIC } from "./detection-overlay.js";
 
 export function createLiveKitOwner({
   ApiError, api, banner, errorBanner, sdkLoader = null,
@@ -73,6 +74,9 @@ function cancelRetry(cameraId) {
 async function teardownLive(cameraId) {
   const session = live.rooms.get(cameraId);
   live.rooms.delete(cameraId);
+  if (session && session.overlay) {
+    try { session.overlay.detach(); } catch (error) { /* already detached */ }
+  }
   if (session && session.track) {
     try { session.track.detach(); } catch (error) { /* already detached */ }
   }
@@ -80,10 +84,53 @@ async function teardownLive(cameraId) {
     video.hidden = true;
     video.removeAttribute("src");
   }
+  setFixtureBadge(cameraId, false);
+  setPersonCount(cameraId, { active: 0, cumulative: 0 }, false);
   liveIdle(cameraId, true);
   liveNote(cameraId, "");
   if (!session) return;
   try { await session.room.disconnect(); } catch (error) { /* already gone */ }
+}
+
+// A tile-local "detection unavailable" badge, toggled by the overlay when
+// `results_are_fixture` is seen. Hidden by default; the live.js markup renders
+// the span with `.detection-badge.hidden` and we flip the class.
+function setFixtureBadge(cameraId, show) {
+  for (const video of liveVideos(cameraId)) {
+    // Guard against test doubles that stand in for a `<video>` without the
+    // full element surface; `closest` only exists on real DOM elements.
+    if (typeof video.closest !== "function") continue;
+    const tile = video.closest(".stage");
+    if (!tile) continue;
+    const badge = tile.querySelector(".detection-badge");
+    if (badge) badge.classList.toggle("hidden", !show);
+  }
+}
+
+// Writes the "active · cumulative" person count into the tile. Hidden while
+// no counts have been reported (empty session) OR while the detector is in
+// fixture mode (counts would be meaningless).
+function setPersonCount(cameraId, counts, fixture) {
+  for (const video of liveVideos(cameraId)) {
+    if (typeof video.closest !== "function") continue;
+    const tile = video.closest(".stage");
+    if (!tile) continue;
+    const el = tile.querySelector(".person-count");
+    if (!el) continue;
+    const hide = fixture || counts.cumulative === 0;
+    el.classList.toggle("hidden", hide);
+    if (!hide) el.textContent = `${counts.active} · ${counts.cumulative}`;
+  }
+}
+
+// Refreshes the "N · M" readout for every active watch session. Invoked by
+// app.js after each reconcile tick so the span is restored on the fresh
+// `.stage` subtree even before the next data packet arrives.
+function restorePersonCounts() {
+  for (const [cameraId, session] of live.rooms) {
+    if (!session.overlay) continue;
+    setPersonCount(cameraId, session.overlay.personCounts(), session.overlay.isFixture());
+  }
 }
 
 async function stopLive(cameraId, remember = true) {
@@ -143,6 +190,20 @@ function reattachLive() {
   }
 }
 
+// Detection canvases live in the DOM beside the `<video>` and are therefore
+// casualties of the live-screen re-render even though the video itself is
+// carried across. This re-inserts the canvas next to each attached video
+// without disturbing the overlay's packet state, so a detection that arrived
+// one tick ago is not forgotten over the next render.
+function reattachOverlays() {
+  for (const [cameraId, session] of live.rooms) {
+    if (!session.overlay) continue;
+    const video = liveVideos(cameraId)[0];
+    if (!video) continue;
+    session.overlay.reattach(video);
+  }
+}
+
 async function startLive(cameraId, video, retryAttempt = 0) {
   live.stopped.delete(cameraId);
   live.desired.add(cameraId);
@@ -170,7 +231,8 @@ async function startLive(cameraId, video, retryAttempt = 0) {
   }
 
   const room = new sdk.Room();
-  const session = { room, track: null, retryAttempt };
+  const overlay = new DetectionOverlay();
+  const session = { room, track: null, overlay, retryAttempt };
   live.rooms.set(cameraId, session);
 
   // Attaching on subscribe rather than on connect: a room can be joined while
@@ -180,6 +242,7 @@ async function startLive(cameraId, video, retryAttempt = 0) {
     if (track.kind !== sdk.Track.Kind.Video) return;
     session.track = track;
     track.attach(video);
+    overlay.attach(video);
     video.dataset.liveAttached = "yes";
     video.hidden = false;
     liveIdle(cameraId, false);
@@ -194,12 +257,27 @@ async function startLive(cameraId, video, retryAttempt = 0) {
 
   room.on(sdk.RoomEvent.TrackUnsubscribed, (track) => {
     track.detach();
+    overlay.detach();
     if (session.track === track) session.track = null;
     video.hidden = true;
+    setFixtureBadge(cameraId, false);
     liveIdle(cameraId, true);
     liveNote(cameraId, banner("warn", "The live stream stopped.",
       "The publisher went away. Recording is independent of this and is " +
       "unaffected; the camera state above is reported separately."));
+  });
+
+  // Detection boxes travel on the room's data channel, topic "det/v1".
+  // The overlay enforces staleness and the fixture guard; here we only
+  // decode, filter by topic, and route.
+  room.on(sdk.RoomEvent.DataReceived, (payload, _participant, _kind, topic) => {
+    if (topic !== DETECTION_TOPIC) return;
+    let packet;
+    try { packet = JSON.parse(new TextDecoder().decode(payload)); }
+    catch (error) { return; }
+    overlay.onPacket(packet);
+    setFixtureBadge(cameraId, !!packet.results_are_fixture);
+    setPersonCount(cameraId, overlay.personCounts(), overlay.isFixture());
   });
 
   room.on(sdk.RoomEvent.Disconnected, () => {
@@ -242,5 +320,10 @@ async function startVisibleLive() {
   }));
 }
 
-  return { live, liveVideos, startLive, startVisibleLive, stopLive, stopAllLive, reattachLive };
+  return {
+    live, liveVideos,
+    startLive, startVisibleLive, stopLive, stopAllLive,
+    reattachLive, reattachOverlays, restorePersonCounts,
+    liveIdle,
+  };
 }

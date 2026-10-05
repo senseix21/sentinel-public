@@ -382,10 +382,10 @@ settings! {
         Duration, [];
     CameraVideoWidth =>
         "camera.video.width", Operational, PipelineRestart, Public, PerCamera, Unsigned,
-        [CameraMemoryBudget, DecodedFrameBudget];
+        [CameraMemoryBudget];
     CameraVideoHeight =>
         "camera.video.height", Operational, PipelineRestart, Public, PerCamera, Unsigned,
-        [CameraMemoryBudget, DecodedFrameBudget];
+        [CameraMemoryBudget];
     CameraQueueRecorderItems =>
         "camera.queue.recorder_items", Operational, PipelineRestart, Public, PerCamera, Unsigned,
         [CameraMemoryBudget];
@@ -440,6 +440,49 @@ settings! {
     CameraDetectionDecodeTimeout =>
         "camera.detection.decode_timeout", Operational, PipelineRestart, Public, PerCamera,
         Duration, [];
+    CameraDetectionModelPath =>
+        "camera.detection.model_path", Operational, PipelineRestart, Public, PerCamera, Path, [];
+    CameraDetectionModelSha256 =>
+        "camera.detection.model_sha256", Operational, PipelineRestart, Public, PerCamera, Text, [];
+    CameraDetectionInputWidth =>
+        "camera.detection.input_width", Operational, PipelineRestart, Public, PerCamera, Unsigned,
+        [CameraMemoryBudget, DecodedFrameBudget];
+    CameraDetectionInputHeight =>
+        "camera.detection.input_height", Operational, PipelineRestart, Public, PerCamera, Unsigned,
+        [CameraMemoryBudget, DecodedFrameBudget];
+    CameraDetectionExecutionProviders =>
+        "camera.detection.execution_providers", Operational, PipelineRestart, Public, PerCamera,
+        Text, [];
+    CameraDetectionIntraOpThreads =>
+        "camera.detection.intra_op_threads", Operational, PipelineRestart, Public, PerCamera,
+        Unsigned, [];
+    CameraDetectionInterOpThreads =>
+        "camera.detection.inter_op_threads", Operational, PipelineRestart, Public, PerCamera,
+        Unsigned, [];
+    // PipelineRestart (not Immediate): `OnnxPersonInference` captures a
+    // `DecodeThresholds` at construction (crates/detector/src/onnx.rs:134 and
+    // :158) and reuses it in every call to `infer` (:371). Reclassifying
+    // as Immediate without threading a live config source into `infer`
+    // would make the config system report "applied immediately" for a knob
+    // that only takes effect on restart — the specific lie the settings
+    // domain is designed to avoid. Make the field live first, then flip.
+    CameraDetectionScoreThresholdPercent =>
+        "camera.detection.score_threshold_percent", Operational, PipelineRestart, Public, PerCamera,
+        Unsigned, [];
+    CameraDetectionNmsIouPercent =>
+        "camera.detection.nms_iou_percent", Operational, PipelineRestart, Public, PerCamera, Unsigned,
+        [];
+    CameraDetectionMotionThresholdPercent =>
+        "camera.detection.motion_threshold_percent", Operational, PipelineRestart, Public, PerCamera,
+        Unsigned, [];
+    CameraDetectionGateCooldown =>
+        "camera.detection.gate_cooldown", Operational, PipelineRestart, Public, PerCamera, Duration,
+        [];
+    CameraDetectionGateHeartbeat =>
+        "camera.detection.gate_heartbeat", Operational, PipelineRestart, Public, PerCamera, Duration,
+        [];
+    CameraDetectionHwaccel =>
+        "camera.detection.hwaccel", Operational, PipelineRestart, Public, PerCamera, Text, [];
     CameraLiveKitEndpoint =>
         "camera.livekit.endpoint", Operational, PipelineRestart, Public, PerCamera, Text, [];
     CameraLiveKitApiKey =>
@@ -560,6 +603,25 @@ mod tests {
                 );
                 assert!(!id.api_editable(), "{id} is bootstrap but API-editable");
             }
+        }
+    }
+
+    #[test]
+    fn captured_detection_thresholds_and_gate_settings_require_pipeline_restart() {
+        // All five are captured at pipeline construction (inference thresholds
+        // in `OnnxPersonInference`, gate settings in `GatePolicy`) and are
+        // never re-read for the life of the pipeline. Reclassifying to
+        // Immediate without a code-path refactor would make the config system
+        // report "applied immediately" for knobs that only take effect on
+        // restart — the exact lie the settings domain is designed to avoid.
+        for id in [
+            SettingId::CameraDetectionScoreThresholdPercent,
+            SettingId::CameraDetectionNmsIouPercent,
+            SettingId::CameraDetectionMotionThresholdPercent,
+            SettingId::CameraDetectionGateCooldown,
+            SettingId::CameraDetectionGateHeartbeat,
+        ] {
+            assert_eq!(id.boundary(), ApplicationBoundary::PipelineRestart, "{id}");
         }
     }
 
@@ -698,7 +760,12 @@ mod tests {
                         "budget",
                         "gap",
                         "tolerance",
-                        "grace"
+                        "grace",
+                        // The detection gate's vocabulary. Both words denote
+                        // time as plainly as the rest of this list, so the
+                        // guard is extended rather than the keys contorted.
+                        "cooldown",
+                        "heartbeat"
                     ]
                     .iter()
                     .any(|marker| key.contains(marker)),
@@ -712,6 +779,6 @@ mod tests {
     fn table_covers_the_documented_setting_count() {
         // Guards against an accidental deletion of a table row. The number is
         // the contracts table's row count; changing it is a deliberate act.
-        assert_eq!(SettingId::ALL.len(), 80);
+        assert_eq!(SettingId::ALL.len(), 93);
     }
 }

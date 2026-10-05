@@ -400,6 +400,9 @@ Add sampled human detection as an independently degradable media consumer and pu
 - [x] Separate immutable past-tense events from commands.
 - [x] Publish camera, recording, storage, and detection lifecycle events without transporting media payloads.
 - [x] Persist externally relevant event versions where required.
+- [x] Assign stable cross-frame identities to detections via an IoU tracker and surface them on `PersonDetectionObserved` alongside a `results_are_fixture` flag. `crates/detector/src/tracker.rs`, `docs/superpowers/specs/2026-10-04-detection-overlay-design.md`.
+- [x] Relay tracked detections to the live-view client over the LiveKit data channel (topic `det/v1`, lossy), with session-owned shutdown so no stale relay survives a reconnect. `crates/livekit/src/relay.rs`.
+- [x] Draw tracked bounding boxes client-side on a canvas over each tile with letterbox-aware coordinate mapping, a 3-second staleness blank, and a server-authoritative `results_are_fixture` guard that shows a "detection unavailable" badge instead of boxes. Browser-verified against mocked packets; full-pipeline session awaits a configured camera. `apps/server/ui/js/detection-overlay.js`.
 
 ### Tests
 
@@ -409,6 +412,16 @@ Add sampled human detection as an independently degradable media consumer and pu
 - [x] Event ordering and overflow tests for each event class.
 - [x] Subscriber crash/unsubscribe and graceful shutdown tests.
 - [!] Accuracy evaluation on an agreed labeled dataset, separated from systems throughput benchmarks. Production model/dataset/criteria remain external product gates; deterministic systems workload evidence is recorded separately.
+  A real backend now exists: ONNX Runtime behind the `onnx-inference` feature,
+  with YOLOX as a reversible documented default (ADR 015,
+  `docs/detection-inference/`). That changes nothing here. The dataset and the
+  criteria are what this item waits on. The adapter has since been measured
+  against COCO val2017 ground truth at 73.7% recall and 89.7% precision
+  (`make container-verify-accuracy`), which is a number on a public benchmark of
+  general photographs and not a grade on this product's cameras. It is enough to
+  say the adapter detects, and enough to catch a regression; it is not what this
+  item asks for. The API reports which backend is live so no reader has to
+  assume.
 
 ### Exit gate
 

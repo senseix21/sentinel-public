@@ -35,6 +35,34 @@ jiff = { version = "=0.2.35", default-features = false, features = ["std"] }
 livekit = { version = "=0.8.3", default-features = false, features = ["tokio", "rustls-tls-native-roots"] }
 livekit-api = { version = "=0.6.3", default-features = false, features = ["access-token", "signal-client-tokio"] }
 muxide = { version = "=0.2.5", default-features = false }
+# Pinned exactly and optional. `ort` has no stable release: 2.0.0-rc.13 is the
+# newest, max_stable_version is null, and every 1.x is yanked. It also publishes
+# no prebuilt for x86_64-apple-darwin, so it is reached only through the
+# `onnx-inference` feature. See docs/adr/015-onnx-person-inference.md.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = [
+    "std",
+    "ndarray",
+    # Acquires the ONNX Runtime binary. Without it the library crate still
+    # compiles, because an rlib does not link, and every test and example binary
+    # fails with `undefined symbol: OrtGetApiBase`.
+    "download-binaries",
+    "copy-dylibs",
+    "cuda",
+    "tensorrt",
+    # Loaded at runtime rather than linked. ONNX Runtime and libwebrtc each
+    # statically vendor protobuf and Abseil, and `crates/config` depends on both
+    # `surveillance-detector` and `surveillance-livekit`, so every binary above
+    # it would link two copies: `duplicate symbol:
+    # google::protobuf::internal::WireFormatLite::SkipField` and the whole
+    # Abseil surface with it. Dynamic loading keeps ONNX Runtime's symbols in
+    # its own object. This is also what a Jetson deployment needs, where the
+    # runtime is built on-device rather than shipped.
+    "load-dynamic",
+    # rustls rather than ort's default native-tls, matching the TLS stack the
+    # rest of this workspace already resolves.
+    "tls-rustls",
+    "api-27",
+] }
 retina = { version = "=0.4.19", default-features = false }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.149"

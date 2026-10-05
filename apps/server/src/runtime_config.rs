@@ -51,6 +51,28 @@ const DETECTION_ENABLED: &str = "SURVEILLANCE_DETECTION_ENABLED";
 const DETECTION_QUEUE_ITEMS: &str = "SURVEILLANCE_DETECTION_QUEUE_ITEMS";
 const DETECTION_SAMPLE_FPS: &str = "SURVEILLANCE_DETECTION_SAMPLE_FPS";
 const DETECTION_MAX_GAP_MS: &str = "SURVEILLANCE_DETECTION_MAX_GAP_MS";
+// ONNX backend selection. `MODEL_PATH` empty or unset keeps the fixture
+// backend; a non-empty value switches to the real backend and requires
+// `MODEL_SHA256` to match the file on disk.
+const DETECTION_MODEL_PATH: &str = "SURVEILLANCE_DETECTION_MODEL_PATH";
+const DETECTION_MODEL_SHA256: &str = "SURVEILLANCE_DETECTION_MODEL_SHA256";
+// Score and NMS thresholds, percent (0..=100). Default 30% is tuned for the
+// container accuracy tests; raise toward 60-70% to drop low-confidence
+// false positives such as hanging clothes or shadows in low-light webcam
+// footage. These apply to real inference only; the fixture backend ignores
+// them.
+const DETECTION_SCORE_THRESHOLD_PERCENT: &str = "SURVEILLANCE_DETECTION_SCORE_THRESHOLD_PERCENT";
+const DETECTION_NMS_IOU_PERCENT: &str = "SURVEILLANCE_DETECTION_NMS_IOU_PERCENT";
+// Model input geometry. YOLOX-Tiny expects 416, YOLOX-S/M/L expect 640.
+// Must match the model's declared input shape; a mismatch is a hard startup
+// failure, not a quality issue.
+const DETECTION_INPUT_WIDTH: &str = "SURVEILLANCE_DETECTION_INPUT_WIDTH";
+const DETECTION_INPUT_HEIGHT: &str = "SURVEILLANCE_DETECTION_INPUT_HEIGHT";
+// Normalized rectangle "x,y,w,h" in 0..=1 whose detections are dropped
+// before they reach the tracker. Format "0.0,0.0,0.3,1.0" excludes the
+// leftmost 30% of the frame. All four values must parse, all must be in
+// 0..=1, and left+width/top+height must not exceed 1.0.
+const DETECTION_ROI_EXCLUDE: &str = "SURVEILLANCE_DETECTION_ROI_EXCLUDE";
 const CONFIG_FILE: &str = "SURVEILLANCE_CONFIG_FILE";
 const WEBCAM_DEVICE: &str = "SURVEILLANCE_WEBCAM_DEVICE";
 const WEBCAM_BACKEND: &str = "SURVEILLANCE_WEBCAM_BACKEND";
@@ -404,6 +426,49 @@ fn load_supervision_with(
     })
 }
 
+/// Parses a comma-separated `x,y,w,h` rectangle in normalized coordinates.
+/// Returns `None` for empty / missing / malformed input, or for geometry that
+/// escapes the unit square. A rectangle that is partially outside the frame
+/// would silently clip detections no reasonable person would expect to clip,
+/// so we refuse it here rather than clamp.
+fn parse_roi_exclude(
+    lookup: &impl Fn(&str) -> Option<String>,
+    key: &'static str,
+) -> Option<[f32; 4]> {
+    let raw = lookup(key).filter(|value| !value.is_empty())?;
+    let parts: Vec<f32> = raw
+        .split(',')
+        .map(|p| p.trim().parse::<f32>())
+        .collect::<Result<_, _>>()
+        .ok()?;
+    if parts.len() != 4 {
+        return None;
+    }
+    let [x, y, w, h] = [parts[0], parts[1], parts[2], parts[3]];
+    if !(0.0..=1.0).contains(&x)
+        || !(0.0..=1.0).contains(&y)
+        || !(0.0..=1.0).contains(&w)
+        || !(0.0..=1.0).contains(&h)
+        || x + w > 1.0 + f32::EPSILON
+        || y + h > 1.0 + f32::EPSILON
+        || w <= 0.0
+        || h <= 0.0
+    {
+        return None;
+    }
+    Some([x, y, w, h])
+}
+
+/// Parses an env var holding a value in `0..=100`. Empty, missing, or
+/// malformed input returns `None` so the caller preserves the existing value
+/// — a bad override is better off ignored than silently defaulted.
+fn parse_percent_u8(lookup: &impl Fn(&str) -> Option<String>, key: &'static str) -> Option<u8> {
+    lookup(key)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u8>().ok())
+        .filter(|value| *value <= 100)
+}
+
 fn positive_usize_override(
     lookup: &impl Fn(&str) -> Option<String>,
     key: &'static str,
@@ -431,6 +496,10 @@ fn load_health_bind_with(
     Ok(address)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one env-var manifest keeps the layering single-source"
+)]
 fn load_with(
     lookup: impl Fn(&str) -> Option<String>,
     resolved: &ResolvedSettings,
@@ -472,6 +541,42 @@ fn load_with(
     );
     settings.detection_decoder =
         lookup(FFMPEG).map_or_else(|| PathBuf::from("ffmpeg"), PathBuf::from);
+    // Promote the fixture backend to the real ONNX one when both env vars are
+    // set and non-empty. Either one alone keeps the fixture: a path without a
+    // SHA cannot be verified, and a SHA without a path has nothing to apply to.
+    let model_path = lookup(DETECTION_MODEL_PATH).filter(|s| !s.is_empty());
+    let model_sha256 = lookup(DETECTION_MODEL_SHA256).filter(|s| !s.is_empty());
+    if let (Some(path), Some(sha)) = (model_path, model_sha256) {
+        settings.detection_model_path = Some(PathBuf::from(path));
+        settings.detection_model_sha256 = Some(sha);
+    }
+    if let Some(percent) = parse_percent_u8(&lookup, DETECTION_SCORE_THRESHOLD_PERCENT) {
+        settings.detection_score_threshold_percent = percent;
+    }
+    if let Some(percent) = parse_percent_u8(&lookup, DETECTION_NMS_IOU_PERCENT) {
+        settings.detection_nms_iou_percent = percent;
+    }
+    if let Some(value) = lookup(DETECTION_INPUT_WIDTH).and_then(|v| v.parse::<u32>().ok()) {
+        settings.detection_input_width = value;
+    }
+    if let Some(value) = lookup(DETECTION_INPUT_HEIGHT).and_then(|v| v.parse::<u32>().ok()) {
+        settings.detection_input_height = value;
+    }
+    // The decoded-frame budget must cover one full model-input frame.
+    // Raising the input geometry past the default forces the budget up with
+    // it; otherwise YOLOX-S/M at 640x640 fails startup with
+    // `DecodedFrameBudgetTooSmall`. We raise, never lower — a user that
+    // explicitly sets a smaller input is not punished for it.
+    let needed =
+        u64::from(settings.detection_input_width) * u64::from(settings.detection_input_height) * 3;
+    if (settings.decoded_frame_max_bytes as u64) < needed {
+        if let Ok(needed_usize) = usize::try_from(needed) {
+            settings.decoded_frame_max_bytes = needed_usize;
+        }
+    }
+    if let Some(rect) = parse_roi_exclude(&lookup, DETECTION_ROI_EXCLUDE) {
+        settings.detection_roi_exclude = Some(rect);
+    }
     settings.livekit = match (
         lookup(LIVEKIT_URL),
         lookup(LIVEKIT_API_KEY),
@@ -739,6 +844,182 @@ mod tests {
         assert!(!settings.detection_enabled);
         assert_eq!(settings.detection_queue_items, 3);
         assert_eq!(settings.detection_sample_fps, 7);
+    }
+
+    #[test]
+    fn model_path_and_sha_promote_the_real_backend_when_both_are_set() {
+        let values = HashMap::from([
+            ("SURVEILLANCE_CAMERA_ID", "camera-01"),
+            ("SURVEILLANCE_RTSP_URL", "rtsp://127.0.0.1/camera"),
+            ("SURVEILLANCE_VIDEO_WIDTH", "640"),
+            ("SURVEILLANCE_VIDEO_HEIGHT", "360"),
+            (
+                "SURVEILLANCE_DETECTION_MODEL_PATH",
+                "/opt/models/yolox.onnx",
+            ),
+            (
+                "SURVEILLANCE_DETECTION_MODEL_SHA256",
+                "427cc366d34e27ff7a03e2899b5e3671425c262ea2291f88bb942bc1cc70b0f7",
+            ),
+        ]);
+        let settings = load_with(
+            |key| values.get(key).map(|value| (*value).to_owned()),
+            &compiled_defaults(),
+        )
+        .unwrap_or_else(|error| panic!("settings: {error}"));
+        assert_eq!(
+            settings.detection_model_path.as_deref(),
+            Some(std::path::Path::new("/opt/models/yolox.onnx"))
+        );
+        assert_eq!(
+            settings.detection_model_sha256.as_deref(),
+            Some("427cc366d34e27ff7a03e2899b5e3671425c262ea2291f88bb942bc1cc70b0f7"),
+        );
+    }
+
+    #[test]
+    fn model_path_without_sha_keeps_the_fixture_backend() {
+        let values = HashMap::from([
+            ("SURVEILLANCE_CAMERA_ID", "camera-01"),
+            ("SURVEILLANCE_RTSP_URL", "rtsp://127.0.0.1/camera"),
+            ("SURVEILLANCE_VIDEO_WIDTH", "640"),
+            ("SURVEILLANCE_VIDEO_HEIGHT", "360"),
+            (
+                "SURVEILLANCE_DETECTION_MODEL_PATH",
+                "/opt/models/yolox.onnx",
+            ),
+        ]);
+        let settings = load_with(
+            |key| values.get(key).map(|value| (*value).to_owned()),
+            &compiled_defaults(),
+        )
+        .unwrap_or_else(|error| panic!("settings: {error}"));
+        assert!(
+            settings.detection_model_path.is_none(),
+            "a path without a verifying sha must not take effect"
+        );
+    }
+
+    #[test]
+    fn score_threshold_env_overrides_the_default() {
+        let values = HashMap::from([
+            ("SURVEILLANCE_CAMERA_ID", "camera-01"),
+            ("SURVEILLANCE_RTSP_URL", "rtsp://127.0.0.1/camera"),
+            ("SURVEILLANCE_VIDEO_WIDTH", "640"),
+            ("SURVEILLANCE_VIDEO_HEIGHT", "360"),
+            ("SURVEILLANCE_DETECTION_SCORE_THRESHOLD_PERCENT", "65"),
+            ("SURVEILLANCE_DETECTION_NMS_IOU_PERCENT", "55"),
+        ]);
+        let settings = load_with(
+            |key| values.get(key).map(|value| (*value).to_owned()),
+            &compiled_defaults(),
+        )
+        .unwrap_or_else(|error| panic!("settings: {error}"));
+        assert_eq!(settings.detection_score_threshold_percent, 65);
+        assert_eq!(settings.detection_nms_iou_percent, 55);
+    }
+
+    #[test]
+    fn out_of_range_threshold_is_ignored_rather_than_clamped() {
+        let values = HashMap::from([
+            ("SURVEILLANCE_CAMERA_ID", "camera-01"),
+            ("SURVEILLANCE_RTSP_URL", "rtsp://127.0.0.1/camera"),
+            ("SURVEILLANCE_VIDEO_WIDTH", "640"),
+            ("SURVEILLANCE_VIDEO_HEIGHT", "360"),
+            ("SURVEILLANCE_DETECTION_SCORE_THRESHOLD_PERCENT", "150"),
+            ("SURVEILLANCE_DETECTION_NMS_IOU_PERCENT", "garbage"),
+        ]);
+        let baseline = compiled_defaults();
+        let settings = load_with(
+            |key| values.get(key).map(|value| (*value).to_owned()),
+            &baseline,
+        )
+        .unwrap_or_else(|error| panic!("settings: {error}"));
+        // Defaults preserved, not silently zeroed.
+        assert_ne!(settings.detection_score_threshold_percent, 0);
+        assert_ne!(settings.detection_nms_iou_percent, 0);
+    }
+
+    #[test]
+    fn valid_roi_exclude_env_populates_the_setting() {
+        let values = HashMap::from([
+            ("SURVEILLANCE_CAMERA_ID", "camera-01"),
+            ("SURVEILLANCE_RTSP_URL", "rtsp://127.0.0.1/camera"),
+            ("SURVEILLANCE_VIDEO_WIDTH", "640"),
+            ("SURVEILLANCE_VIDEO_HEIGHT", "360"),
+            ("SURVEILLANCE_DETECTION_ROI_EXCLUDE", "0.0,0.0,0.3,1.0"),
+        ]);
+        let settings = load_with(
+            |key| values.get(key).map(|value| (*value).to_owned()),
+            &compiled_defaults(),
+        )
+        .unwrap_or_else(|error| panic!("settings: {error}"));
+        let rect = settings
+            .detection_roi_exclude
+            .expect("roi should parse from valid env");
+        assert!((rect[0] - 0.0).abs() < 1e-6);
+        assert!((rect[2] - 0.3).abs() < 1e-6);
+        assert!((rect[3] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn roi_outside_unit_square_is_ignored_rather_than_clamped() {
+        let values = HashMap::from([
+            ("SURVEILLANCE_CAMERA_ID", "camera-01"),
+            ("SURVEILLANCE_RTSP_URL", "rtsp://127.0.0.1/camera"),
+            ("SURVEILLANCE_VIDEO_WIDTH", "640"),
+            ("SURVEILLANCE_VIDEO_HEIGHT", "360"),
+            ("SURVEILLANCE_DETECTION_ROI_EXCLUDE", "0.5,0.5,0.8,0.8"),
+        ]);
+        let settings = load_with(
+            |key| values.get(key).map(|value| (*value).to_owned()),
+            &compiled_defaults(),
+        )
+        .unwrap_or_else(|error| panic!("settings: {error}"));
+        assert!(
+            settings.detection_roi_exclude.is_none(),
+            "rect that reaches past 1.0 must be refused, not clamped"
+        );
+    }
+
+    #[test]
+    fn malformed_roi_env_is_ignored() {
+        for raw in ["", "a,b,c,d", "0.1,0.2", "0.1,0.2,0.3,0.4,0.5"] {
+            let values = HashMap::from([
+                ("SURVEILLANCE_CAMERA_ID", "camera-01"),
+                ("SURVEILLANCE_RTSP_URL", "rtsp://127.0.0.1/camera"),
+                ("SURVEILLANCE_VIDEO_WIDTH", "640"),
+                ("SURVEILLANCE_VIDEO_HEIGHT", "360"),
+                ("SURVEILLANCE_DETECTION_ROI_EXCLUDE", raw),
+            ]);
+            let settings = load_with(
+                |key| values.get(key).map(|value| (*value).to_owned()),
+                &compiled_defaults(),
+            )
+            .unwrap_or_else(|error| panic!("settings: {error}"));
+            assert!(
+                settings.detection_roi_exclude.is_none(),
+                "malformed roi \"{raw}\" must be ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_model_path_env_var_is_the_same_as_unset() {
+        let values = HashMap::from([
+            ("SURVEILLANCE_CAMERA_ID", "camera-01"),
+            ("SURVEILLANCE_RTSP_URL", "rtsp://127.0.0.1/camera"),
+            ("SURVEILLANCE_VIDEO_WIDTH", "640"),
+            ("SURVEILLANCE_VIDEO_HEIGHT", "360"),
+            ("SURVEILLANCE_DETECTION_MODEL_PATH", ""),
+            ("SURVEILLANCE_DETECTION_MODEL_SHA256", ""),
+        ]);
+        let settings = load_with(
+            |key| values.get(key).map(|value| (*value).to_owned()),
+            &compiled_defaults(),
+        )
+        .unwrap_or_else(|error| panic!("settings: {error}"));
+        assert!(settings.detection_model_path.is_none());
     }
 
     #[test]

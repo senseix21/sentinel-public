@@ -14,7 +14,7 @@ use surveillance_config::{
     value::SettingValue,
 };
 use surveillance_database::PostgresRecordingRepository;
-use surveillance_detector::inference::compiled_backend;
+use surveillance_detector::inference::InferenceDescriptor;
 use surveillance_livekit::{config::LiveKitSettings, token::DevelopmentTokenService};
 use surveillance_storage::recordings::{
     PlaybackPlan, RecordingCursor, RecordingResultLimit, RecordingSearch, RecordingTimeRange,
@@ -704,7 +704,9 @@ fn header_value(head: &str, name: &str) -> Option<String> {
 /// to the router, not from configuration intent. A surface that is configured
 /// but failed to construct reports `false`, which is the useful answer: it says
 /// what the API will actually do, not what someone meant it to do.
-#[derive(Clone, Copy, Debug, Serialize)]
+// No longer Copy: the detection claim is taken from the live backends and
+// carries their identity, which is textual.
+#[derive(Clone, Debug, Serialize)]
 // Five independent yes/no facts about one deployment, serialised by name. The
 // excessive-bools lint guards against positional confusion at call sites; there
 // is one call site and it names every field, and the JSON keys are the whole
@@ -719,6 +721,67 @@ struct SurfaceAvailability {
     settings: bool,
     identities: bool,
     access_audit: bool,
+    /// What the running detectors are, taken from the live pipelines.
+    detection: DetectionCapability,
+}
+
+/// Describes detection from the backends that are actually running.
+///
+/// Empty means no detector is running, which is still reported as a fixture.
+/// The field exists for a client to branch on, and `false` there reads as "these
+/// results are genuine"; saying that about a deployment producing no results at
+/// all is the direction that misleads. A deployment where any detector is a
+/// fixture is reported as a fixture deployment for the same reason: one stream
+/// of fabricated detections is enough, and under-claiming is the only safe way
+/// to be wrong here.
+fn detection_capability(backends: &[Option<InferenceDescriptor>]) -> DetectionCapability {
+    let live: Vec<&InferenceDescriptor> = backends.iter().flatten().collect();
+    let Some(first) = live.first() else {
+        return DetectionCapability {
+            model_name: "none".to_owned(),
+            model_version: "none".to_owned(),
+            is_production_model: false,
+            results_are_fixture: true,
+        };
+    };
+    let all_production = live.iter().all(|descriptor| descriptor.is_production());
+    // Uniform means every running detector is the same thing. Differing
+    // production status counts even when the names coincide: one camera on a
+    // real model and another on a fixture is the mixture that matters most, and
+    // naming one of them would describe a deployment that does not exist.
+    let uniform = live.iter().all(|descriptor| {
+        descriptor.model_version() == first.model_version()
+            && descriptor.is_production() == first.is_production()
+    });
+    DetectionCapability {
+        model_name: if uniform {
+            first.model_name().to_owned()
+        } else {
+            "mixed".to_owned()
+        },
+        model_version: if uniform {
+            first.model_version().to_owned()
+        } else {
+            "mixed".to_owned()
+        },
+        is_production_model: all_production,
+        results_are_fixture: !all_production,
+    }
+}
+
+fn live_detection_backend(
+    detection: &surveillance_detector::detector::DetectionHealthSnapshot,
+) -> Option<InferenceDescriptor> {
+    use surveillance_detector::detector::DetectionState;
+    match detection.state {
+        DetectionState::Starting | DetectionState::Running | DetectionState::Degraded => {
+            detection.backend.clone()
+        }
+        DetectionState::Disabled
+        | DetectionState::Terminal
+        | DetectionState::Stopping
+        | DetectionState::Stopped => None,
+    }
 }
 
 /// Describes what this deployment can and cannot do.
@@ -749,26 +812,13 @@ async fn route_system(surfaces: SurfaceAvailability, guard: &Guard<'_>) -> Strin
 }
 
 fn system_capabilities(surfaces: SurfaceAvailability, _authorized: &Authorized) -> String {
-    // Derived by asking the compiled implementation, not by naming it here. A
-    // hardcoded string would keep saying "fake" after a real model landed, or —
-    // worse — could be edited to say "production" without anything changing.
-    let detection = match compiled_backend() {
-        Ok(descriptor) => DetectionCapability {
-            model_name: descriptor.model_name().to_owned(),
-            model_version: descriptor.model_version().to_owned(),
-            is_production_model: descriptor.is_production(),
-            results_are_fixture: !descriptor.is_production(),
-        },
-        // Unknown is reported as unknown, and still as a fixture. Defaulting to
-        // "production" would be the one unrecoverable mistake this endpoint
-        // exists to prevent.
-        Err(_) => DetectionCapability {
-            model_name: "unknown".to_owned(),
-            model_version: "unknown".to_owned(),
-            is_production_model: false,
-            results_are_fixture: true,
-        },
-    };
+    // Taken from the backends the pipelines actually built, not from what this
+    // build could construct. A build can carry the ONNX backend and still run
+    // with no weights, so only the live object knows whether these results mean
+    // anything, and a hardcoded string would keep saying "fake" after a real
+    // model landed — or be edited to say "production" with nothing else
+    // changing.
+    let detection = surfaces.detection.clone();
     json_response(
         "200 OK",
         &SystemCapabilities {
@@ -790,7 +840,7 @@ struct SystemCapabilities {
     surfaces: SurfaceAvailability,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct DetectionCapability {
     model_name: String,
     model_version: String,
@@ -938,6 +988,11 @@ const UI_ASSETS: &[UiAsset] = &[
         "/ui/js/livekit.js",
         JAVASCRIPT,
         include_str!("../ui/js/livekit.js"),
+    ),
+    ui_asset(
+        "/ui/js/detection-overlay.js",
+        JAVASCRIPT,
+        include_str!("../ui/js/detection-overlay.js"),
     ),
     ui_asset(
         "/ui/js/playback.js",
@@ -2089,12 +2144,22 @@ async fn route_with_recordings(
             Err(response) => response,
         },
         ("GET", "/api/system") => {
+            let backends: Vec<Option<InferenceDescriptor>> = registry
+                .snapshots()
+                .into_iter()
+                .map(|camera| {
+                    camera
+                        .health
+                        .and_then(|health| live_detection_backend(&health.detection))
+                })
+                .collect();
             let surfaces = SurfaceAvailability {
                 recording_index: recordings.is_some(),
                 viewer_tokens: viewer_tokens.is_some(),
                 settings: settings.is_some(),
                 identities: identities.is_some(),
                 access_audit: access_audit.is_some(),
+                detection: detection_capability(&backends),
             };
             route_system(surfaces, &guard).await
         }
@@ -3365,7 +3430,7 @@ fn render_metrics(
         queue_metrics(&mut output, camera, "recorder", snapshot.recorder_queue);
         queue_metrics(&mut output, camera, "live", snapshot.live_queue);
         queue_metrics(&mut output, camera, "detection", snapshot.detection_queue);
-        let detection = snapshot.detection;
+        let detection = &snapshot.detection;
         metric(
             &mut output,
             "surveillance_detector_enabled",
@@ -3389,6 +3454,7 @@ fn render_metrics(
                 surveillance_detector::detector::DetectionState::Stopped => 6,
             },
         );
+        detection_gate_metrics(&mut output, camera, detection.counters);
         for (name, value) in [
             (
                 "surveillance_detector_encoded_considered_total",
@@ -3639,6 +3705,25 @@ const fn publication_state_value(state: surveillance_livekit::domain::Publicatio
 
 fn metric(output: &mut String, name: &str, camera: &str, value: impl std::fmt::Display) {
     let _ = writeln!(output, "{name}{{camera_id=\"{camera}\"}} {value}");
+}
+
+fn detection_gate_metrics(
+    output: &mut String,
+    camera: &str,
+    counters: surveillance_detector::detector::DetectionCounters,
+) {
+    metric(
+        output,
+        "surveillance_detector_gate_skipped_total",
+        camera,
+        counters.gate_skipped,
+    );
+    metric(
+        output,
+        "surveillance_detector_gate_heartbeat_total",
+        camera,
+        counters.gate_heartbeat,
+    );
 }
 
 fn queue_metrics(
@@ -4735,27 +4820,120 @@ mod tests {
     /// and — worse — could be edited to say `production` without a single line
     /// of inference changing. Asking the implementation is the only version of
     /// this that stays true by construction.
+    /// DI.R7: the reported claim is derived from the live backends.
+    ///
+    /// This replaces `the_compiled_backend_matches_what_the_pipeline_builds`,
+    /// which asserted that the endpoint described the one implementation the
+    /// build contained. That invariant does not survive a real backend: a build
+    /// can carry ONNX support and run with no weights, so what the build
+    /// contains stopped being evidence of what is running. Each assertion below
+    /// carries one of the claims that test used to make, restated against the
+    /// live object.
     #[test]
-    fn the_compiled_backend_matches_what_the_pipeline_builds() {
+    fn detection_is_reported_from_the_running_backends() {
+        use super::detection_capability;
         use surveillance_detector::inference::{
-            compiled_backend, DeterministicFakeInference, InferenceDescriptor, PersonInference as _,
+            DeterministicFakeInference, InferenceDescriptor, PersonInference,
         };
 
-        let built = DeterministicFakeInference::new().expect("the fixture backend builds");
-        let reported = compiled_backend().expect("the compiled backend is describable");
-        assert_eq!(
-            reported,
-            InferenceDescriptor::of(&built),
-            "the reported backend is not the one the pipeline builds"
+        /// A backend that claims production, so the aggregate can be exercised
+        /// without a model file. Nothing in the tree reports production unless
+        /// it is actually running inference.
+        struct ProductionLike(DeterministicFakeInference);
+        impl PersonInference for ProductionLike {
+            fn model_name(&self) -> &surveillance_events::event::ModelName {
+                self.0.model_name()
+            }
+            fn model_version(&self) -> &surveillance_events::event::ModelVersion {
+                self.0.model_version()
+            }
+            fn infer(
+                &mut self,
+                frame: &surveillance_media::frame::DecodedFrame,
+            ) -> Result<
+                surveillance_events::event::DetectionSet,
+                surveillance_detector::inference::InferenceError,
+            > {
+                self.0.infer(frame)
+            }
+            fn is_production_model(&self) -> bool {
+                true
+            }
+        }
+
+        let fixture = InferenceDescriptor::of(
+            &DeterministicFakeInference::new().expect("the fixture backend builds"),
         );
+        let production = InferenceDescriptor::of(&ProductionLike(
+            DeterministicFakeInference::new().expect("the fixture backend builds"),
+        ));
+
+        // No detector running still reports a fixture. A client branches on
+        // this field, and `false` would tell it the results are genuine — about
+        // a deployment producing none at all.
+        let none = detection_capability(&[]);
+        assert!(!none.is_production_model);
+        assert!(none.results_are_fixture);
+
+        // A fixture backend reports itself, which is what the old test pinned.
+        let fixtures = detection_capability(&[Some(fixture.clone()), Some(fixture.clone())]);
+        assert!(!fixtures.is_production_model);
+        assert!(fixtures.results_are_fixture);
+
+        // A camera with detection disabled does not drag a production
+        // deployment down, and does not lift a fixture one up.
+        let production_only = detection_capability(&[Some(production.clone()), None]);
+        assert!(production_only.is_production_model);
+        assert!(!production_only.results_are_fixture);
+
+        // Mixed deployments under-claim. One stream of fabricated detections is
+        // enough to mislead whoever reads the results.
+        let mixed = detection_capability(&[Some(production), Some(fixture)]);
         assert!(
-            !built.is_production_model(),
-            "the fixture claims to be a production model"
+            !mixed.is_production_model,
+            "a deployment with any fixture backend must not report production"
         );
+        assert!(mixed.results_are_fixture);
+        assert_eq!(mixed.model_name, "mixed");
+    }
+
+    #[test]
+    fn terminal_detector_is_excluded_from_live_backend_status() {
+        use super::live_detection_backend;
+        use surveillance_detector::{
+            detector::{DetectionHealth, DetectionState},
+            inference::{DeterministicFakeInference, InferenceDescriptor},
+        };
+
+        let descriptor = InferenceDescriptor::of(
+            &DeterministicFakeInference::new().expect("the fixture backend builds"),
+        );
+        let mut terminal = DetectionHealth::disabled_snapshot();
+        terminal.state = DetectionState::Terminal;
+        terminal.backend = Some(descriptor.clone());
+
+        assert!(live_detection_backend(&terminal).is_none());
+
+        terminal.state = DetectionState::Running;
+        assert_eq!(live_detection_backend(&terminal), Some(descriptor));
+    }
+
+    #[test]
+    fn detector_gate_counters_are_exported_with_bounded_camera_labels() {
+        let counters = surveillance_detector::detector::DetectionCounters {
+            gate_skipped: 7,
+            gate_heartbeat: 2,
+            ..Default::default()
+        };
+        let mut output = String::new();
+
+        super::detection_gate_metrics(&mut output, "camera-01", counters);
+
         assert!(
-            !reported.is_production(),
-            "the capabilities endpoint would report a fixture as production"
+            output.contains("surveillance_detector_gate_skipped_total{camera_id=\"camera-01\"} 7")
         );
+        assert!(output
+            .contains("surveillance_detector_gate_heartbeat_total{camera_id=\"camera-01\"} 2"));
     }
 
     /// The capabilities endpoint is authenticated like every other read.

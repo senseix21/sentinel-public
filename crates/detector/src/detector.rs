@@ -1,7 +1,8 @@
 //! Owned detection composition and decoder boundary.
 
 use crate::{
-    inference::PersonInference,
+    gate::{GateDecision, GatePolicy, MotionGate},
+    inference::{InferenceDescriptor, PersonInference},
     sampler::{SampleDecision, SamplerCounters, TimestampSampler},
 };
 use std::{
@@ -43,6 +44,7 @@ pub trait H264Decoder: Send + 'static {
 mod tests {
     use super::{DetectionOwner, DetectionStopReason, FixtureH264Decoder};
     use crate::{
+        gate::GatePolicy,
         inference::DeterministicFakeInference,
         sampler::{SampleRateHz, TimestampSampler},
     };
@@ -85,6 +87,50 @@ mod tests {
         panic!("keyframe was not completed")
     }
 
+    #[test]
+    fn roi_filter_drops_detections_whose_centre_falls_inside_the_rect() {
+        use surveillance_events::event::{
+            Confidence, DetectionSet, NormalizedBoundingBox, PersonDetection,
+        };
+        let inside = PersonDetection {
+            confidence: Confidence::new(0.9).unwrap(),
+            bounding_box: NormalizedBoundingBox::new(0.05, 0.05, 0.1, 0.1).unwrap(),
+            track_id: None,
+        };
+        let outside = PersonDetection {
+            confidence: Confidence::new(0.9).unwrap(),
+            bounding_box: NormalizedBoundingBox::new(0.6, 0.6, 0.2, 0.2).unwrap(),
+            track_id: None,
+        };
+        let set = DetectionSet::new(vec![inside, outside]).unwrap();
+        let filtered = super::filter_detections_outside(&set, [0.0, 0.0, 0.3, 1.0]);
+        assert_eq!(
+            filtered.as_slice().len(),
+            1,
+            "the inside box must be dropped"
+        );
+        let kept = &filtered.as_slice()[0];
+        assert!((kept.bounding_box.left() - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn roi_filter_keeps_detections_touching_but_centred_outside() {
+        use surveillance_events::event::{
+            Confidence, DetectionSet, NormalizedBoundingBox, PersonDetection,
+        };
+        // Box at (0.2, 0.0) 0.2 wide: centre at 0.3 — on the right edge of the
+        // 0.0..0.3 exclude region, outside by `>` definition.
+        let edge = PersonDetection {
+            confidence: Confidence::new(0.9).unwrap(),
+            bounding_box: NormalizedBoundingBox::new(0.25, 0.0, 0.2, 0.5).unwrap(),
+            track_id: None,
+        };
+        let set = DetectionSet::new(vec![edge]).unwrap();
+        let filtered = super::filter_detections_outside(&set, [0.0, 0.0, 0.3, 1.0]);
+        // Centre 0.35 is strictly outside, keep.
+        assert_eq!(filtered.as_slice().len(), 1);
+    }
+
     #[tokio::test]
     async fn produces_typed_event_and_joins_on_input_close() {
         let (distributor, subscriptions) =
@@ -110,7 +156,12 @@ mod tests {
             sampler,
             FixtureH264Decoder::new(limits, 2, 2),
             DeterministicFakeInference::new().unwrap_or_else(|error| panic!("inference: {error}")),
+            // A gate that admits everything, so these tests keep measuring the
+            // behaviour they were written for rather than the gate's.
+            GatePolicy::new(0, Duration::from_secs(0), Duration::from_secs(0))
+                .unwrap_or_else(|error| panic!("gate: {error}")),
             bus,
+            None,
         );
         let _ = distributor.publish(keyframe(90_000, 1));
         drop(distributor);
@@ -160,7 +211,12 @@ mod tests {
                 2,
             ),
             DeterministicFakeInference::new().unwrap_or_else(|error| panic!("inference: {error}")),
+            // A gate that admits everything, so these tests keep measuring the
+            // behaviour they were written for rather than the gate's.
+            GatePolicy::new(0, Duration::from_secs(0), Duration::from_secs(0))
+                .unwrap_or_else(|error| panic!("gate: {error}")),
             EventBus::new(),
+            None,
         );
         let exit = tokio::time::timeout(Duration::from_secs(1), owner.stop_and_join())
             .await
@@ -197,7 +253,12 @@ mod tests {
             .unwrap_or_else(|error| panic!("sampler: {error}")),
             TerminalDecoder,
             DeterministicFakeInference::new().unwrap_or_else(|error| panic!("inference: {error}")),
+            // A gate that admits everything, so these tests keep measuring the
+            // behaviour they were written for rather than the gate's.
+            GatePolicy::new(0, Duration::from_secs(0), Duration::from_secs(0))
+                .unwrap_or_else(|error| panic!("gate: {error}")),
             bus,
+            None,
         );
         let _ = distributor.publish(keyframe(90_000, 1));
         let exit = tokio::time::timeout(Duration::from_secs(1), owner.join())
@@ -272,7 +333,10 @@ mod tests {
                 version: surveillance_events::event::ModelVersion::new("1.0")
                     .unwrap_or_else(|error| panic!("version: {error}")),
             },
+            GatePolicy::new(0, Duration::from_secs(0), Duration::from_secs(0))
+                .unwrap_or_else(|error| panic!("gate: {error}")),
             EventBus::new(),
+            None,
         );
         let _ = distributor.publish(keyframe(90_000, 1));
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -375,6 +439,20 @@ impl H264Decoder for FixtureH264Decoder {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DetectionCounters {
+    /// Sampled frames the gate declined to run inference on.
+    pub gate_skipped: u64,
+    /// Time spent turning frames into tensors, separate from inference.
+    ///
+    /// Kept apart because they move independently: preprocessing scales with
+    /// frame size and inference with model size, and one number hides which of
+    /// the two a change actually affected.
+    pub preprocess_duration_micros: u64,
+    /// Time spent turning output tensors back into detections.
+    pub output_decode_duration_micros: u64,
+    /// Frames admitted because the heartbeat elapsed rather than because
+    /// anything moved. A number that approaches the admitted total means the
+    /// motion threshold is set too high to be doing any work.
+    pub gate_heartbeat: u64,
     pub decode_attempts: u64,
     pub decoded: u64,
     pub decode_failed: u64,
@@ -421,12 +499,20 @@ pub enum DetectionState {
     Stopped,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// Not Copy: the snapshot now carries the live backend's identity, which is
+// textual. Callers clone it, which they already did through Copy.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DetectionHealthSnapshot {
     pub state: DetectionState,
     pub counters: DetectionCounters,
     pub sampler: SamplerCounters,
     pub input: QueueMetrics,
+    /// What this detector is actually running, taken from the object it was
+    /// handed rather than from anything the build knows about itself.
+    ///
+    /// `None` means no detector is running for this camera, which is not the
+    /// same as running a fixture and must not be reported as though it were.
+    pub backend: Option<InferenceDescriptor>,
 }
 
 #[derive(Clone)]
@@ -436,7 +522,12 @@ impl DetectionHealth {
     pub const fn disabled_snapshot() -> DetectionHealthSnapshot {
         DetectionHealthSnapshot {
             state: DetectionState::Disabled,
+            backend: None,
             counters: DetectionCounters {
+                gate_skipped: 0,
+                preprocess_duration_micros: 0,
+                output_decode_duration_micros: 0,
+                gate_heartbeat: 0,
                 decode_attempts: 0,
                 decoded: 0,
                 decode_failed: 0,
@@ -484,10 +575,10 @@ impl DetectionHealth {
     }
     #[must_use]
     pub fn snapshot(&self) -> DetectionHealthSnapshot {
-        *self
-            .0
+        self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
     fn update(
         &self,
@@ -496,15 +587,19 @@ impl DetectionHealth {
         sampler: SamplerCounters,
         input: QueueMetrics,
     ) {
-        *self
+        // The backend is established once, when the owner is handed its
+        // inference, and does not change for the life of this detector. Each
+        // update preserves it rather than restating it, so there is no path by
+        // which a counter refresh could quietly change what this camera claims
+        // to be running.
+        let mut held = self
             .0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = DetectionHealthSnapshot {
-            state,
-            counters,
-            sampler,
-            input,
-        };
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.state = state;
+        held.counters = counters;
+        held.sampler = sampler;
+        held.input = input;
     }
 }
 
@@ -513,20 +608,40 @@ pub struct DetectionOwner {
     task: JoinHandle<DetectionExit>,
 }
 impl DetectionOwner {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "assembling the detection pipeline is a flat parameter list by design"
+    )]
     pub fn start<D: H264Decoder, I: PersonInference>(
         camera_id: CameraId,
         input: MediaSubscriber<H264AccessUnit>,
         sampler: TimestampSampler,
         decoder: D,
         inference: I,
+        gate_policy: GatePolicy,
         event_bus: EventBus,
+        roi_exclude: Option<[f32; 4]>,
     ) -> Self {
-        Self::start_observed(camera_id, input, sampler, decoder, inference, event_bus).0
+        Self::start_observed(
+            camera_id,
+            input,
+            sampler,
+            decoder,
+            inference,
+            gate_policy,
+            event_bus,
+            roi_exclude,
+        )
+        .0
     }
 
     #[allow(
         clippy::too_many_lines,
         reason = "linear ownership loop keeps cancellation, decode, inference, and publication auditable"
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "assembling the detection pipeline is a flat parameter list by design"
     )]
     pub fn start_observed<D: H264Decoder, I: PersonInference>(
         camera_id: CameraId,
@@ -534,14 +649,22 @@ impl DetectionOwner {
         mut sampler: TimestampSampler,
         mut decoder: D,
         mut inference: I,
+        gate_policy: GatePolicy,
         event_bus: EventBus,
+        roi_exclude: Option<[f32; 4]>,
     ) -> (Self, DetectionHealth) {
+        let mut gate = MotionGate::new(gate_policy);
         let (shutdown, mut stop) = watch::channel(false);
+        // Described here, from the object this owner was handed. Asking the
+        // live backend is the only form of this claim that cannot drift from
+        // what is running.
+        let backend = Some(InferenceDescriptor::of(&inference));
         let health = DetectionHealth(Arc::new(Mutex::new(DetectionHealthSnapshot {
             state: DetectionState::Starting,
             counters: DetectionCounters::default(),
             sampler: sampler.counters(),
             input: input.metrics(),
+            backend,
         })));
         let task_health = health.clone();
         let task = tokio::spawn(async move {
@@ -556,6 +679,11 @@ impl DetectionOwner {
                 state_sequence,
             );
             let mut last_media: Option<(u64, surveillance_media::packet::MediaTimestamp)> = None;
+            // One tracker instance per detection session. Ids reset when the
+            // owner restarts (camera reconnect, inference failure); that is
+            // acceptable because the visual session resets too.
+            let mut tracker =
+                crate::tracker::PersonTracker::new(crate::tracker::TrackerConfig::default());
             task_health.update(
                 DetectionState::Running,
                 counters,
@@ -647,12 +775,39 @@ impl DetectionOwner {
                     }
                 };
                 match sampler.consider(frame.connection_epoch(), frame.media_timestamp()) {
-                    Ok(SampleDecision::Sample | SampleDecision::ResetAndSample) => {}
+                    Ok(SampleDecision::Sample) => {}
+                    Ok(SampleDecision::ResetAndSample) => gate.reset_timing(),
                     Ok(SampleDecision::SkipRate | SampleDecision::Duplicate) => continue,
                     Err(_) => {
                         decoder.reset();
                         continue;
                     }
+                }
+                // The gate decides after sampling and before inference. It
+                // saves inference only: the decoder above already ran, because
+                // H.264 inter-frames cannot be decoded in isolation.
+                // The camera's own position, from media ticks rather than wall
+                // time, so the gate's windows do not move when the clock does.
+                let stamp = frame.media_timestamp();
+                let position = Duration::from_micros(
+                    u64::try_from(stamp.ticks().max(0))
+                        .unwrap_or(0)
+                        .saturating_mul(1_000_000)
+                        / u64::from(stamp.timebase_hz().max(1)),
+                );
+                match gate.admit(&frame, position) {
+                    GateDecision::Skip => {
+                        counters.gate_skipped += 1;
+                        task_health.update(
+                            DetectionState::Running,
+                            counters,
+                            sampler.counters(),
+                            input.metrics(),
+                        );
+                        continue;
+                    }
+                    GateDecision::Heartbeat => counters.gate_heartbeat += 1,
+                    GateDecision::Motion | GateDecision::Cooldown => {}
                 }
                 counters.inference_attempts += 1;
                 let inference_started = Instant::now();
@@ -676,6 +831,12 @@ impl DetectionOwner {
                     Ok(detections) => {
                         counters.inferred += 1;
                         failure_streak = 0;
+                        if !detections.as_slice().is_empty() {
+                            // Starts the cooldown, so a person who stops moving
+                            // keeps being examined instead of disappearing the
+                            // moment the scene goes still.
+                            gate.observed_detections(position);
+                        }
                         detections
                     }
                     Err(error)
@@ -711,6 +872,17 @@ impl DetectionOwner {
                         continue;
                     }
                 };
+                // Drop detections whose box centre falls inside the ROI
+                // exclude rectangle, before they reach the tracker. Done
+                // here (not post-tracker) so the tracker never allocates an
+                // ID for a known-bad region in the first place.
+                let detections = match roi_exclude {
+                    Some(rect) => filter_detections_outside(&detections, rect),
+                    None => detections,
+                };
+                // Assign stable cross-frame ids. The tracker returns a
+                // `DetectionSet` where every entry has `track_id: Some(_)`.
+                let detections = tracker.update_detections(&detections);
                 counters.detections_produced = counters
                     .detections_produced
                     .saturating_add(u64::try_from(detections.as_slice().len()).unwrap_or(u64::MAX));
@@ -750,6 +922,7 @@ impl DetectionOwner {
                         },
                         model: inference.model_name().clone(),
                         model_version: inference.model_version().clone(),
+                        results_are_fixture: !inference.is_production_model(),
                         detections,
                     },
                 ) else {
@@ -827,6 +1000,33 @@ impl DetectionOwner {
     pub async fn join(self) -> Result<DetectionExit, tokio::task::JoinError> {
         self.task.await
     }
+}
+
+/// Drops every detection whose box centre falls inside `rect`.
+/// `rect` is `[x, y, w, h]` normalized to the camera frame.
+///
+/// The box centre is the right discriminator for an exclusion zone: a box
+/// that *touches* the rectangle but has its centre outside it is a detection
+/// that mostly reaches into real coverage, and dropping it would blind the
+/// system to a person leaning past the mask. The centre is also what the
+/// tracker uses to match frames.
+fn filter_detections_outside(
+    detections: &surveillance_events::event::DetectionSet,
+    rect: [f32; 4],
+) -> surveillance_events::event::DetectionSet {
+    let [rx, ry, rw, rh] = rect;
+    let kept: Vec<_> = detections
+        .as_slice()
+        .iter()
+        .filter(|det| {
+            let cx = det.bounding_box.left() + det.bounding_box.width() * 0.5;
+            let cy = det.bounding_box.top() + det.bounding_box.height() * 0.5;
+            !(cx >= rx && cx <= rx + rw && cy >= ry && cy <= ry + rh)
+        })
+        .cloned()
+        .collect();
+    surveillance_events::event::DetectionSet::new(kept)
+        .unwrap_or_else(|_| unreachable!("filtering only removes; it cannot grow"))
 }
 
 fn duration_micros(duration: Duration) -> u64 {

@@ -16,13 +16,19 @@ make check    # the full gate: fmt --check, clippy -D warnings, test, release bu
 make help     # manual development targets and their overridable variables
 ```
 
+The ONNX inference backend is optional, behind the `onnx-inference` feature,
+because `ort` has no prebuilt for `x86_64-apple-darwin`. `make verify` covers
+default features and runs anywhere; `make verify-onnx` covers the backend and
+needs a platform `ort` supports. `make container-verify-onnx` provides one.
+See `docs/adr/015-onnx-person-inference.md`.
+
 `make check` is the completion gate. Run it before claiming a phase or slice is
 done. Individual steps:
 
 ```bash
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 cargo build --workspace --release
 ```
 
@@ -58,9 +64,24 @@ claim. `ROADMAP.md` is the authority on per-phase status.
 | `docs/phase-N/` | Per-phase contracts and evidence. |
 | `context/YYYY-MM-DD[-HHMM]/` | Dated session snapshots; `context/README.md` points at the latest. |
 
-Detection currently runs `DeterministicFakeInference` — the only implementation
-of the `PersonInference` trait. There is no production model. Do not describe
-detection as a working capability; it is a wired seam with a fixture behind it.
+Detection has two backends. A default build runs `DeterministicFakeInference`
+and the API reports `results_are_fixture: true`; a build with the
+`onnx-inference` feature and a configured `camera.detection.model_path` runs a
+real ONNX model and reports production. Which one is running is taken from the
+live backend, never from what the build contains.
+
+The ONNX adapter has been run against a real artifact: one frame
+(`make container-verify-model`) and a 60-frame set with COCO ground truth
+(`make container-verify-accuracy`), at 73.7% recall and 89.7% precision —
+roughly one person in four not reported, and 36.9% recall on small subjects.
+Specification sections 3.3 and 3.4.
+
+**Detection accuracy is still unevaluated.** Phase 6's remaining item needs a
+labeled dataset and agreed criteria representing this product's cameras, and
+neither exists. COCO photographs are not surveillance footage and nobody has
+agreed that one predicts the other, so the numbers above are a regression guard
+and not a grade. A working backend is not a working capability: do not describe
+detection as accurate, and do not quote a camera count from it.
 
 ## Working conventions
 

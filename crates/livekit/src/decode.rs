@@ -128,8 +128,19 @@ pub trait DecodedFrameSink: Send + 'static {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DecodeError {
-    /// No decoder binary. Not retryable: it will still be absent next time.
+    /// No usable decoder binary. Not retryable: it will still be absent, or
+    /// still be unreadable, next time.
     Unavailable,
+    /// The decoder could not be started for a reason that may not recur.
+    ///
+    /// Separate from [`Self::Unavailable`] because the two call for opposite
+    /// responses and the operating system distinguishes them even though a
+    /// failed `exec` looks the same from here. `ETXTBSY` while a deployment
+    /// rewrites the binary, `EAGAIN` against a process limit, `ENOMEM` under
+    /// pressure: each resolves on its own, and each was previously reported as
+    /// a permanently missing binary, which stopped publication for that camera
+    /// until something else restarted it.
+    StartFailed,
     /// The frame geometry cannot be represented.
     Geometry,
     /// The decoder died, or its pipes did.
@@ -144,6 +155,7 @@ impl fmt::Display for DecodeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Unavailable => "no H.264 decoder binary is available",
+            Self::StartFailed => "the decode process could not be started",
             Self::Geometry => "frame geometry cannot be represented in I420",
             Self::Failed => "the decode process failed",
             Self::Overloaded => "the decode process did not accept input in time",
@@ -176,6 +188,25 @@ pub struct H264ToI420 {
     /// Distinguishes a decoder that has not started reading yet from one that
     /// has stopped keeping up. See [`Self::SPAWN_WRITE_TIMEOUT`].
     accepted_a_write: bool,
+}
+
+/// Separates a start failure that will recur from one that may not.
+///
+/// Only two conditions are treated as permanent, and both describe the artifact
+/// rather than the moment: the file is not there, or this process may not run
+/// it. Everything else — including every error this code has not anticipated —
+/// is transient, because the two mistakes are not equal. Retrying a permanent
+/// fault costs a backed-off reconnect loop and a log line. Giving up on a
+/// transient one costs a camera its live view, silently, until somebody
+/// notices, and the deployment that replaced the decoder binary a second
+/// earlier has already finished.
+fn classify_spawn_failure(error: &std::io::Error) -> DecodeError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+            DecodeError::Unavailable
+        }
+        _ => DecodeError::StartFailed,
+    }
 }
 
 impl H264ToI420 {
@@ -216,8 +247,10 @@ impl H264ToI420 {
     ///
     /// # Errors
     ///
-    /// Returns [`DecodeError::Unavailable`] when `program` cannot be executed,
-    /// and [`DecodeError::Failed`] when its pipes cannot be taken.
+    /// Returns [`DecodeError::Unavailable`] when `program` is absent or not
+    /// executable, [`DecodeError::StartFailed`] when it exists and the start
+    /// failed anyway, and [`DecodeError::Failed`] when its pipes cannot be
+    /// taken.
     pub fn spawn(
         program: &str,
         size: FrameSize,
@@ -279,7 +312,18 @@ impl H264ToI420 {
             // cost a debugging session on 2026-08-16.
             .kill_on_drop(true)
             .spawn()
-            .map_err(|_| DecodeError::Unavailable)?;
+            .map_err(|error| {
+                // The reason is logged because the classification deliberately
+                // discards it, and an operator looking at a camera that will
+                // not publish needs the errno rather than a category.
+                tracing::warn!(
+                    decoder = program,
+                    kind = ?error.kind(),
+                    errno = ?error.raw_os_error(),
+                    "live decoder could not be started"
+                );
+                classify_spawn_failure(&error)
+            })?;
 
         let stdin = child.stdin.take().ok_or(DecodeError::Failed)?;
         let mut stdout = child.stdout.take().ok_or(DecodeError::Failed)?;
@@ -468,11 +512,29 @@ mod tests {
             "a cold decoder must be given more time than a warm one"
         );
 
-        // `yes` never reads its stdin and ignores the arguments it is handed, so
-        // the pipe fills and stays full. That is precisely a decoder that has
-        // not reached its input loop.
+        // A stand-in for a decoder that has not reached its input loop: it
+        // ignores the arguments it is handed, never reads its stdin, and —
+        // crucially — never writes its stdout.
+        //
+        // `yes` was the obvious choice and is the wrong one. It writes, so it
+        // races our stdin write: whichever happens first, the child filling a
+        // stdout pipe and taking SIGPIPE, or our 4 MiB write blocking. That
+        // race resolves differently per platform. On macOS the write blocks and
+        // the budget is measured; on Linux the child dies first and `feed`
+        // returns `Failed` after ~37 ms, so the test asserted the opposite of
+        // what it meant. A child that writes nothing cannot die that way.
+        //
+        // It is committed rather than written here, which is the second race
+        // this test lost. Creating an executable and immediately running it is
+        // safe only in a single-threaded process: any sibling thread spawning a
+        // child forks a copy of the write descriptor that `fs::write` has not
+        // closed yet, and the kernel refuses to exec a file held open for
+        // writing. It failed as ETXTBSY about once in 120 runs under spawn
+        // pressure, and reported it as a missing decoder binary.
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/stalled-decoder.sh");
+
         let mut decoder = H264ToI420::spawn(
-            "yes",
+            fixture,
             FrameSize::new(320, 240).unwrap_or_else(|error| panic!("{error}")),
             CollectingSink(Arc::new(Mutex::new(Vec::new()))),
             Arc::new(DecodeCounters::default()),
@@ -496,6 +558,88 @@ mod tests {
              budget rather than the startup budget"
         );
         decoder.shutdown().await;
+    }
+
+    #[test]
+    fn a_start_failure_is_permanent_only_when_the_binary_itself_is() {
+        for (raw, kind, expected) in [
+            // ENOENT: the binary is not there and will not be next time.
+            (2, "ENOENT", DecodeError::Unavailable),
+            // EACCES: present and not runnable by this process, which a retry
+            // does not change either.
+            (13, "EACCES", DecodeError::Unavailable),
+            // ETXTBSY: observed in this repository when a process held the file
+            // open for writing. Transient by construction — the writer closes.
+            (26, "ETXTBSY", DecodeError::StartFailed),
+            // EAGAIN against a process or thread limit, and ENOMEM under
+            // pressure. Both pass.
+            (11, "EAGAIN", DecodeError::StartFailed),
+            (12, "ENOMEM", DecodeError::StartFailed),
+            // Anything unanticipated is transient, which is the safer of the
+            // two mistakes: a retry loop is noisy, a camera that silently
+            // stopped publishing is not noticed.
+            (5, "EIO", DecodeError::StartFailed),
+        ] {
+            assert_eq!(
+                classify_spawn_failure(&std::io::Error::from_raw_os_error(raw)),
+                expected,
+                "{kind} must classify as {expected}"
+            );
+        }
+    }
+
+    /// The condition the unit table above only describes, produced for real.
+    ///
+    /// Holding the descriptor here is what makes this deterministic rather than
+    /// a race: Linux refuses to exec a file open for writing, and this process
+    /// is the writer, so there is no window in which it might succeed.
+    ///
+    /// Linux only, and not from caution: macOS does not refuse this exec at all
+    /// — measured here, the spawn succeeds — so there is no `ETXTBSY` to
+    /// classify. The deployment target is Linux, which is where the condition
+    /// exists and where this guarantee is worth pinning.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_binary_being_written_is_a_transient_start_failure_not_a_missing_one() {
+        let fixture = std::env::temp_dir().join(format!("busy-decoder-{}", std::process::id()));
+        std::fs::write(&fixture, "#!/bin/sh\nexec sleep 300\n")
+            .unwrap_or_else(|error| panic!("write the fixture: {error}"));
+        std::fs::set_permissions(
+            &fixture,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap_or_else(|error| panic!("mark the fixture runnable: {error}"));
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture)
+            .unwrap_or_else(|error| panic!("hold the fixture open for writing: {error}"));
+
+        let error = H264ToI420::spawn(
+            &fixture.to_string_lossy(),
+            FrameSize::new(320, 240).unwrap_or_else(|error| panic!("{error}")),
+            CollectingSink::default(),
+            Arc::new(DecodeCounters::default()),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("a binary held open for writing cannot be executed"));
+
+        assert_eq!(
+            error,
+            DecodeError::StartFailed,
+            "a decoder being rewritten is coming back; reporting it as absent \
+             stops the publication for good"
+        );
+        drop(held);
+        let _ = std::fs::remove_file(&fixture);
+    }
+
+    #[test]
+    fn only_an_unavailable_decoder_stops_a_publication_for_good() {
+        // The classification is only worth making if it survives the mapping
+        // into the adapter's contract, which is where retryability is decided.
+        use crate::adapter::{AdapterError, AdapterErrorKind};
+        assert!(!AdapterError::new(AdapterErrorKind::Unavailable).retryable());
+        assert!(AdapterError::new(AdapterErrorKind::Transport).retryable());
     }
 
     #[tokio::test]

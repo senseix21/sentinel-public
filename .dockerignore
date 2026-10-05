@@ -1,0 +1,8 @@
+# Build context only; this does not affect the bind mount used by the
+# container-* make targets, where CARGO_TARGET_DIR keeps the two builds apart.
+target/
+.local/
+recordings/
+.git/
+.playwright-mcp/
+node_modules/
