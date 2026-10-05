@@ -459,11 +459,15 @@ settings! {
     CameraDetectionInterOpThreads =>
         "camera.detection.inter_op_threads", Operational, PipelineRestart, Public, PerCamera,
         Unsigned, [];
+    // Immediate: `DecodeThresholds` is reconstructed from configuration on
+    // every inference call rather than captured once at pipeline start, so a
+    // change here is visible on the next frame. See the comment at the top of
+    // `crates/detector/src/model_output.rs::DecodeThresholds`.
     CameraDetectionScoreThresholdPercent =>
-        "camera.detection.score_threshold_percent", Operational, PipelineRestart, Public, PerCamera,
+        "camera.detection.score_threshold_percent", Operational, Immediate, Public, PerCamera,
         Unsigned, [];
     CameraDetectionNmsIouPercent =>
-        "camera.detection.nms_iou_percent", Operational, PipelineRestart, Public, PerCamera, Unsigned,
+        "camera.detection.nms_iou_percent", Operational, Immediate, Public, PerCamera, Unsigned,
         [];
     CameraDetectionMotionThresholdPercent =>
         "camera.detection.motion_threshold_percent", Operational, PipelineRestart, Public, PerCamera,
@@ -600,10 +604,25 @@ mod tests {
     }
 
     #[test]
-    fn captured_detection_thresholds_and_gate_settings_require_pipeline_restart() {
+    fn score_and_nms_thresholds_take_effect_immediately() {
+        // Rebuilt per-inference from configuration via `DecodeThresholds`, so
+        // reporting Immediate here matches the live code path.
         for id in [
             SettingId::CameraDetectionScoreThresholdPercent,
             SettingId::CameraDetectionNmsIouPercent,
+        ] {
+            assert_eq!(id.boundary(), ApplicationBoundary::Immediate, "{id}");
+        }
+    }
+
+    #[test]
+    fn captured_gate_settings_require_pipeline_restart() {
+        // `GatePolicy` is constructed once at pipeline start and holds these
+        // values as fields. Reclassifying to Immediate without a MotionGate
+        // refactor would make the config system LIE to the operator —
+        // "applied immediately" would be reported for a knob that only takes
+        // effect on restart.
+        for id in [
             SettingId::CameraDetectionMotionThresholdPercent,
             SettingId::CameraDetectionGateCooldown,
             SettingId::CameraDetectionGateHeartbeat,
