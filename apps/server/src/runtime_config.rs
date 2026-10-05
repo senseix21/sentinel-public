@@ -63,6 +63,11 @@ const DETECTION_MODEL_SHA256: &str = "SURVEILLANCE_DETECTION_MODEL_SHA256";
 // them.
 const DETECTION_SCORE_THRESHOLD_PERCENT: &str = "SURVEILLANCE_DETECTION_SCORE_THRESHOLD_PERCENT";
 const DETECTION_NMS_IOU_PERCENT: &str = "SURVEILLANCE_DETECTION_NMS_IOU_PERCENT";
+// Model input geometry. YOLOX-Tiny expects 416, YOLOX-S/M/L expect 640.
+// Must match the model's declared input shape; a mismatch is a hard startup
+// failure, not a quality issue.
+const DETECTION_INPUT_WIDTH: &str = "SURVEILLANCE_DETECTION_INPUT_WIDTH";
+const DETECTION_INPUT_HEIGHT: &str = "SURVEILLANCE_DETECTION_INPUT_HEIGHT";
 const CONFIG_FILE: &str = "SURVEILLANCE_CONFIG_FILE";
 const WEBCAM_DEVICE: &str = "SURVEILLANCE_WEBCAM_DEVICE";
 const WEBCAM_BACKEND: &str = "SURVEILLANCE_WEBCAM_BACKEND";
@@ -512,6 +517,24 @@ fn load_with(
     }
     if let Some(percent) = parse_percent_u8(&lookup, DETECTION_NMS_IOU_PERCENT) {
         settings.detection_nms_iou_percent = percent;
+    }
+    if let Some(value) = lookup(DETECTION_INPUT_WIDTH).and_then(|v| v.parse::<u32>().ok()) {
+        settings.detection_input_width = value;
+    }
+    if let Some(value) = lookup(DETECTION_INPUT_HEIGHT).and_then(|v| v.parse::<u32>().ok()) {
+        settings.detection_input_height = value;
+    }
+    // The decoded-frame budget must cover one full model-input frame.
+    // Raising the input geometry past the default forces the budget up with
+    // it; otherwise YOLOX-S/M at 640x640 fails startup with
+    // `DecodedFrameBudgetTooSmall`. We raise, never lower — a user that
+    // explicitly sets a smaller input is not punished for it.
+    let needed =
+        u64::from(settings.detection_input_width) * u64::from(settings.detection_input_height) * 3;
+    if (settings.decoded_frame_max_bytes as u64) < needed {
+        if let Ok(needed_usize) = usize::try_from(needed) {
+            settings.decoded_frame_max_bytes = needed_usize;
+        }
     }
     settings.livekit = match (
         lookup(LIVEKIT_URL),
