@@ -87,6 +87,50 @@ mod tests {
         panic!("keyframe was not completed")
     }
 
+    #[test]
+    fn roi_filter_drops_detections_whose_centre_falls_inside_the_rect() {
+        use surveillance_events::event::{
+            Confidence, DetectionSet, NormalizedBoundingBox, PersonDetection,
+        };
+        let inside = PersonDetection {
+            confidence: Confidence::new(0.9).unwrap(),
+            bounding_box: NormalizedBoundingBox::new(0.05, 0.05, 0.1, 0.1).unwrap(),
+            track_id: None,
+        };
+        let outside = PersonDetection {
+            confidence: Confidence::new(0.9).unwrap(),
+            bounding_box: NormalizedBoundingBox::new(0.6, 0.6, 0.2, 0.2).unwrap(),
+            track_id: None,
+        };
+        let set = DetectionSet::new(vec![inside, outside]).unwrap();
+        let filtered = super::filter_detections_outside(&set, [0.0, 0.0, 0.3, 1.0]);
+        assert_eq!(
+            filtered.as_slice().len(),
+            1,
+            "the inside box must be dropped"
+        );
+        let kept = &filtered.as_slice()[0];
+        assert!((kept.bounding_box.left() - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn roi_filter_keeps_detections_touching_but_centred_outside() {
+        use surveillance_events::event::{
+            Confidence, DetectionSet, NormalizedBoundingBox, PersonDetection,
+        };
+        // Box at (0.2, 0.0) 0.2 wide: centre at 0.3 — on the right edge of the
+        // 0.0..0.3 exclude region, outside by `>` definition.
+        let edge = PersonDetection {
+            confidence: Confidence::new(0.9).unwrap(),
+            bounding_box: NormalizedBoundingBox::new(0.25, 0.0, 0.2, 0.5).unwrap(),
+            track_id: None,
+        };
+        let set = DetectionSet::new(vec![edge]).unwrap();
+        let filtered = super::filter_detections_outside(&set, [0.0, 0.0, 0.3, 1.0]);
+        // Centre 0.35 is strictly outside, keep.
+        assert_eq!(filtered.as_slice().len(), 1);
+    }
+
     #[tokio::test]
     async fn produces_typed_event_and_joins_on_input_close() {
         let (distributor, subscriptions) =
@@ -117,6 +161,7 @@ mod tests {
             GatePolicy::new(0, Duration::from_secs(0), Duration::from_secs(0))
                 .unwrap_or_else(|error| panic!("gate: {error}")),
             bus,
+            None,
         );
         let _ = distributor.publish(keyframe(90_000, 1));
         drop(distributor);
@@ -171,6 +216,7 @@ mod tests {
             GatePolicy::new(0, Duration::from_secs(0), Duration::from_secs(0))
                 .unwrap_or_else(|error| panic!("gate: {error}")),
             EventBus::new(),
+            None,
         );
         let exit = tokio::time::timeout(Duration::from_secs(1), owner.stop_and_join())
             .await
@@ -212,6 +258,7 @@ mod tests {
             GatePolicy::new(0, Duration::from_secs(0), Duration::from_secs(0))
                 .unwrap_or_else(|error| panic!("gate: {error}")),
             bus,
+            None,
         );
         let _ = distributor.publish(keyframe(90_000, 1));
         let exit = tokio::time::timeout(Duration::from_secs(1), owner.join())
@@ -289,6 +336,7 @@ mod tests {
             GatePolicy::new(0, Duration::from_secs(0), Duration::from_secs(0))
                 .unwrap_or_else(|error| panic!("gate: {error}")),
             EventBus::new(),
+            None,
         );
         let _ = distributor.publish(keyframe(90_000, 1));
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -560,6 +608,10 @@ pub struct DetectionOwner {
     task: JoinHandle<DetectionExit>,
 }
 impl DetectionOwner {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "assembling the detection pipeline is a flat parameter list by design"
+    )]
     pub fn start<D: H264Decoder, I: PersonInference>(
         camera_id: CameraId,
         input: MediaSubscriber<H264AccessUnit>,
@@ -568,6 +620,7 @@ impl DetectionOwner {
         inference: I,
         gate_policy: GatePolicy,
         event_bus: EventBus,
+        roi_exclude: Option<[f32; 4]>,
     ) -> Self {
         Self::start_observed(
             camera_id,
@@ -577,6 +630,7 @@ impl DetectionOwner {
             inference,
             gate_policy,
             event_bus,
+            roi_exclude,
         )
         .0
     }
@@ -584,6 +638,10 @@ impl DetectionOwner {
     #[allow(
         clippy::too_many_lines,
         reason = "linear ownership loop keeps cancellation, decode, inference, and publication auditable"
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "assembling the detection pipeline is a flat parameter list by design"
     )]
     pub fn start_observed<D: H264Decoder, I: PersonInference>(
         camera_id: CameraId,
@@ -593,6 +651,7 @@ impl DetectionOwner {
         mut inference: I,
         gate_policy: GatePolicy,
         event_bus: EventBus,
+        roi_exclude: Option<[f32; 4]>,
     ) -> (Self, DetectionHealth) {
         let mut gate = MotionGate::new(gate_policy);
         let (shutdown, mut stop) = watch::channel(false);
@@ -813,6 +872,14 @@ impl DetectionOwner {
                         continue;
                     }
                 };
+                // Drop detections whose box centre falls inside the ROI
+                // exclude rectangle, before they reach the tracker. Done
+                // here (not post-tracker) so the tracker never allocates an
+                // ID for a known-bad region in the first place.
+                let detections = match roi_exclude {
+                    Some(rect) => filter_detections_outside(&detections, rect),
+                    None => detections,
+                };
                 // Assign stable cross-frame ids. The tracker returns a
                 // `DetectionSet` where every entry has `track_id: Some(_)`.
                 let detections = tracker.update_detections(&detections);
@@ -933,6 +1000,33 @@ impl DetectionOwner {
     pub async fn join(self) -> Result<DetectionExit, tokio::task::JoinError> {
         self.task.await
     }
+}
+
+/// Drops every detection whose box centre falls inside `rect`.
+/// `rect` is `[x, y, w, h]` normalized to the camera frame.
+///
+/// The box centre is the right discriminator for an exclusion zone: a box
+/// that *touches* the rectangle but has its centre outside it is a detection
+/// that mostly reaches into real coverage, and dropping it would blind the
+/// system to a person leaning past the mask. The centre is also what the
+/// tracker uses to match frames.
+fn filter_detections_outside(
+    detections: &surveillance_events::event::DetectionSet,
+    rect: [f32; 4],
+) -> surveillance_events::event::DetectionSet {
+    let [rx, ry, rw, rh] = rect;
+    let kept: Vec<_> = detections
+        .as_slice()
+        .iter()
+        .filter(|det| {
+            let cx = det.bounding_box.left() + det.bounding_box.width() * 0.5;
+            let cy = det.bounding_box.top() + det.bounding_box.height() * 0.5;
+            !(cx >= rx && cx <= rx + rw && cy >= ry && cy <= ry + rh)
+        })
+        .cloned()
+        .collect();
+    surveillance_events::event::DetectionSet::new(kept)
+        .unwrap_or_else(|_| unreachable!("filtering only removes; it cannot grow"))
 }
 
 fn duration_micros(duration: Duration) -> u64 {

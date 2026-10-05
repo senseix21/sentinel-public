@@ -178,6 +178,7 @@ impl CameraPipeline {
                 inference,
                 gate_policy,
                 event_bus,
+                config.detection_roi_exclude,
             );
             (Some(owner), health)
         } else {

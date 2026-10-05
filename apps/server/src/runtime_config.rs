@@ -68,6 +68,11 @@ const DETECTION_NMS_IOU_PERCENT: &str = "SURVEILLANCE_DETECTION_NMS_IOU_PERCENT"
 // failure, not a quality issue.
 const DETECTION_INPUT_WIDTH: &str = "SURVEILLANCE_DETECTION_INPUT_WIDTH";
 const DETECTION_INPUT_HEIGHT: &str = "SURVEILLANCE_DETECTION_INPUT_HEIGHT";
+// Normalized rectangle "x,y,w,h" in 0..=1 whose detections are dropped
+// before they reach the tracker. Format "0.0,0.0,0.3,1.0" excludes the
+// leftmost 30% of the frame. All four values must parse, all must be in
+// 0..=1, and left+width/top+height must not exceed 1.0.
+const DETECTION_ROI_EXCLUDE: &str = "SURVEILLANCE_DETECTION_ROI_EXCLUDE";
 const CONFIG_FILE: &str = "SURVEILLANCE_CONFIG_FILE";
 const WEBCAM_DEVICE: &str = "SURVEILLANCE_WEBCAM_DEVICE";
 const WEBCAM_BACKEND: &str = "SURVEILLANCE_WEBCAM_BACKEND";
@@ -421,6 +426,39 @@ fn load_supervision_with(
     })
 }
 
+/// Parses a comma-separated `x,y,w,h` rectangle in normalized coordinates.
+/// Returns `None` for empty / missing / malformed input, or for geometry that
+/// escapes the unit square. A rectangle that is partially outside the frame
+/// would silently clip detections no reasonable person would expect to clip,
+/// so we refuse it here rather than clamp.
+fn parse_roi_exclude(
+    lookup: &impl Fn(&str) -> Option<String>,
+    key: &'static str,
+) -> Option<[f32; 4]> {
+    let raw = lookup(key).filter(|value| !value.is_empty())?;
+    let parts: Vec<f32> = raw
+        .split(',')
+        .map(|p| p.trim().parse::<f32>())
+        .collect::<Result<_, _>>()
+        .ok()?;
+    if parts.len() != 4 {
+        return None;
+    }
+    let [x, y, w, h] = [parts[0], parts[1], parts[2], parts[3]];
+    if !(0.0..=1.0).contains(&x)
+        || !(0.0..=1.0).contains(&y)
+        || !(0.0..=1.0).contains(&w)
+        || !(0.0..=1.0).contains(&h)
+        || x + w > 1.0 + f32::EPSILON
+        || y + h > 1.0 + f32::EPSILON
+        || w <= 0.0
+        || h <= 0.0
+    {
+        return None;
+    }
+    Some([x, y, w, h])
+}
+
 /// Parses an env var holding a value in `0..=100`. Empty, missing, or
 /// malformed input returns `None` so the caller preserves the existing value
 /// — a bad override is better off ignored than silently defaulted.
@@ -535,6 +573,9 @@ fn load_with(
         if let Ok(needed_usize) = usize::try_from(needed) {
             settings.decoded_frame_max_bytes = needed_usize;
         }
+    }
+    if let Some(rect) = parse_roi_exclude(&lookup, DETECTION_ROI_EXCLUDE) {
+        settings.detection_roi_exclude = Some(rect);
     }
     settings.livekit = match (
         lookup(LIVEKIT_URL),
@@ -897,6 +938,70 @@ mod tests {
         // Defaults preserved, not silently zeroed.
         assert_ne!(settings.detection_score_threshold_percent, 0);
         assert_ne!(settings.detection_nms_iou_percent, 0);
+    }
+
+    #[test]
+    fn valid_roi_exclude_env_populates_the_setting() {
+        let values = HashMap::from([
+            ("SURVEILLANCE_CAMERA_ID", "camera-01"),
+            ("SURVEILLANCE_RTSP_URL", "rtsp://127.0.0.1/camera"),
+            ("SURVEILLANCE_VIDEO_WIDTH", "640"),
+            ("SURVEILLANCE_VIDEO_HEIGHT", "360"),
+            ("SURVEILLANCE_DETECTION_ROI_EXCLUDE", "0.0,0.0,0.3,1.0"),
+        ]);
+        let settings = load_with(
+            |key| values.get(key).map(|value| (*value).to_owned()),
+            &compiled_defaults(),
+        )
+        .unwrap_or_else(|error| panic!("settings: {error}"));
+        let rect = settings
+            .detection_roi_exclude
+            .expect("roi should parse from valid env");
+        assert!((rect[0] - 0.0).abs() < 1e-6);
+        assert!((rect[2] - 0.3).abs() < 1e-6);
+        assert!((rect[3] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn roi_outside_unit_square_is_ignored_rather_than_clamped() {
+        let values = HashMap::from([
+            ("SURVEILLANCE_CAMERA_ID", "camera-01"),
+            ("SURVEILLANCE_RTSP_URL", "rtsp://127.0.0.1/camera"),
+            ("SURVEILLANCE_VIDEO_WIDTH", "640"),
+            ("SURVEILLANCE_VIDEO_HEIGHT", "360"),
+            ("SURVEILLANCE_DETECTION_ROI_EXCLUDE", "0.5,0.5,0.8,0.8"),
+        ]);
+        let settings = load_with(
+            |key| values.get(key).map(|value| (*value).to_owned()),
+            &compiled_defaults(),
+        )
+        .unwrap_or_else(|error| panic!("settings: {error}"));
+        assert!(
+            settings.detection_roi_exclude.is_none(),
+            "rect that reaches past 1.0 must be refused, not clamped"
+        );
+    }
+
+    #[test]
+    fn malformed_roi_env_is_ignored() {
+        for raw in ["", "a,b,c,d", "0.1,0.2", "0.1,0.2,0.3,0.4,0.5"] {
+            let values = HashMap::from([
+                ("SURVEILLANCE_CAMERA_ID", "camera-01"),
+                ("SURVEILLANCE_RTSP_URL", "rtsp://127.0.0.1/camera"),
+                ("SURVEILLANCE_VIDEO_WIDTH", "640"),
+                ("SURVEILLANCE_VIDEO_HEIGHT", "360"),
+                ("SURVEILLANCE_DETECTION_ROI_EXCLUDE", raw),
+            ]);
+            let settings = load_with(
+                |key| values.get(key).map(|value| (*value).to_owned()),
+                &compiled_defaults(),
+            )
+            .unwrap_or_else(|error| panic!("settings: {error}"));
+            assert!(
+                settings.detection_roi_exclude.is_none(),
+                "malformed roi \"{raw}\" must be ignored"
+            );
+        }
     }
 
     #[test]

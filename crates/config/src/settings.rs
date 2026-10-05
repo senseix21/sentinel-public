@@ -72,6 +72,11 @@ pub struct OneCameraSettings {
     /// `None` is software decode. Set it to an `FFmpeg` accelerator name on a
     /// target where one exists.
     pub detection_hwaccel: Option<String>,
+    /// Normalized rectangle `[x, y, w, h]` in `0.0..=1.0`. Any detection whose
+    /// box centre falls inside this rectangle is dropped before it reaches the
+    /// tracker. Used to mask fixed false-positive sources (hanging clothes,
+    /// mirrors, decorative statues). `None` means no exclusion.
+    pub detection_roi_exclude: Option<[f32; 4]>,
     pub width: u32,
     pub height: u32,
     pub segment_duration: Duration,
@@ -133,6 +138,7 @@ impl OneCameraSettings {
             detection_gate_cooldown: Duration::from_secs(5),
             detection_gate_heartbeat: Duration::from_secs(10),
             detection_hwaccel: None,
+            detection_roi_exclude: None,
             width,
             height,
             segment_duration: Duration::from_secs(30),
@@ -166,6 +172,9 @@ pub struct OneCameraConfig {
     pub detection_decoder: PathBuf,
     pub detection_decode_timeout: Duration,
     pub detection_hwaccel: Option<String>,
+    /// Normalized rectangle whose detections are dropped before tracking.
+    /// See [`OneCameraSettings::detection_roi_exclude`].
+    pub detection_roi_exclude: Option<[f32; 4]>,
     pub detection_motion_threshold_percent: u8,
     pub detection_gate_cooldown: Duration,
     pub detection_gate_heartbeat: Duration,
@@ -373,6 +382,7 @@ impl OneCameraConfig {
             },
             detection_decoder: settings.detection_decoder,
             detection_hwaccel: settings.detection_hwaccel,
+            detection_roi_exclude: settings.detection_roi_exclude,
             detection_motion_threshold_percent: settings.detection_motion_threshold_percent,
             detection_gate_cooldown: settings.detection_gate_cooldown,
             detection_gate_heartbeat: settings.detection_gate_heartbeat,
@@ -471,6 +481,7 @@ mod tests {
             detection_gate_cooldown: Duration::from_secs(5),
             detection_gate_heartbeat: Duration::from_secs(10),
             detection_hwaccel: None,
+            detection_roi_exclude: None,
             width: 2560,
             height: 1440,
             segment_duration: Duration::from_secs(30),
