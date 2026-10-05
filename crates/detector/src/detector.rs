@@ -716,7 +716,8 @@ impl DetectionOwner {
                     }
                 };
                 match sampler.consider(frame.connection_epoch(), frame.media_timestamp()) {
-                    Ok(SampleDecision::Sample | SampleDecision::ResetAndSample) => {}
+                    Ok(SampleDecision::Sample) => {}
+                    Ok(SampleDecision::ResetAndSample) => gate.reset_timing(),
                     Ok(SampleDecision::SkipRate | SampleDecision::Duplicate) => continue,
                     Err(_) => {
                         decoder.reset();

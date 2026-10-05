@@ -117,7 +117,7 @@ impl OneCameraSettings {
             detection_queue_items: 2,
             detection_sample_fps: 5,
             detection_max_gap: Duration::from_secs(2),
-            decoded_frame_max_bytes: width as usize * height as usize * 3,
+            decoded_frame_max_bytes: 416 * 416 * 3,
             detection_decoder: PathBuf::from("ffmpeg"),
             detection_decode_timeout: Duration::from_secs(2),
             detection_model_path: None,
@@ -266,12 +266,12 @@ impl OneCameraConfig {
         if settings.detection_decode_timeout.is_zero() {
             return Err(OneCameraConfigError::ZeroDetectionDecodeTimeout);
         }
-        let required_decoded_bytes = usize::try_from(settings.width)
+        let model_frame_bytes = usize::try_from(settings.detection_input_width)
             .ok()
-            .and_then(|width| width.checked_mul(settings.height as usize))
+            .and_then(|width| width.checked_mul(settings.detection_input_height as usize))
             .and_then(|pixels| pixels.checked_mul(3))
             .ok_or(OneCameraConfigError::MemoryBoundOverflow)?;
-        if settings.decoded_frame_max_bytes < required_decoded_bytes {
+        if settings.decoded_frame_max_bytes < model_frame_bytes {
             return Err(OneCameraConfigError::DecodedFrameBudgetTooSmall);
         }
         let duration = SegmentDuration::new(settings.segment_duration)
@@ -495,6 +495,36 @@ mod tests {
         assert_eq!(config.bounded_memory_bytes, 118_587_392);
         assert_eq!(config.recorder_queue.get(), 32);
         assert_eq!(config.live_queue.get(), 4);
+    }
+
+    #[test]
+    fn decoded_frame_budget_covers_model_geometry_smaller_than_source() {
+        let mut too_small = valid();
+        too_small.width = 320;
+        too_small.height = 240;
+        too_small.decoded_frame_max_bytes = 320 * 240 * 3;
+        assert!(matches!(
+            OneCameraConfig::validate(too_small),
+            Err(OneCameraConfigError::DecodedFrameBudgetTooSmall)
+        ));
+
+        let mut settings = valid();
+        settings.decoded_frame_max_bytes = 416 * 416 * 3;
+        let config = OneCameraConfig::validate(settings)
+            .unwrap_or_else(|error| panic!("model-sized budget is valid: {error}"));
+        assert_eq!(config.decoded_frame_max_bytes, 416 * 416 * 3);
+
+        let defaults = OneCameraSettings::h264_mvp(
+            "camera-02".to_owned(),
+            "rtsp://127.0.0.1:8554/camera-02".to_owned(),
+            None,
+            320,
+            240,
+            PathBuf::from("recordings"),
+        );
+        assert_eq!(defaults.decoded_frame_max_bytes, 416 * 416 * 3);
+        OneCameraConfig::validate(defaults)
+            .unwrap_or_else(|error| panic!("model-sized defaults are valid: {error}"));
     }
 
     #[test]

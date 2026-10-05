@@ -473,15 +473,17 @@ Every setting declares when it takes effect.
 | `input_width`, `input_height` | after restart |
 | `execution_providers` | after restart |
 | `intra_op_threads`, `inter_op_threads` | after restart |
-| `score_threshold` | immediately, read per inference |
-| `nms_iou` | immediately, read per inference |
-| `motion_threshold` | immediately |
-| `gate_cooldown` | immediately |
-| `gate_heartbeat` | immediately |
+| `score_threshold` | pipeline restart |
+| `nms_iou` | pipeline restart |
+| `motion_threshold` | pipeline restart |
+| `gate_cooldown` | pipeline restart |
+| `gate_heartbeat` | pipeline restart |
 
 Restart-scoped settings are validated at startup and rejected as a group. A
 change to one of them through the settings API is accepted into persistence and
-reported as pending restart; it must not partially apply.
+reported as pending restart; it must not partially apply. Thresholds and gate
+timings are captured when the detector starts, so reporting them as immediate
+would claim an update that running cameras do not apply.
 
 ### DI.C13 — No claim beyond the evidence
 
@@ -492,11 +494,11 @@ capacity gate are unchanged by this work.
 
 ## 8. Observability
 
-Added counters, all fixed-cardinality, none labelled by camera, recording,
-model path or threshold value:
+Gate counters have fixed names and bounded per-camera `camera_id` labels, with
+no labels exposing model paths or threshold values:
 
-- `detection_inference_gate_skipped_total`
-- `detection_inference_heartbeat_total`
+- `surveillance_detector_gate_skipped_total`
+- `surveillance_detector_gate_heartbeat_total`
 - `detection_inference_preprocess_micros`
 - `detection_inference_decode_micros`
 - existing `inference_attempts`, `inferred`, `inference_failed` and

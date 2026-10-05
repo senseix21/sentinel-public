@@ -6,7 +6,10 @@
 //! nothing outside this module knows the difference. See
 //! `docs/adr/015-onnx-person-inference.md`.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use sha2::{Digest, Sha256};
 use surveillance_events::event::{DetectionSet, ModelName, ModelVersion};
@@ -67,12 +70,13 @@ impl core::error::Error for OnnxBackendError {}
 /// A model file that has been read and identified.
 ///
 /// The hash is computed over the bytes actually loaded, not over whatever is at
-/// the path later, and it becomes the model version reported to operators. That
-/// is what makes field version skew detectable.
+/// the path later, and it becomes the model version reported to operators. Its
+/// bytes are retained only through session construction, then released.
 #[derive(Clone, Debug)]
 pub struct ModelArtifact {
     path: PathBuf,
     sha256: String,
+    bytes: Option<Arc<[u8]>>,
 }
 
 impl ModelArtifact {
@@ -101,6 +105,7 @@ impl ModelArtifact {
         Ok(Self {
             path: path.to_path_buf(),
             sha256,
+            bytes: Some(bytes.into()),
         })
     }
 
@@ -112,6 +117,10 @@ impl ModelArtifact {
     #[must_use]
     pub fn sha256(&self) -> &str {
         &self.sha256
+    }
+
+    fn discard_verified_bytes(&mut self) {
+        self.bytes = None;
     }
 }
 
@@ -145,14 +154,15 @@ impl OnnxPersonInference {
             .model_path
             .as_ref()
             .ok_or_else(|| OnnxBackendError::UnusableArtifact(PathBuf::new()))?;
-        let artifact = ModelArtifact::load(path, config.model_sha256.as_deref())?;
+        let mut artifact = ModelArtifact::load(path, config.model_sha256.as_deref())?;
         let thresholds = DecodeThresholds::from_percentages(
             config.score_threshold_percent,
             config.nms_iou_percent,
         )
         .map_err(|_| OnnxBackendError::Identity)?;
 
-        let session = build_session(config).map_err(OnnxBackendError::Session)?;
+        let session = build_session(config, &artifact).map_err(OnnxBackendError::Session)?;
+        artifact.discard_verified_bytes();
         let input_name = session
             .inputs()
             .first()
@@ -258,9 +268,9 @@ impl OnnxPersonInference {
                 }
             }
         }
-        let tensor = ort::value::Tensor::from_array((
+        let tensor = ort::value::TensorRef::from_array_view((
             [1_usize, CHANNELS, height, width],
-            self.scratch.clone(),
+            self.scratch.as_slice(),
         ))
         .map_err(|_| InferenceError::new(InferenceFailureKind::ResourceExhausted))?;
         // The outputs own the buffer that `try_extract_tensor` borrows, so they
@@ -295,7 +305,10 @@ fn model_name_from(artifact: &ModelArtifact) -> String {
         .to_owned()
 }
 
-fn build_session(config: &InferenceBackendConfig) -> Result<ort::session::Session, String> {
+fn build_session(
+    config: &InferenceBackendConfig,
+    artifact: &ModelArtifact,
+) -> Result<ort::session::Session, String> {
     let mut builder = ort::session::Session::builder().map_err(|error| error.to_string())?;
     builder = builder
         .with_intra_threads(usize::from(config.intra_op_threads))
@@ -303,13 +316,38 @@ fn build_session(config: &InferenceBackendConfig) -> Result<ort::session::Sessio
     builder = builder
         .with_inter_threads(usize::from(config.inter_op_threads))
         .map_err(|error| error.to_string())?;
-    let path = config
-        .model_path
-        .as_ref()
-        .ok_or_else(|| "no model path configured".to_owned())?;
+    let providers = execution_providers(&config.execution_providers)?;
+    builder = builder
+        .with_execution_providers(providers)
+        .map_err(|error| error.to_string())?;
+    let bytes = artifact
+        .bytes
+        .as_deref()
+        .ok_or_else(|| "verified model bytes were released before session creation".to_owned())?;
     builder
-        .commit_from_file(path)
+        .commit_from_memory(bytes)
         .map_err(|error| error.to_string())
+}
+
+fn execution_providers(
+    configured: &[String],
+) -> Result<Vec<ort::ep::ExecutionProviderDispatch>, String> {
+    let mut providers = Vec::with_capacity(configured.len());
+    for name in configured {
+        let provider = match name.as_str() {
+            "cpu" => ort::ep::CPU::default().build(),
+            "cuda" => ort::ep::CUDA::default().build(),
+            "tensorrt" => ort::ep::TensorRT::default().build(),
+            unsupported => {
+                return Err(format!("unsupported execution provider {unsupported:?}"));
+            }
+        };
+        providers.push(provider.error_on_failure());
+    }
+    if providers.is_empty() {
+        return Err("at least one execution provider must be configured".to_owned());
+    }
+    Ok(providers)
 }
 
 impl PersonInference for OnnxPersonInference {
@@ -342,7 +380,11 @@ impl PersonInference for OnnxPersonInference {
 
 #[cfg(test)]
 mod tests {
-    use super::{InferenceBackendConfig, ModelArtifact, OnnxBackendError, OnnxPersonInference};
+    use super::{
+        execution_providers, InferenceBackendConfig, ModelArtifact, OnnxBackendError,
+        OnnxPersonInference,
+    };
+    use sha2::{Digest, Sha256};
     use std::path::PathBuf;
 
     fn scratch(name: &str) -> PathBuf {
@@ -398,6 +440,37 @@ mod tests {
             ModelArtifact::load(&path, None).unwrap_or_else(|error| panic!("load: {error}"));
         assert_ne!(artifact.sha256(), changed.sha256());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn verified_artifact_bytes_are_retained_after_the_path_is_replaced() {
+        let path = scratch("replaced.onnx");
+        let verified_bytes = b"verified model bytes";
+        std::fs::write(&path, verified_bytes).unwrap_or_else(|error| panic!("write: {error}"));
+        let pin = format!("{:x}", Sha256::digest(verified_bytes));
+        let artifact =
+            ModelArtifact::load(&path, Some(&pin)).unwrap_or_else(|error| panic!("load: {error}"));
+        let verified_hash = artifact.sha256().to_owned();
+
+        std::fs::write(&path, b"replacement model bytes")
+            .unwrap_or_else(|error| panic!("replace: {error}"));
+
+        assert_eq!(artifact.bytes.as_deref(), Some(verified_bytes.as_slice()));
+        assert_eq!(artifact.sha256(), verified_hash);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn configured_execution_providers_are_ordered_and_unknown_names_refuse() {
+        let configured = vec!["cuda".to_owned(), "cpu".to_owned()];
+        let providers = execution_providers(&configured)
+            .unwrap_or_else(|error| panic!("known providers: {error}"));
+        assert_eq!(providers.len(), 2);
+        assert!(providers[0].downcast_ref::<ort::ep::CUDA>().is_some());
+        assert!(providers[1].downcast_ref::<ort::ep::CPU>().is_some());
+
+        assert!(execution_providers(&["invalid".to_owned()]).is_err());
+        assert!(execution_providers(&[]).is_err());
     }
 
     /// DI.R4: a pin that does not match refuses, naming both sides.

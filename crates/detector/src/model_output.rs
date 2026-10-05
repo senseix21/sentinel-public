@@ -427,6 +427,28 @@ mod tests {
     }
 
     #[test]
+    fn padding_candidates_do_not_consume_the_detection_limit() {
+        let letterbox = Letterbox::new(1280, 720, 416, 416, LetterboxAlignment::Centred)
+            .unwrap_or_else(|error| panic!("valid letterbox: {error}"));
+        let rows = YoloxDecoder::grid(letterbox).len();
+        let mut values = vec![0.0; rows * COLUMNS];
+        for row in 0..MAX_DETECTIONS_PER_EVENT {
+            // These boxes are entirely in the top letterbox padding.
+            put(&mut values, row, [0.0, 0.0, 0.0, 0.0], 0.99, 0.99);
+        }
+        // A lower-scoring valid candidate follows all the padding-only boxes.
+        put(&mut values, 20 * 52, [0.0, 0.0, 0.0, 0.0], 0.8, 0.8);
+        let permissive =
+            DecodeThresholds::new(0.3, 1.0).unwrap_or_else(|error| panic!("valid bounds: {error}"));
+
+        let set = decoder()
+            .decode(&values, &[1, rows, COLUMNS], letterbox, permissive)
+            .unwrap_or_else(|error| panic!("decode: {error}"));
+
+        assert_eq!(set.as_slice().len(), 1);
+    }
+
+    #[test]
     fn an_unexpected_shape_is_classified_not_panicked() {
         let values = blank(SMALL_ROWS);
         for shape in [
