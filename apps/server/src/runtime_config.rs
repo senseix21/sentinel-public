@@ -51,6 +51,11 @@ const DETECTION_ENABLED: &str = "SURVEILLANCE_DETECTION_ENABLED";
 const DETECTION_QUEUE_ITEMS: &str = "SURVEILLANCE_DETECTION_QUEUE_ITEMS";
 const DETECTION_SAMPLE_FPS: &str = "SURVEILLANCE_DETECTION_SAMPLE_FPS";
 const DETECTION_MAX_GAP_MS: &str = "SURVEILLANCE_DETECTION_MAX_GAP_MS";
+// ONNX backend selection. `MODEL_PATH` empty or unset keeps the fixture
+// backend; a non-empty value switches to the real backend and requires
+// `MODEL_SHA256` to match the file on disk.
+const DETECTION_MODEL_PATH: &str = "SURVEILLANCE_DETECTION_MODEL_PATH";
+const DETECTION_MODEL_SHA256: &str = "SURVEILLANCE_DETECTION_MODEL_SHA256";
 const CONFIG_FILE: &str = "SURVEILLANCE_CONFIG_FILE";
 const WEBCAM_DEVICE: &str = "SURVEILLANCE_WEBCAM_DEVICE";
 const WEBCAM_BACKEND: &str = "SURVEILLANCE_WEBCAM_BACKEND";
@@ -472,6 +477,15 @@ fn load_with(
     );
     settings.detection_decoder =
         lookup(FFMPEG).map_or_else(|| PathBuf::from("ffmpeg"), PathBuf::from);
+    // Promote the fixture backend to the real ONNX one when both env vars are
+    // set and non-empty. Either one alone keeps the fixture: a path without a
+    // SHA cannot be verified, and a SHA without a path has nothing to apply to.
+    let model_path = lookup(DETECTION_MODEL_PATH).filter(|s| !s.is_empty());
+    let model_sha256 = lookup(DETECTION_MODEL_SHA256).filter(|s| !s.is_empty());
+    if let (Some(path), Some(sha)) = (model_path, model_sha256) {
+        settings.detection_model_path = Some(PathBuf::from(path));
+        settings.detection_model_sha256 = Some(sha);
+    }
     settings.livekit = match (
         lookup(LIVEKIT_URL),
         lookup(LIVEKIT_API_KEY),
@@ -739,6 +753,78 @@ mod tests {
         assert!(!settings.detection_enabled);
         assert_eq!(settings.detection_queue_items, 3);
         assert_eq!(settings.detection_sample_fps, 7);
+    }
+
+    #[test]
+    fn model_path_and_sha_promote_the_real_backend_when_both_are_set() {
+        let values = HashMap::from([
+            ("SURVEILLANCE_CAMERA_ID", "camera-01"),
+            ("SURVEILLANCE_RTSP_URL", "rtsp://127.0.0.1/camera"),
+            ("SURVEILLANCE_VIDEO_WIDTH", "640"),
+            ("SURVEILLANCE_VIDEO_HEIGHT", "360"),
+            (
+                "SURVEILLANCE_DETECTION_MODEL_PATH",
+                "/opt/models/yolox.onnx",
+            ),
+            (
+                "SURVEILLANCE_DETECTION_MODEL_SHA256",
+                "427cc366d34e27ff7a03e2899b5e3671425c262ea2291f88bb942bc1cc70b0f7",
+            ),
+        ]);
+        let settings = load_with(
+            |key| values.get(key).map(|value| (*value).to_owned()),
+            &compiled_defaults(),
+        )
+        .unwrap_or_else(|error| panic!("settings: {error}"));
+        assert_eq!(
+            settings.detection_model_path.as_deref(),
+            Some(std::path::Path::new("/opt/models/yolox.onnx"))
+        );
+        assert_eq!(
+            settings.detection_model_sha256.as_deref(),
+            Some("427cc366d34e27ff7a03e2899b5e3671425c262ea2291f88bb942bc1cc70b0f7"),
+        );
+    }
+
+    #[test]
+    fn model_path_without_sha_keeps_the_fixture_backend() {
+        let values = HashMap::from([
+            ("SURVEILLANCE_CAMERA_ID", "camera-01"),
+            ("SURVEILLANCE_RTSP_URL", "rtsp://127.0.0.1/camera"),
+            ("SURVEILLANCE_VIDEO_WIDTH", "640"),
+            ("SURVEILLANCE_VIDEO_HEIGHT", "360"),
+            (
+                "SURVEILLANCE_DETECTION_MODEL_PATH",
+                "/opt/models/yolox.onnx",
+            ),
+        ]);
+        let settings = load_with(
+            |key| values.get(key).map(|value| (*value).to_owned()),
+            &compiled_defaults(),
+        )
+        .unwrap_or_else(|error| panic!("settings: {error}"));
+        assert!(
+            settings.detection_model_path.is_none(),
+            "a path without a verifying sha must not take effect"
+        );
+    }
+
+    #[test]
+    fn empty_model_path_env_var_is_the_same_as_unset() {
+        let values = HashMap::from([
+            ("SURVEILLANCE_CAMERA_ID", "camera-01"),
+            ("SURVEILLANCE_RTSP_URL", "rtsp://127.0.0.1/camera"),
+            ("SURVEILLANCE_VIDEO_WIDTH", "640"),
+            ("SURVEILLANCE_VIDEO_HEIGHT", "360"),
+            ("SURVEILLANCE_DETECTION_MODEL_PATH", ""),
+            ("SURVEILLANCE_DETECTION_MODEL_SHA256", ""),
+        ]);
+        let settings = load_with(
+            |key| values.get(key).map(|value| (*value).to_owned()),
+            &compiled_defaults(),
+        )
+        .unwrap_or_else(|error| panic!("settings: {error}"));
+        assert!(settings.detection_model_path.is_none());
     }
 
     #[test]

@@ -181,7 +181,11 @@ lsof -nP -iTCP:"${livekit_port}" -sTCP:LISTEN -t 2>/dev/null | grep -q . \
 status "READY" "LiveKit · ws://127.0.0.1:${livekit_port}"
 
 status "BUILD" "surveillance-server · ${build_profile}"
-(cd "${repo_root}" && cargo build -p surveillance-server "${cargo_profile[@]}") \
+cargo_features=()
+if [[ -n "${SURVEILLANCE_CARGO_FEATURES:-}" ]]; then
+  cargo_features=(--features "${SURVEILLANCE_CARGO_FEATURES}")
+fi
+(cd "${repo_root}" && cargo build -p surveillance-server "${cargo_profile[@]}" "${cargo_features[@]}") \
   >"${log_dir}/build.log" 2>&1 \
   || fail "server build failed; see ${log_dir}/build.log"
 status "READY" "Binary · ${server_binary}"
