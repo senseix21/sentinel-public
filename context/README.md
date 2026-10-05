@@ -4,14 +4,14 @@ This directory contains compact, dated handoff snapshots. Its purpose is to let 
 
 ## Latest snapshot
 
-**2026-10-04 20:21 +06:** [`context/2026-10-04-2021/`](2026-10-04-2021/) — detection's ONNX backend was run against a real artifact and measured against ground truth: 73.7% recall and 89.7% precision on sixty COCO frames, and 36.9% on small subjects. Two preprocessing conventions were wrong and were settled by measurement rather than by reading. A LiveKit flake turned out to be a decoder start failure misclassified as a missing binary, which stopped a camera's publication for good over a condition that clears in a second. Accuracy on anything representing this product remains unevaluated. Previous snapshot, **2026-10-03 22:37 +06:** [`context/2026-10-03-2237/`](2026-10-03-2237/) — the ONNX backend and the motion gate.
+**2026-10-05 00:00 +06:** [`context/2026-10-05-0000/`](2026-10-05-0000/) — PR #11 is merged. A real ONNX detection path, a cross-frame tracker, a browser-side bounding-box overlay with per-tile person counts, four env knobs for the model and thresholds, and an ROI exclude mask all now live on `main`. The 1-in-3 restart flake that opened the session is deterministic. Score and NMS threshold classifications stayed `PipelineRestart` with a documented reason: the inference capture sites don't re-read live, so `Immediate` would be a lie. Previous snapshot, **2026-10-04 20:21 +06:** [`context/2026-10-04-2021/`](2026-10-04-2021/) — ONNX backend measured against ground truth: 73.7% recall, 89.7% precision, 36.9% small-subject recall on sixty COCO frames.
 
 Read in this order:
 
-1. [`next-actions.md`](2026-10-04-2021/next-actions.md) — current position and immediate work.
-2. [`repository-status.md`](2026-10-04-2021/repository-status.md) — verified repository facts, test results, and the prototype record.
-3. [`architecture.md`](2026-10-04-2021/architecture.md) — child-process ownership, recording retrieval, and the enforcement boundary.
-4. [`decisions-and-open-questions.md`](2026-10-04-2021/decisions-and-open-questions.md) — decisions, evidence, and blockers.
+1. [`next-actions.md`](2026-10-05-0000/next-actions.md) — current position and immediate work.
+2. [`repository-status.md`](2026-10-05-0000/repository-status.md) — verified repository facts, test results, and the prototype record.
+3. [`architecture.md`](2026-10-04-2021/architecture.md) — child-process ownership, recording retrieval, and the enforcement boundary (unchanged this session).
+4. [`decisions-and-open-questions.md`](2026-10-04-2021/decisions-and-open-questions.md) — decisions, evidence, and blockers (unchanged this session).
 
 The paused detection model/runtime design remains in the previous snapshot:
 [`detection-model-design.md`](2026-08-14-1914/detection-model-design.md).
