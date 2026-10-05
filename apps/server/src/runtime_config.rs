@@ -56,6 +56,13 @@ const DETECTION_MAX_GAP_MS: &str = "SURVEILLANCE_DETECTION_MAX_GAP_MS";
 // `MODEL_SHA256` to match the file on disk.
 const DETECTION_MODEL_PATH: &str = "SURVEILLANCE_DETECTION_MODEL_PATH";
 const DETECTION_MODEL_SHA256: &str = "SURVEILLANCE_DETECTION_MODEL_SHA256";
+// Score and NMS thresholds, percent (0..=100). Default 30% is tuned for the
+// container accuracy tests; raise toward 60-70% to drop low-confidence
+// false positives such as hanging clothes or shadows in low-light webcam
+// footage. These apply to real inference only; the fixture backend ignores
+// them.
+const DETECTION_SCORE_THRESHOLD_PERCENT: &str = "SURVEILLANCE_DETECTION_SCORE_THRESHOLD_PERCENT";
+const DETECTION_NMS_IOU_PERCENT: &str = "SURVEILLANCE_DETECTION_NMS_IOU_PERCENT";
 const CONFIG_FILE: &str = "SURVEILLANCE_CONFIG_FILE";
 const WEBCAM_DEVICE: &str = "SURVEILLANCE_WEBCAM_DEVICE";
 const WEBCAM_BACKEND: &str = "SURVEILLANCE_WEBCAM_BACKEND";
@@ -409,6 +416,16 @@ fn load_supervision_with(
     })
 }
 
+/// Parses an env var holding a value in `0..=100`. Empty, missing, or
+/// malformed input returns `None` so the caller preserves the existing value
+/// — a bad override is better off ignored than silently defaulted.
+fn parse_percent_u8(lookup: &impl Fn(&str) -> Option<String>, key: &'static str) -> Option<u8> {
+    lookup(key)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u8>().ok())
+        .filter(|value| *value <= 100)
+}
+
 fn positive_usize_override(
     lookup: &impl Fn(&str) -> Option<String>,
     key: &'static str,
@@ -436,6 +453,10 @@ fn load_health_bind_with(
     Ok(address)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one env-var manifest keeps the layering single-source"
+)]
 fn load_with(
     lookup: impl Fn(&str) -> Option<String>,
     resolved: &ResolvedSettings,
@@ -485,6 +506,12 @@ fn load_with(
     if let (Some(path), Some(sha)) = (model_path, model_sha256) {
         settings.detection_model_path = Some(PathBuf::from(path));
         settings.detection_model_sha256 = Some(sha);
+    }
+    if let Some(percent) = parse_percent_u8(&lookup, DETECTION_SCORE_THRESHOLD_PERCENT) {
+        settings.detection_score_threshold_percent = percent;
+    }
+    if let Some(percent) = parse_percent_u8(&lookup, DETECTION_NMS_IOU_PERCENT) {
+        settings.detection_nms_iou_percent = percent;
     }
     settings.livekit = match (
         lookup(LIVEKIT_URL),
@@ -807,6 +834,46 @@ mod tests {
             settings.detection_model_path.is_none(),
             "a path without a verifying sha must not take effect"
         );
+    }
+
+    #[test]
+    fn score_threshold_env_overrides_the_default() {
+        let values = HashMap::from([
+            ("SURVEILLANCE_CAMERA_ID", "camera-01"),
+            ("SURVEILLANCE_RTSP_URL", "rtsp://127.0.0.1/camera"),
+            ("SURVEILLANCE_VIDEO_WIDTH", "640"),
+            ("SURVEILLANCE_VIDEO_HEIGHT", "360"),
+            ("SURVEILLANCE_DETECTION_SCORE_THRESHOLD_PERCENT", "65"),
+            ("SURVEILLANCE_DETECTION_NMS_IOU_PERCENT", "55"),
+        ]);
+        let settings = load_with(
+            |key| values.get(key).map(|value| (*value).to_owned()),
+            &compiled_defaults(),
+        )
+        .unwrap_or_else(|error| panic!("settings: {error}"));
+        assert_eq!(settings.detection_score_threshold_percent, 65);
+        assert_eq!(settings.detection_nms_iou_percent, 55);
+    }
+
+    #[test]
+    fn out_of_range_threshold_is_ignored_rather_than_clamped() {
+        let values = HashMap::from([
+            ("SURVEILLANCE_CAMERA_ID", "camera-01"),
+            ("SURVEILLANCE_RTSP_URL", "rtsp://127.0.0.1/camera"),
+            ("SURVEILLANCE_VIDEO_WIDTH", "640"),
+            ("SURVEILLANCE_VIDEO_HEIGHT", "360"),
+            ("SURVEILLANCE_DETECTION_SCORE_THRESHOLD_PERCENT", "150"),
+            ("SURVEILLANCE_DETECTION_NMS_IOU_PERCENT", "garbage"),
+        ]);
+        let baseline = compiled_defaults();
+        let settings = load_with(
+            |key| values.get(key).map(|value| (*value).to_owned()),
+            &baseline,
+        )
+        .unwrap_or_else(|error| panic!("settings: {error}"));
+        // Defaults preserved, not silently zeroed.
+        assert_ne!(settings.detection_score_threshold_percent, 0);
+        assert_ne!(settings.detection_nms_iou_percent, 0);
     }
 
     #[test]
