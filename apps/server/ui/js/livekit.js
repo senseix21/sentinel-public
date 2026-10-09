@@ -1,10 +1,20 @@
 import { esc } from "./formatting.js";
-import { DetectionOverlay, DETECTION_TOPIC } from "./detection-overlay.js";
+import { DetectionOverlay, DETECTION_TOPIC, FACE_TOPIC, PRESENCE_TOPIC, MAX_DETECTION_PACKET_BYTES } from "./detection-overlay.js";
+
+export function localFirefoxHelp(endpoint, userAgent) {
+  if (!/Firefox\//.test(userAgent)) return "";
+  let host;
+  try { host = new URL(endpoint).hostname; } catch { return ""; }
+  if (!["127.0.0.1", "localhost", "[::1]"].includes(host)) return "";
+  return "If this local media server uses loopback, Firefox may block its WebRTC connection. "
+    + "Open about:config, set media.peerconnection.ice.loopback to true, then refresh this page.";
+}
 
 export function createLiveKitOwner({
   ApiError, api, banner, errorBanner, sdkLoader = null,
   setRetryTimer = (callback, delay) => setTimeout(callback, delay),
   clearRetryTimer = (timer) => clearTimeout(timer),
+  userAgent = globalThis.navigator?.userAgent || "",
 }) {
 
 // ------------------------------------------------------------- live viewing
@@ -46,9 +56,15 @@ function loadBrowserLiveKit() {
 // `stopped` is operator intent, distinct from a disconnected room. Without it,
 // the live-screen reconciler sees the intentionally empty room map on its next
 // poll and immediately starts every stopped camera again.
-const live = { rooms: new Map(), desired: new Set(), retries: new Map(), stopped: new Set() };
+const live = { rooms: new Map(), desired: new Set(), retries: new Map(), stopped: new Set(), notes: new Map() };
 
 function liveNote(cameraId, html) {
+  if (html) live.notes.set(cameraId, html);
+  else live.notes.delete(cameraId);
+  renderLiveNote(cameraId, html);
+}
+
+function renderLiveNote(cameraId, html) {
   for (const node of document.querySelectorAll("[data-live-note]")) {
     if (node.dataset.liveNote === cameraId) node.innerHTML = html;
   }
@@ -117,9 +133,12 @@ function setPersonCount(cameraId, counts, fixture) {
     if (!tile) continue;
     const el = tile.querySelector(".person-count");
     if (!el) continue;
-    const hide = fixture || counts.cumulative === 0;
+    const hide = counts.mode === "person_face" ? false : fixture || (counts.mode === "face" ? !counts.received : counts.cumulative === 0);
     el.classList.toggle("hidden", hide);
-    if (!hide) el.textContent = `${counts.active} · ${counts.cumulative}`;
+    if (!hide) {
+      el.textContent = counts.mode === "person_face" ? (counts.available ? `People observed: ${counts.saturated ? "at least " : ""}${counts.active}${counts.uncertain ? ` · temporarily uncertain: ${counts.uncertain}` : ""} · Faces: ${counts.faces}` : "Person detection unavailable / stale") : counts.mode === "face" ? `Faces detected: ${counts.active}` : `${counts.active} · ${counts.cumulative}`;
+      el.title = counts.mode === "person_face" ? "Current camera observations; uncertainty is not confirmed occupancy or identity" : counts.mode === "face" ? "Visible face detections; not unique people" : "active persons · unique seen this session";
+    }
   }
 }
 
@@ -129,6 +148,7 @@ function setPersonCount(cameraId, counts, fixture) {
 function restorePersonCounts() {
   for (const [cameraId, session] of live.rooms) {
     if (!session.overlay) continue;
+    setFixtureBadge(cameraId, session.overlay.faceUnavailable());
     setPersonCount(cameraId, session.overlay.personCounts(), session.overlay.isFixture());
   }
 }
@@ -153,7 +173,7 @@ async function stopAllLive(remember = true) {
   await Promise.all([...cameraIds].map((cameraId) => stopLive(cameraId, remember)));
 }
 
-function scheduleReconnect(cameraId, priorAttempt = 0) {
+function scheduleReconnect(cameraId, priorAttempt = 0, connectionHelp = "") {
   if (!live.desired.has(cameraId) || live.retries.has(cameraId)) return;
   const attempt = priorAttempt + 1;
   const delay = Math.min(30_000, 1_000 * (2 ** Math.min(attempt - 1, 5)));
@@ -169,7 +189,7 @@ function scheduleReconnect(cameraId, priorAttempt = 0) {
   }, delay);
   live.retries.set(cameraId, { timer, attempt });
   liveNote(cameraId, banner("warn", "Reconnecting to the live stream…",
-    `Retrying automatically in ${Math.ceil(delay / 1_000)} second(s). Recording is unaffected.`));
+    `Retrying automatically in ${Math.ceil(delay / 1_000)} second(s). Recording is unaffected. ${connectionHelp}`));
 }
 
 // The fleet screens re-render every five seconds, which replaces the elements
@@ -177,6 +197,7 @@ function scheduleReconnect(cameraId, priorAttempt = 0) {
 // belong to the rooms, not to the DOM — so the video is put back rather than
 // re-negotiated. The live-screen reconciler separately starts missing sessions.
 function reattachLive() {
+  for (const [cameraId, html] of live.notes) renderLiveNote(cameraId, html);
   for (const [cameraId, session] of live.rooms) {
     if (!session.track) continue;
     const video = liveVideos(cameraId)[0];
@@ -200,6 +221,10 @@ function reattachOverlays() {
     if (!session.overlay) continue;
     const video = liveVideos(cameraId)[0];
     if (!video) continue;
+    session.detectionMode = video.dataset?.detectionMode || "person";
+    session.overlay.updateConfiguration(session.detectionMode, Number(video.dataset?.detectionMaxAgeMs));
+    session.overlay.setUnavailable(["Disabled", "Terminal", "Stopped", "Degraded"].includes(session.detectionMode === "person_face" ? video.dataset?.detectionFaceState : video.dataset?.detectionState));
+    session.overlay.setPersonUnavailable(["Disabled", "Terminal", "Stopped", "Degraded"].includes(video.dataset?.detectionPersonState));
     session.overlay.reattach(video);
   }
 }
@@ -231,16 +256,18 @@ async function startLive(cameraId, video, retryAttempt = 0) {
   }
 
   const room = new sdk.Room();
-  const overlay = new DetectionOverlay();
-  const session = { room, track: null, overlay, retryAttempt };
+  const overlay = new DetectionOverlay({ mode: video.dataset?.detectionMode || "person", cameraId, maxAgeMs: Number(video.dataset?.detectionMaxAgeMs) || undefined });
+  const connectionHelp = localFirefoxHelp(access.endpoint, userAgent);
+  const session = { room, track: null, overlay, retryAttempt, connectionHelp, detectionMode: video.dataset?.detectionMode || "person" };
   live.rooms.set(cameraId, session);
 
   // Attaching on subscribe rather than on connect: a room can be joined while
   // nothing is publishing into it, and a `<video>` shown before a track exists
   // is a black rectangle an operator cannot distinguish from a dead camera.
-  room.on(sdk.RoomEvent.TrackSubscribed, (track) => {
+  room.on(sdk.RoomEvent.TrackSubscribed, (track, _publication, participant) => {
     if (track.kind !== sdk.Track.Kind.Video) return;
     session.track = track;
+    session.publisherSid = participant?.sid || null;
     track.attach(video);
     overlay.attach(video);
     video.dataset.liveAttached = "yes";
@@ -256,8 +283,10 @@ async function startLive(cameraId, video, retryAttempt = 0) {
   });
 
   room.on(sdk.RoomEvent.TrackUnsubscribed, (track) => {
+    if (session.track !== track) return;
     track.detach();
     overlay.detach();
+    session.publisherSid = null;
     if (session.track === track) session.track = null;
     video.hidden = true;
     setFixtureBadge(cameraId, false);
@@ -271,11 +300,16 @@ async function startLive(cameraId, video, retryAttempt = 0) {
   // The overlay enforces staleness and the fixture guard; here we only
   // decode, filter by topic, and route.
   room.on(sdk.RoomEvent.DataReceived, (payload, _participant, _kind, topic) => {
-    if (topic !== DETECTION_TOPIC) return;
+    if (session.detectionMode === "person_face" ? ![FACE_TOPIC,PRESENCE_TOPIC].includes(topic) : topic !== (session.detectionMode === "face" ? FACE_TOPIC : DETECTION_TOPIC)) return;
+    if (payload.byteLength > MAX_DETECTION_PACKET_BYTES) return;
+    if (session.publisherSid && _participant?.sid !== session.publisherSid) return;
     let packet;
     try { packet = JSON.parse(new TextDecoder().decode(payload)); }
     catch (error) { return; }
-    overlay.onPacket(packet);
+    if (packet.camera_id !== cameraId) return;
+    if (topic === PRESENCE_TOPIC) { if (!overlay.onPresencePacket(packet)) return; }
+    else if (topic === FACE_TOPIC) { if (!overlay.onFacePacket(packet)) return; }
+    else overlay.onPacket(packet);
     setFixtureBadge(cameraId, !!packet.results_are_fixture);
     setPersonCount(cameraId, overlay.personCounts(), overlay.isFixture());
   });
@@ -285,20 +319,19 @@ async function startLive(cameraId, video, retryAttempt = 0) {
     live.rooms.delete(cameraId);
     video.hidden = true;
     liveIdle(cameraId, true);
-    scheduleReconnect(cameraId, session.retryAttempt);
+    scheduleReconnect(cameraId, session.retryAttempt, session.connectionHelp);
   });
 
   liveNote(cameraId, banner("info", "Connecting…",
-    `Room ${esc(access.room)} on ${esc(access.endpoint)}.`));
+    `Room ${esc(access.room)} on ${esc(access.endpoint)}. ${connectionHelp}`));
 
   try {
     await room.connect(access.endpoint, access.token);
   } catch (error) {
     await teardownLive(cameraId);
-    liveNote(cameraId, banner("bad", "Could not connect to the live server.",
-      "The token was issued, but this browser could not reach the LiveKit " +
-      "server at " + esc(access.endpoint) + ". Recording is unaffected."));
-    scheduleReconnect(cameraId, retryAttempt);
+    liveNote(cameraId, banner("bad", "The live media connection failed.",
+      "Viewer access was issued, but this browser could not establish WebRTC media with " + esc(access.endpoint) + ". Recording is unaffected. " + connectionHelp));
+    scheduleReconnect(cameraId, retryAttempt, connectionHelp);
     return;
   }
   if (live.rooms.get(cameraId) !== session) return;  // superseded while connecting

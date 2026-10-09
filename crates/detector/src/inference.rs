@@ -70,6 +70,7 @@ pub struct InferenceDescriptor {
     model_name: String,
     model_version: String,
     is_production: bool,
+    mode: DetectionMode,
 }
 
 impl InferenceDescriptor {
@@ -80,9 +81,19 @@ impl InferenceDescriptor {
             model_name: inference.model_name().as_str().to_owned(),
             model_version: inference.model_version().as_str().to_owned(),
             is_production: inference.is_production_model(),
+            mode: DetectionMode::Person,
         }
     }
 
+    #[must_use]
+    pub fn combined(real: bool) -> Self {
+        Self {
+            model_name: "person-face".to_owned(),
+            model_version: "1".to_owned(),
+            is_production: real,
+            mode: DetectionMode::PersonFace,
+        }
+    }
     #[must_use]
     pub fn model_name(&self) -> &str {
         &self.model_name
@@ -139,5 +150,92 @@ impl PersonInference for DeterministicFakeInference {
             track_id: None,
         }])
         .map_err(|_| InferenceError::new(InferenceFailureKind::MalformedOutput))
+    }
+}
+
+/// Selected meaning of detections. A face is not a person or identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DetectionMode {
+    Person,
+    Face,
+    PersonFace,
+}
+impl DetectionMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Person => "person",
+            Self::Face => "face",
+            Self::PersonFace => "person_face",
+        }
+    }
+}
+pub enum InferenceResults {
+    Persons(DetectionSet),
+    Faces(surveillance_events::event::FaceDetectionSet),
+}
+impl InferenceResults {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Persons(set) => set.as_slice().len(),
+            Self::Faces(set) => set.as_slice().len(),
+        }
+    }
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+/// The owner executes either model with the same decoder/task ownership.
+pub trait DetectionInference: Send + 'static {
+    fn model_name(&self) -> &ModelName;
+    fn model_version(&self) -> &ModelVersion;
+    fn mode(&self) -> DetectionMode;
+    /// Eligible candidates omitted by the output bound in the last inference.
+    fn output_capacity_dropped(&self) -> u64 {
+        0
+    }
+    fn is_production_model(&self) -> bool;
+    /// # Errors
+    /// Returns a typed model failure.
+    fn infer_detections(
+        &mut self,
+        frame: &DecodedFrame,
+    ) -> Result<InferenceResults, InferenceError>;
+}
+impl<T: PersonInference> DetectionInference for T {
+    fn model_name(&self) -> &ModelName {
+        PersonInference::model_name(self)
+    }
+    fn model_version(&self) -> &ModelVersion {
+        PersonInference::model_version(self)
+    }
+    fn mode(&self) -> DetectionMode {
+        DetectionMode::Person
+    }
+    fn is_production_model(&self) -> bool {
+        PersonInference::is_production_model(self)
+    }
+    fn infer_detections(
+        &mut self,
+        frame: &DecodedFrame,
+    ) -> Result<InferenceResults, InferenceError> {
+        self.infer(frame).map(InferenceResults::Persons)
+    }
+}
+impl InferenceDescriptor {
+    #[must_use]
+    pub fn of_detection(inference: &dyn DetectionInference) -> Self {
+        Self {
+            model_name: inference.model_name().as_str().to_owned(),
+            model_version: inference.model_version().as_str().to_owned(),
+            is_production: inference.is_production_model(),
+            mode: inference.mode(),
+        }
+    }
+    #[must_use]
+    pub const fn mode(&self) -> DetectionMode {
+        self.mode
     }
 }

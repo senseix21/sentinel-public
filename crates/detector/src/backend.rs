@@ -78,6 +78,25 @@ impl core::fmt::Display for BackendError {
 
 impl core::error::Error for BackendError {}
 
+impl BackendError {
+    /// Bounded, redacted category suitable for operator logs.
+    #[must_use]
+    pub const fn category(&self) -> &'static str {
+        match self {
+            Self::OnnxUnavailable(_) => "onnx_feature_unavailable",
+            Self::Fixture => "fixture_identity",
+            #[cfg(feature = "onnx-inference")]
+            Self::Onnx(error) => match error {
+                crate::onnx::OnnxBackendError::UnusableArtifact(_) => "artifact_unreadable",
+                crate::onnx::OnnxBackendError::HashMismatch { .. } => "artifact_hash_mismatch",
+                crate::onnx::OnnxBackendError::Session(_) => "onnx_session",
+                crate::onnx::OnnxBackendError::WarmUp(_) => "model_contract",
+                crate::onnx::OnnxBackendError::Identity => "model_identity",
+            },
+        }
+    }
+}
+
 /// The inference backend one camera runs.
 pub enum PersonInferenceBackend {
     /// Correctly shaped results that say nothing about what the camera saw.
@@ -142,6 +161,92 @@ impl PersonInference for PersonInferenceBackend {
             Self::Fixture(backend) => backend.is_production_model(),
             #[cfg(feature = "onnx-inference")]
             Self::Onnx(backend) => backend.is_production_model(),
+        }
+    }
+}
+
+/// Explicit mode dispatch; faces never implement the person contract.
+pub enum ModeInferenceBackend {
+    Person(PersonInferenceBackend),
+    #[cfg(feature = "onnx-inference")]
+    Face(Box<crate::face::OnnxFaceInference>),
+}
+impl ModeInferenceBackend {
+    /// # Errors
+    /// Refuses unavailable or invalid models without silently switching mode.
+    pub fn select(
+        config: &InferenceBackendConfig,
+        mode: crate::inference::DetectionMode,
+    ) -> Result<Self, BackendError> {
+        match mode {
+            crate::inference::DetectionMode::Person => {
+                PersonInferenceBackend::select(config).map(Self::Person)
+            }
+            crate::inference::DetectionMode::PersonFace => Err(BackendError::Fixture),
+            crate::inference::DetectionMode::Face => {
+                #[cfg(feature = "onnx-inference")]
+                {
+                    crate::face::OnnxFaceInference::load(config)
+                        .map(|model| Self::Face(Box::new(model)))
+                        .map_err(BackendError::Onnx)
+                }
+                #[cfg(not(feature = "onnx-inference"))]
+                {
+                    Err(BackendError::OnnxUnavailable(
+                        config.model_path.clone().unwrap_or_default(),
+                    ))
+                }
+            }
+        }
+    }
+}
+impl crate::inference::DetectionInference for ModeInferenceBackend {
+    fn output_capacity_dropped(&self) -> u64 {
+        match self {
+            Self::Person(_) => 0,
+            #[cfg(feature = "onnx-inference")]
+            Self::Face(face) => face.output_capacity_dropped(),
+        }
+    }
+
+    fn model_name(&self) -> &ModelName {
+        match self {
+            Self::Person(p) => PersonInference::model_name(p),
+            #[cfg(feature = "onnx-inference")]
+            Self::Face(f) => f.model_name(),
+        }
+    }
+    fn model_version(&self) -> &ModelVersion {
+        match self {
+            Self::Person(p) => PersonInference::model_version(p),
+            #[cfg(feature = "onnx-inference")]
+            Self::Face(f) => f.model_version(),
+        }
+    }
+    fn mode(&self) -> crate::inference::DetectionMode {
+        match self {
+            Self::Person(_) => crate::inference::DetectionMode::Person,
+            #[cfg(feature = "onnx-inference")]
+            Self::Face(_) => crate::inference::DetectionMode::Face,
+        }
+    }
+    fn is_production_model(&self) -> bool {
+        match self {
+            Self::Person(p) => PersonInference::is_production_model(p),
+            #[cfg(feature = "onnx-inference")]
+            Self::Face(f) => f.is_production_model(),
+        }
+    }
+    fn infer_detections(
+        &mut self,
+        frame: &DecodedFrame,
+    ) -> Result<crate::inference::InferenceResults, InferenceError> {
+        match self {
+            Self::Person(p) => p
+                .infer(frame)
+                .map(crate::inference::InferenceResults::Persons),
+            #[cfg(feature = "onnx-inference")]
+            Self::Face(f) => f.infer_detections(frame),
         }
     }
 }

@@ -68,6 +68,26 @@ pub struct Alias {
 /// scope key, not a setting.
 pub const LEGACY_ALIASES: &[Alias] = &[
     Alias {
+        name: "SURVEILLANCE_DETECTION_MODE",
+        id: SettingId::CameraDetectionMode,
+        implied: ImpliedUnit::None,
+    },
+    Alias {
+        name: "SURVEILLANCE_DETECTION_FACE_MODEL_PATH",
+        id: SettingId::CameraDetectionFaceModelPath,
+        implied: ImpliedUnit::None,
+    },
+    Alias {
+        name: "SURVEILLANCE_DETECTION_FACE_MODEL_SHA256",
+        id: SettingId::CameraDetectionFaceModelSha256,
+        implied: ImpliedUnit::None,
+    },
+    Alias {
+        name: "SURVEILLANCE_DETECTION_FACE_SCORE_THRESHOLD_PERCENT",
+        id: SettingId::CameraDetectionFaceScoreThresholdPercent,
+        implied: ImpliedUnit::None,
+    },
+    Alias {
         name: "SURVEILLANCE_RTSP_URL",
         id: SettingId::CameraRtspEndpoint,
         implied: ImpliedUnit::None,

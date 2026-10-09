@@ -74,6 +74,21 @@ pub fn one_camera_settings(
         decoded_frame_max_bytes: reader.usize(SettingId::CameraDetectionDecodedFrameMaxBytes)?,
         detection_decoder: reader.path(SettingId::CameraDetectionDecoder)?,
         detection_decode_timeout: reader.duration(SettingId::CameraDetectionDecodeTimeout)?,
+        detection_presence_confirmation: reader
+            .duration(SettingId::CameraDetectionPresenceConfirmation)?,
+        detection_presence_grace: reader.duration(SettingId::CameraDetectionPresenceGrace)?,
+        detection_presence_freshness: reader
+            .duration(SettingId::CameraDetectionPresenceFreshness)?,
+        detection_face_sample_fps: reader.u16(SettingId::CameraDetectionFaceSampleFps)?,
+        detection_inference_concurrency: reader
+            .usize(SettingId::CameraDetectionInferenceConcurrency)?,
+        detection_mode: reader.text(SettingId::CameraDetectionMode)?,
+        detection_overlay_max_age: reader.duration(SettingId::CameraDetectionOverlayMaxAge)?,
+        detection_face_model_path: reader.optional_path(SettingId::CameraDetectionFaceModelPath),
+        detection_face_model_sha256: reader
+            .optional_text(SettingId::CameraDetectionFaceModelSha256),
+        detection_face_score_threshold_percent: reader
+            .percentage(SettingId::CameraDetectionFaceScoreThresholdPercent)?,
         detection_model_path: reader.optional_path(SettingId::CameraDetectionModelPath),
         detection_model_sha256: reader.optional_text(SettingId::CameraDetectionModelSha256),
         detection_input_width: reader.u32(SettingId::CameraDetectionInputWidth)?,
@@ -367,7 +382,7 @@ mod tests {
         assert_eq!(settings.detection_execution_providers, "cpu");
         assert_eq!(settings.detection_intra_op_threads, 1);
         assert_eq!(settings.detection_inter_op_threads, 1);
-        assert_eq!(settings.detection_score_threshold_percent, 30);
+        assert_eq!(settings.detection_score_threshold_percent, 70);
         assert_eq!(settings.detection_nms_iou_percent, 45);
         assert_eq!(settings.detection_motion_threshold_percent, 2);
     }

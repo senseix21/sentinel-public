@@ -240,6 +240,42 @@ pub struct PersonDetection {
     pub track_id: Option<TrackId>,
 }
 
+/// A localized face, never a person detection or a recognized identity.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct FaceDetection {
+    pub confidence: Confidence,
+    pub bounding_box: NormalizedBoundingBox,
+}
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(try_from = "Vec<FaceDetection>")]
+pub struct FaceDetectionSet(Vec<FaceDetection>);
+impl FaceDetectionSet {
+    /// # Errors
+    /// Refuses more than the bounded event capacity.
+    pub fn new(values: Vec<FaceDetection>) -> Result<Self, EventValidationError> {
+        if values.len() > MAX_DETECTIONS_PER_EVENT {
+            return Err(EventValidationError::TooManyDetections);
+        }
+        Ok(Self(values))
+    }
+    /// Filtering preserves the already-validated cardinality bound.
+    #[must_use]
+    pub fn retain(mut self, predicate: impl FnMut(&FaceDetection) -> bool) -> Self {
+        self.0.retain(predicate);
+        self
+    }
+    #[must_use]
+    pub fn as_slice(&self) -> &[FaceDetection] {
+        &self.0
+    }
+}
+impl TryFrom<Vec<FaceDetection>> for FaceDetectionSet {
+    type Error = EventValidationError;
+    fn try_from(values: Vec<FaceDetection>) -> Result<Self, Self::Error> {
+        Self::new(values)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(try_from = "Vec<PersonDetection>", into = "Vec<PersonDetection>")]
 pub struct DetectionSet(Vec<PersonDetection>);
@@ -347,6 +383,84 @@ pub enum StoragePressure {
     Recovered,
 }
 
+/// Track evidence is camera/session local, never a recognized identity.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackEvidence {
+    Tentative,
+    Observed,
+    Coasting,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PresenceTrack {
+    pub id: u32,
+    pub evidence: TrackEvidence,
+}
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(try_from = "PresenceWire")]
+pub struct PresenceSnapshot {
+    tracks: Vec<PresenceTrack>,
+    available: bool,
+    saturated: bool,
+}
+#[derive(Deserialize)]
+struct PresenceWire {
+    tracks: Vec<PresenceTrack>,
+    available: bool,
+    saturated: bool,
+}
+impl TryFrom<PresenceWire> for PresenceSnapshot {
+    type Error = EventValidationError;
+    fn try_from(w: PresenceWire) -> Result<Self, Self::Error> {
+        Self::new(w.tracks, w.available, w.saturated)
+    }
+}
+impl PresenceSnapshot {
+    /// # Errors
+    /// Refuses cardinality, duplicate/zero IDs and observed evidence while unavailable.
+    pub fn new(
+        tracks: Vec<PresenceTrack>,
+        available: bool,
+        saturated: bool,
+    ) -> Result<Self, EventValidationError> {
+        if tracks.len() > 64
+            || tracks.iter().enumerate().any(|(i, t)| {
+                t.id == 0
+                    || tracks[..i].iter().any(|p| p.id == t.id)
+                    || (!available && t.evidence == TrackEvidence::Observed)
+            })
+        {
+            return Err(EventValidationError::InvalidPresence);
+        }
+        Ok(Self {
+            tracks,
+            available,
+            saturated,
+        })
+    }
+    #[must_use]
+    pub fn tracks(&self) -> &[PresenceTrack] {
+        &self.tracks
+    }
+    #[must_use]
+    pub const fn available(&self) -> bool {
+        self.available
+    }
+    #[must_use]
+    pub const fn saturated(&self) -> bool {
+        self.saturated
+    }
+    #[must_use]
+    pub fn counts(&self) -> (usize, usize, usize) {
+        let count = |state| self.tracks.iter().filter(|t| t.evidence == state).count();
+        (
+            count(TrackEvidence::Observed),
+            count(TrackEvidence::Coasting),
+            count(TrackEvidence::Tentative),
+        )
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventPayload {
@@ -372,6 +486,21 @@ pub enum EventPayload {
         /// The UI must not render boxes when this is set.
         results_are_fixture: bool,
         detections: DetectionSet,
+    },
+    PersonPresenceObserved {
+        media_time: SourceMediaTime,
+        session: NonZeroU64,
+        results_are_fixture: bool,
+        presence: PresenceSnapshot,
+    },
+    FaceDetectionObserved {
+        #[serde(default)]
+        session: Option<NonZeroU64>,
+        media_time: SourceMediaTime,
+        model: ModelName,
+        model_version: ModelVersion,
+        results_are_fixture: bool,
+        detections: FaceDetectionSet,
     },
     DetectorStateChanged {
         state: DetectorState,
@@ -405,6 +534,8 @@ pub enum EventKind {
     RecordingSegmentFailed,
     StoragePressureChanged,
     PersonDetectionObserved,
+    FaceDetectionObserved,
+    PersonPresenceObserved,
     DetectorStateChanged,
     ConfigurationChanged,
 }
@@ -457,7 +588,12 @@ impl DomainEvent {
         delivery_class: DeliveryClass,
         payload: EventPayload,
     ) -> Result<Self, EventValidationError> {
-        if let EventPayload::PersonDetectionObserved { .. } = &payload {
+        if matches!(
+            &payload,
+            EventPayload::PersonDetectionObserved { .. }
+                | EventPayload::FaceDetectionObserved { .. }
+                | EventPayload::PersonPresenceObserved { .. }
+        ) {
             if camera_id.is_none() {
                 return Err(EventValidationError::DetectionWithoutCamera);
             }
@@ -508,6 +644,8 @@ impl DomainEvent {
             EventPayload::RecordingSegmentFailed { .. } => EventKind::RecordingSegmentFailed,
             EventPayload::StoragePressureChanged { .. } => EventKind::StoragePressureChanged,
             EventPayload::PersonDetectionObserved { .. } => EventKind::PersonDetectionObserved,
+            EventPayload::FaceDetectionObserved { .. } => EventKind::FaceDetectionObserved,
+            EventPayload::PersonPresenceObserved { .. } => EventKind::PersonPresenceObserved,
             EventPayload::DetectorStateChanged { .. } => EventKind::DetectorStateChanged,
             EventPayload::ConfigurationChanged { .. } => EventKind::ConfigurationChanged,
         }
@@ -527,6 +665,7 @@ pub enum EventValidationError {
     DetectionWithoutCamera,
     ConfigurationWithCamera,
     WrongDeliveryClass,
+    InvalidPresence,
 }
 impl fmt::Display for EventValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -553,6 +692,49 @@ mod tests {
                 .unwrap_or_else(|error| panic!("box: {error}")),
             track_id: None,
         }
+    }
+
+    #[test]
+    fn face_events_require_camera_scope_and_detection_delivery() {
+        let payload = EventPayload::FaceDetectionObserved {
+            session: None,
+            media_time: SourceMediaTime {
+                epoch: NonZeroU64::new(1).unwrap(),
+                ticks: 0,
+                timebase_hz: NonZeroU64::new(90000).unwrap(),
+            },
+            model: ModelName::new("face").unwrap(),
+            model_version: ModelVersion::new("1").unwrap(),
+            results_are_fixture: false,
+            detections: super::FaceDetectionSet::new(vec![]).unwrap(),
+        };
+        assert_eq!(
+            DomainEvent::new(
+                EventId::new("face-1").unwrap(),
+                OccurredAtUnixMicros::new(1).unwrap(),
+                None,
+                DeliveryClass::Detection,
+                payload.clone()
+            )
+            .unwrap_err(),
+            EventValidationError::DetectionWithoutCamera
+        );
+        assert_eq!(
+            DomainEvent::new(
+                EventId::new("face-2").unwrap(),
+                OccurredAtUnixMicros::new(1).unwrap(),
+                Some(CameraId::new("cam").unwrap()),
+                DeliveryClass::Telemetry,
+                payload
+            )
+            .unwrap_err(),
+            EventValidationError::WrongDeliveryClass
+        );
+        let face = super::FaceDetection {
+            confidence: Confidence::new(0.7).unwrap(),
+            bounding_box: NormalizedBoundingBox::new(0.1, 0.1, 0.2, 0.2).unwrap(),
+        };
+        assert!(super::FaceDetectionSet::new(vec![face; 65]).is_err());
     }
 
     #[test]

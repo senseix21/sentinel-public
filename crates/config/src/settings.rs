@@ -56,6 +56,16 @@ pub struct OneCameraSettings {
     pub detection_decode_timeout: Duration,
     /// Absent means no production model is configured, so the detector keeps
     /// its fixture backend and the API keeps reporting that it has one.
+    pub detection_presence_confirmation: Duration,
+    pub detection_presence_grace: Duration,
+    pub detection_presence_freshness: Duration,
+    pub detection_face_sample_fps: u16,
+    pub detection_inference_concurrency: usize,
+    pub detection_mode: String,
+    pub detection_overlay_max_age: Duration,
+    pub detection_face_model_path: Option<PathBuf>,
+    pub detection_face_model_sha256: Option<String>,
+    pub detection_face_score_threshold_percent: u8,
     pub detection_model_path: Option<PathBuf>,
     /// Absent means unpinned. Present, it must match the artifact's hash.
     pub detection_model_sha256: Option<String>,
@@ -125,6 +135,16 @@ impl OneCameraSettings {
             decoded_frame_max_bytes: 416 * 416 * 3,
             detection_decoder: PathBuf::from("ffmpeg"),
             detection_decode_timeout: Duration::from_secs(2),
+            detection_presence_confirmation: Duration::from_secs(1),
+            detection_presence_grace: Duration::from_secs(1),
+            detection_presence_freshness: Duration::from_secs(1),
+            detection_face_sample_fps: 5,
+            detection_inference_concurrency: 4,
+            detection_mode: "person".to_owned(),
+            detection_overlay_max_age: Duration::from_secs(3),
+            detection_face_model_path: None,
+            detection_face_model_sha256: None,
+            detection_face_score_threshold_percent: 70,
             detection_model_path: None,
             detection_model_sha256: None,
             detection_input_width: 416,
@@ -132,7 +152,7 @@ impl OneCameraSettings {
             detection_execution_providers: "cpu".to_owned(),
             detection_intra_op_threads: 1,
             detection_inter_op_threads: 1,
-            detection_score_threshold_percent: 30,
+            detection_score_threshold_percent: 70,
             detection_nms_iou_percent: 45,
             detection_motion_threshold_percent: 2,
             detection_gate_cooldown: Duration::from_secs(5),
@@ -180,6 +200,12 @@ pub struct OneCameraConfig {
     pub detection_gate_heartbeat: Duration,
     /// Which inference backend this camera runs, and the model that defines it.
     pub inference: InferenceBackendConfig,
+    pub face_inference: InferenceBackendConfig,
+    pub presence_policy: surveillance_detector::presence::PresencePolicy,
+    pub face_sample_fps: u16,
+    pub inference_concurrency: usize,
+    pub detection_mode: surveillance_detector::inference::DetectionMode,
+    pub detection_overlay_max_age: Duration,
     pub max_access_unit_bytes: usize,
     pub max_nals_per_access_unit: usize,
     pub recorder: Fmp4SinkConfig,
@@ -231,7 +257,7 @@ impl OneCameraConfig {
         clippy::too_many_lines,
         reason = "one transaction validates all coupled pipeline resource bounds before activation"
     )]
-    pub fn validate(settings: OneCameraSettings) -> Result<Self, OneCameraConfigError> {
+    pub fn validate(mut settings: OneCameraSettings) -> Result<Self, OneCameraConfigError> {
         let camera_id =
             CameraId::new(settings.camera_id).map_err(OneCameraConfigError::CameraId)?;
         let endpoint =
@@ -275,6 +301,101 @@ impl OneCameraConfig {
         if settings.detection_decode_timeout.is_zero() {
             return Err(OneCameraConfigError::ZeroDetectionDecodeTimeout);
         }
+        if settings.detection_overlay_max_age.is_zero()
+            || settings.detection_overlay_max_age > Duration::from_secs(60)
+        {
+            return Err(OneCameraConfigError::InvalidOverlayAge);
+        }
+        let presence_policy = surveillance_detector::presence::PresencePolicy::new(
+            settings.detection_presence_confirmation,
+            settings.detection_presence_grace,
+            settings.detection_presence_freshness,
+        )
+        .map_err(|_| OneCameraConfigError::InvalidPresencePolicy)?;
+        if settings.detection_inference_concurrency == 0
+            || settings.detection_inference_concurrency > 64
+            || settings.detection_face_sample_fps == 0
+            || (settings.detection_mode == "person_face"
+                && settings.detection_face_sample_fps > settings.detection_sample_fps)
+        {
+            return Err(OneCameraConfigError::InvalidPresencePolicy);
+        }
+        let face_inference = InferenceBackendConfig {
+            model_path: settings.detection_face_model_path.clone(),
+            model_sha256: settings.detection_face_model_sha256.clone(),
+            source_width: settings.width,
+            source_height: settings.height,
+            input_width: 640,
+            input_height: 640,
+            letterbox_alignment: surveillance_detector::model_output::YOLOX_LETTERBOX_ALIGNMENT,
+            execution_providers: settings
+                .detection_execution_providers
+                .split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            intra_op_threads: settings.detection_intra_op_threads,
+            inter_op_threads: settings.detection_inter_op_threads,
+            score_threshold_percent: settings.detection_face_score_threshold_percent,
+            nms_iou_percent: settings.detection_nms_iou_percent,
+        };
+        let detection_mode = match settings.detection_mode.as_str() {
+            "person" => surveillance_detector::inference::DetectionMode::Person,
+            "person_face" => {
+                if settings.detection_enabled
+                    && (settings.detection_model_path.is_none()
+                        || settings.detection_face_model_path.is_none()
+                        || [
+                            &settings.detection_model_sha256,
+                            &settings.detection_face_model_sha256,
+                        ]
+                        .iter()
+                        .any(|h| {
+                            h.as_ref().is_none_or(|h| {
+                                h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit())
+                            })
+                        })
+                        || settings.decoded_frame_max_bytes < 640 * 640 * 3
+                        || settings.max_pipeline_memory_bytes < 5 * 640 * 640 * 3
+                        || settings.detection_input_width != settings.detection_input_height
+                        || settings.detection_face_score_threshold_percent > 100
+                        || settings.detection_presence_freshness.as_secs_f64()
+                            < 1.0 / f64::from(settings.detection_sample_fps)
+                        || settings.detection_presence_confirmation.as_secs_f64()
+                            < 1.0 / f64::from(settings.detection_sample_fps))
+                {
+                    return Err(OneCameraConfigError::InvalidPresencePolicy);
+                }
+                surveillance_detector::inference::DetectionMode::PersonFace
+            }
+            "face" => {
+                if settings.detection_enabled
+                    && (settings.detection_face_model_path.is_none()
+                        || settings
+                            .detection_face_model_sha256
+                            .as_ref()
+                            .is_none_or(|hash| {
+                                hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit())
+                            })
+                        || settings.detection_face_score_threshold_percent > 100)
+                {
+                    return Err(OneCameraConfigError::InvalidFaceConfiguration);
+                }
+                settings.detection_model_path = settings.detection_face_model_path.take();
+                settings.detection_model_sha256 = settings.detection_face_model_sha256.take();
+                settings.detection_score_threshold_percent =
+                    settings.detection_face_score_threshold_percent;
+                if settings.detection_enabled
+                    && (settings.detection_input_width != 640
+                        || settings.detection_input_height != 640)
+                {
+                    return Err(OneCameraConfigError::InvalidFaceConfiguration);
+                }
+                surveillance_detector::inference::DetectionMode::Face
+            }
+            _ => return Err(OneCameraConfigError::InvalidDetectionMode),
+        };
         let model_frame_bytes = usize::try_from(settings.detection_input_width)
             .ok()
             .and_then(|width| width.checked_mul(settings.detection_input_height as usize))
@@ -317,7 +438,15 @@ impl OneCameraConfig {
             .checked_add(fragment_buffers)
             .and_then(|bytes| {
                 bytes.checked_add(if settings.detection_enabled {
-                    settings.decoded_frame_max_bytes.checked_mul(2)?
+                    settings.decoded_frame_max_bytes.checked_mul(
+                        if detection_mode
+                            == surveillance_detector::inference::DetectionMode::PersonFace
+                        {
+                            7
+                        } else {
+                            2
+                        },
+                    )?
                 } else {
                     0
                 })
@@ -356,6 +485,12 @@ impl OneCameraConfig {
             detection_sample_rate,
             detection_max_gap: settings.detection_max_gap,
             decoded_frame_max_bytes: settings.decoded_frame_max_bytes,
+            detection_mode,
+            face_inference,
+            presence_policy,
+            face_sample_fps: settings.detection_face_sample_fps,
+            inference_concurrency: settings.detection_inference_concurrency,
+            detection_overlay_max_age: settings.detection_overlay_max_age,
             inference: InferenceBackendConfig {
                 model_path: settings.detection_model_path,
                 model_sha256: settings.detection_model_sha256,
@@ -415,6 +550,10 @@ pub enum OneCameraConfigError {
     LiveQueue(QueueCapacityError),
     DetectionQueue(QueueCapacityError),
     DetectionSampleRate(SamplerError),
+    InvalidDetectionMode,
+    InvalidPresencePolicy,
+    InvalidOverlayAge,
+    InvalidFaceConfiguration,
     ZeroDetectionMaximumGap,
     DecodedFrameBudgetTooSmall,
     EmptyDetectionDecoder,
@@ -468,6 +607,16 @@ mod tests {
             decoded_frame_max_bytes: 2560 * 1440 * 3,
             detection_decoder: PathBuf::from("ffmpeg"),
             detection_decode_timeout: Duration::from_secs(2),
+            detection_presence_confirmation: Duration::from_secs(1),
+            detection_presence_grace: Duration::from_secs(1),
+            detection_presence_freshness: Duration::from_secs(1),
+            detection_face_sample_fps: 5,
+            detection_inference_concurrency: 4,
+            detection_mode: "person".to_owned(),
+            detection_overlay_max_age: Duration::from_secs(3),
+            detection_face_model_path: None,
+            detection_face_model_sha256: None,
+            detection_face_score_threshold_percent: 70,
             detection_model_path: None,
             detection_model_sha256: None,
             detection_input_width: 416,
@@ -497,6 +646,45 @@ mod tests {
             reconciliation_scan_entries: 100_000,
             livekit: None,
         }
+    }
+
+    #[test]
+    fn overlay_expiry_is_validated_and_disabled_face_mode_needs_no_artifact() {
+        let mut settings = valid();
+        settings.detection_overlay_max_age = Duration::ZERO;
+        assert!(matches!(
+            OneCameraConfig::validate(settings),
+            Err(OneCameraConfigError::InvalidOverlayAge)
+        ));
+        let mut settings = valid();
+        settings.detection_mode = "face".to_owned();
+        settings.detection_enabled = false;
+        assert!(OneCameraConfig::validate(settings).is_ok());
+    }
+
+    #[test]
+    fn face_configuration_is_distinct_pinned_and_bounded() {
+        let mut settings = valid();
+        settings.detection_mode = "face".to_owned();
+        assert!(matches!(
+            OneCameraConfig::validate(settings),
+            Err(OneCameraConfigError::InvalidFaceConfiguration)
+        ));
+        let mut settings = valid();
+        settings.detection_mode = "face".to_owned();
+        settings.detection_face_model_path = Some("face.onnx".into());
+        settings.detection_face_model_sha256 = Some("a".repeat(64));
+        settings.detection_input_width = 640;
+        settings.detection_input_height = 640;
+        settings.decoded_frame_max_bytes = 640 * 640 * 3;
+        let config = OneCameraConfig::validate(settings).unwrap();
+        assert_eq!(
+            config.detection_mode,
+            surveillance_detector::inference::DetectionMode::Face
+        );
+        assert_eq!(config.inference.model_path, Some("face.onnx".into()));
+        assert_eq!(config.inference.score_threshold_percent, 70);
+        assert_eq!(config.inference.input_width, 640);
     }
 
     #[test]

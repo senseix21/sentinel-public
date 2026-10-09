@@ -440,6 +440,26 @@ settings! {
     CameraDetectionDecodeTimeout =>
         "camera.detection.decode_timeout", Operational, PipelineRestart, Public, PerCamera,
         Duration, [];
+    CameraDetectionOverlayMaxAge =>
+        "camera.detection.overlay_max_age", Operational, PipelineRestart, Public, PerCamera, Duration, [];
+    CameraDetectionPresenceConfirmation =>
+        "camera.detection.presence_confirmation_duration", Operational, PipelineRestart, Public, PerCamera, Duration, [];
+    CameraDetectionPresenceGrace =>
+        "camera.detection.presence_grace_duration", Operational, PipelineRestart, Public, PerCamera, Duration, [];
+    CameraDetectionPresenceFreshness =>
+        "camera.detection.presence_freshness_duration", Operational, PipelineRestart, Public, PerCamera, Duration, [];
+    CameraDetectionFaceSampleFps =>
+        "camera.detection.face_sample_fps", Operational, PipelineRestart, Public, PerCamera, Unsigned, [];
+    CameraDetectionInferenceConcurrency =>
+        "detection.inference_concurrency", Operational, ProcessRestart, Public, Global, Unsigned, [];
+    CameraDetectionMode =>
+        "camera.detection.mode", Operational, PipelineRestart, Public, PerCamera, Text, [];
+    CameraDetectionFaceModelPath =>
+        "camera.detection.face_model_path", Operational, PipelineRestart, Public, PerCamera, Path, [];
+    CameraDetectionFaceModelSha256 =>
+        "camera.detection.face_model_sha256", Operational, PipelineRestart, Public, PerCamera, Text, [];
+    CameraDetectionFaceScoreThresholdPercent =>
+        "camera.detection.face_score_threshold_percent", Operational, PipelineRestart, Public, PerCamera, Unsigned, [];
     CameraDetectionModelPath =>
         "camera.detection.model_path", Operational, PipelineRestart, Public, PerCamera, Path, [];
     CameraDetectionModelSha256 =>
@@ -779,6 +799,6 @@ mod tests {
     fn table_covers_the_documented_setting_count() {
         // Guards against an accidental deletion of a table row. The number is
         // the contracts table's row count; changing it is a deliberate act.
-        assert_eq!(SettingId::ALL.len(), 93);
+        assert_eq!(SettingId::ALL.len(), 103);
     }
 }

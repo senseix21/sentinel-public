@@ -56,11 +56,10 @@ const DETECTION_MAX_GAP_MS: &str = "SURVEILLANCE_DETECTION_MAX_GAP_MS";
 // `MODEL_SHA256` to match the file on disk.
 const DETECTION_MODEL_PATH: &str = "SURVEILLANCE_DETECTION_MODEL_PATH";
 const DETECTION_MODEL_SHA256: &str = "SURVEILLANCE_DETECTION_MODEL_SHA256";
-// Score and NMS thresholds, percent (0..=100). Default 30% is tuned for the
-// container accuracy tests; raise toward 60-70% to drop low-confidence
-// false positives such as hanging clothes or shadows in low-light webcam
-// footage. These apply to real inference only; the fixture backend ignores
-// them.
+// Score and NMS thresholds, percent (0..=100). The default score threshold
+// is 70%, as selected for local operation. These apply to real inference
+// only; the fixture backend ignores them. Explicit configuration overrides
+// the default.
 const DETECTION_SCORE_THRESHOLD_PERCENT: &str = "SURVEILLANCE_DETECTION_SCORE_THRESHOLD_PERCENT";
 const DETECTION_NMS_IOU_PERCENT: &str = "SURVEILLANCE_DETECTION_NMS_IOU_PERCENT";
 // Model input geometry. YOLOX-Tiny expects 416, YOLOX-S/M/L expect 640.
@@ -544,6 +543,101 @@ fn load_with(
     // Promote the fixture backend to the real ONNX one when both env vars are
     // set and non-empty. Either one alone keeps the fixture: a path without a
     // SHA cannot be verified, and a SHA without a path has nothing to apply to.
+    let camera =
+        surveillance_common::types::CameraId::new(settings.camera_id.clone()).map_err(|_| {
+            EnvironmentConfigError::InvalidEnvironment("invalid camera identifier".to_owned())
+        })?;
+    if let Some(value) = resolved.effective(SettingId::CameraDetectionOverlayMaxAge, Some(&camera))
+    {
+        if let SettingValue::Duration(age) = value.value() {
+            settings.detection_overlay_max_age = *age;
+        }
+    }
+    for (id, target) in [
+        (
+            SettingId::CameraDetectionPresenceConfirmation,
+            &mut settings.detection_presence_confirmation,
+        ),
+        (
+            SettingId::CameraDetectionPresenceGrace,
+            &mut settings.detection_presence_grace,
+        ),
+        (
+            SettingId::CameraDetectionPresenceFreshness,
+            &mut settings.detection_presence_freshness,
+        ),
+    ] {
+        if let Some(value) = resolved.effective(id, Some(&camera)) {
+            if let SettingValue::Duration(age) = value.value() {
+                *target = *age;
+            }
+        }
+    }
+    if let Some(value) = resolved.effective(SettingId::CameraDetectionFaceSampleFps, Some(&camera))
+    {
+        if let SettingValue::Unsigned(n) = value.value() {
+            settings.detection_face_sample_fps = u16::try_from(*n).map_err(|_| {
+                EnvironmentConfigError::InvalidEnvironment(
+                    "face sample FPS out of range".to_owned(),
+                )
+            })?;
+        }
+    }
+    if let Some(value) = resolved.effective(SettingId::CameraDetectionInferenceConcurrency, None) {
+        if let SettingValue::Unsigned(n) = value.value() {
+            settings.detection_inference_concurrency = usize::try_from(*n).map_err(|_| {
+                EnvironmentConfigError::InvalidEnvironment(
+                    "inference concurrency out of range".to_owned(),
+                )
+            })?;
+        }
+    }
+    let configured_text = |id| {
+        resolved
+            .effective(id, Some(&camera))
+            .and_then(|value| match value.value() {
+                SettingValue::Text(text) => Some(text.clone()),
+                _ => None,
+            })
+    };
+    let configured_path = |id| {
+        resolved
+            .effective(id, Some(&camera))
+            .and_then(|value| match value.value() {
+                SettingValue::Path(path) => Some(path.clone()),
+                _ => None,
+            })
+    };
+    settings.detection_mode = lookup("SURVEILLANCE_DETECTION_MODE")
+        .or_else(|| configured_text(SettingId::CameraDetectionMode))
+        .unwrap_or_else(|| "person".to_owned());
+    settings.detection_face_model_path = lookup("SURVEILLANCE_DETECTION_FACE_MODEL_PATH")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| configured_path(SettingId::CameraDetectionFaceModelPath));
+    settings.detection_face_model_sha256 = lookup("SURVEILLANCE_DETECTION_FACE_MODEL_SHA256")
+        .filter(|s| !s.is_empty())
+        .or_else(|| configured_text(SettingId::CameraDetectionFaceModelSha256));
+    if let Some(value) = lookup("SURVEILLANCE_DETECTION_FACE_SCORE_THRESHOLD_PERCENT") {
+        settings.detection_face_score_threshold_percent =
+            value.parse::<u8>().ok().filter(|p| *p <= 100).ok_or(
+                EnvironmentConfigError::InvalidEnvironment(
+                    "face confidence must be 0..=100".to_owned(),
+                ),
+            )?;
+    } else if let Some(value) = resolved.effective(
+        SettingId::CameraDetectionFaceScoreThresholdPercent,
+        Some(&camera),
+    ) {
+        if let SettingValue::Unsigned(percent) = value.value() {
+            settings.detection_face_score_threshold_percent = u8::try_from(*percent)
+                .ok()
+                .filter(|p| *p <= 100)
+                .ok_or(EnvironmentConfigError::InvalidEnvironment(
+                    "face confidence must be 0..=100".to_owned(),
+                ))?;
+        }
+    }
     let model_path = lookup(DETECTION_MODEL_PATH).filter(|s| !s.is_empty());
     let model_sha256 = lookup(DETECTION_MODEL_SHA256).filter(|s| !s.is_empty());
     if let (Some(path), Some(sha)) = (model_path, model_sha256) {
@@ -556,6 +650,10 @@ fn load_with(
     if let Some(percent) = parse_percent_u8(&lookup, DETECTION_NMS_IOU_PERCENT) {
         settings.detection_nms_iou_percent = percent;
     }
+    if settings.detection_mode == "face" {
+        settings.detection_input_width = 640;
+        settings.detection_input_height = 640;
+    }
     if let Some(value) = lookup(DETECTION_INPUT_WIDTH).and_then(|v| v.parse::<u32>().ok()) {
         settings.detection_input_width = value;
     }
@@ -567,8 +665,11 @@ fn load_with(
     // it; otherwise YOLOX-S/M at 640x640 fails startup with
     // `DecodedFrameBudgetTooSmall`. We raise, never lower — a user that
     // explicitly sets a smaller input is not punished for it.
-    let needed =
-        u64::from(settings.detection_input_width) * u64::from(settings.detection_input_height) * 3;
+    let needed = if settings.detection_mode == "person_face" {
+        640 * 640 * 3
+    } else {
+        u64::from(settings.detection_input_width) * u64::from(settings.detection_input_height) * 3
+    };
     if (settings.decoded_frame_max_bytes as u64) < needed {
         if let Ok(needed_usize) = usize::try_from(needed) {
             settings.decoded_frame_max_bytes = needed_usize;

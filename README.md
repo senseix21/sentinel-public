@@ -68,7 +68,8 @@ List AVFoundation devices:
 make webcam-devices
 ```
 
-The launcher defaults to video device `0` only for local development. On first
+The launcher defaults to video device `0` at 1280×720 and 30 FPS for local development.
+Override `VIDEO_FPS` with a mode supported by your camera. On first
 use, macOS may ask for camera access.
 Grant the terminal application access under **System Settings -> Privacy &
 Security -> Camera**.
@@ -81,7 +82,7 @@ Start the stack:
 make run
 ```
 
-Then open:
+The launcher opens the development login page automatically:
 
 ```text
 http://127.0.0.1:3001/
@@ -141,6 +142,28 @@ Persistent local state defaults to:
 .local/webcam-run/pgdata persistent PostgreSQL data
 recordings/          finalized and partial recording segments
 ```
+
+The HTTP server and development login proxy listen on loopback. LiveKit WebRTC
+media uses the machine's active private IPv4 address, with UDP on `LIVEKIT_PORT + 2`
+(7882 by default); TCP fallback is disabled. This supports browsers that reject
+loopback ICE. Media still requires a signed, camera-scoped viewer token.
+
+Set `LIVEKIT_MEDIA_IP=127.0.0.1` for loopback-only media, or choose a private IPv4
+address assigned to this machine to override automatic route selection. The
+launcher prints the selected media address. With loopback-only media, Firefox
+may need `media.peerconnection.ice.loopback=true` in `about:config`. Multiple
+tabs receive distinct viewer identities so they cannot evict one another.
+
+To qualify actual browser decoding while the stack is running, supply Playwright
+from a separate installation and run:
+
+```bash
+PLAYWRIGHT_MODULE_PATH=/path/to/node_modules/playwright make verify-live-browser
+```
+
+Install Playwright's Chromium browser in that installation first. The check logs
+in, uses a separate development viewer identity, and requires playback and decoded
+frame counts to advance across multiple dashboard refreshes.
 
 ## Security model
 
@@ -231,9 +254,44 @@ For the local stack:
 - **System** reports server capabilities and dependency state.
 - **Logout** revokes the in-memory development session.
 
-Detection is disabled by `make run` because the repository has no production
-model. Enabling fake inference would spend decode resources and display
-synthetic facts as if they represented a real detector.
+`make run` and `make run-release` enable real ONNX inference by default.
+They select **person presence with face-only boxes** (`person_face`) at a 70% confidence threshold. On first use
+they download the checksum-verified YOLOX person model, YuNet face model and pinned
+ONNX Runtime 1.28.3 into `.local/onnx/`. The runtime bundle supports Apple Silicon
+macOS and Linux x64/ARM64; other hosts must supply `ORT_DYLIB_PATH`.
+The default detection confidence threshold is 70%. Override it with
+`SURVEILLANCE_DETECTION_FACE_SCORE_THRESHOLD_PERCENT` (0–100); changes require a
+camera pipeline restart.
+This development model has not been qualified for production surveillance accuracy.
+
+Set `SURVEILLANCE_DETECTION_ENABLED=false` to skip inference and artifact downloads,
+and `SENTINEL_OPEN_BROWSER=false` to skip opening the browser. Face overrides use
+`SURVEILLANCE_DETECTION_FACE_MODEL_PATH` and
+`SURVEILLANCE_DETECTION_FACE_MODEL_SHA256`; this adapter requires a YuNet-compatible
+640×640 artifact. The live UI shows faces detected, with no recognition or unique
+identity count. No outlines are burned into recordings.
+
+Set `SURVEILLANCE_DETECTION_MODE=person` to retain the YOLOX person path. Its custom
+model overrides are `SURVEILLANCE_DETECTION_MODEL_PATH` and
+`SURVEILLANCE_DETECTION_MODEL_SHA256`, with `SURVEILLANCE_DETECTION_INPUT_WIDTH`
+and `_HEIGHT` matching its geometry. Set `ORT_DYLIB_PATH` to use an installed
+compatible runtime. See [face detection specification](docs/face-detection/SPEC.md)
+and [ADR 016](docs/adr/016-face-only-live-detection.md).
+[Combined mode](docs/person-presence/SPEC.md) uses independent person and face lanes.
+Back-facing fixture evidence stays in the presence readout without drawing a body box.
+See [qualification and remaining reliability gates](docs/person-presence/VERIFICATION.md).
+Set `SURVEILLANCE_DETECTION_MODE=face` to restore face-only mode.
+
+To qualify real face observations in the running browser alongside decoded video,
+run `SENTINEL_EXPECT_FACE=true make verify-live-browser` with Playwright supplied
+through `PLAYWRIGHT_MODULE_PATH`. See [verification evidence and open gates](docs/face-detection/VERIFICATION.md).
+
+Overlay expiry defaults to three seconds. Set the validated duration
+`SURVEILLANCE_CAMERA_DETECTION_OVERLAY_MAX_AGE` (for example `5s`, at most `60s`);
+it applies after a pipeline restart. Camera health exposes `detection_mode` and
+`detection_overlay_max_age_ms`; face-mode live packets use `face/v1`.
+The macOS release build currently requires `CARGO_PROFILE_RELEASE_STRIP=none`
+to avoid the documented SQLx proc-macro linker issue.
 
 ## HTTP API
 

@@ -54,6 +54,7 @@ pub struct PublicationCounters {
     /// Internal restarts the adapter last reported. Climbing here with a
     /// healthy state is a live view that is degraded and says it is not.
     pub adapter_restarts: u64,
+    pub detection_packets_dropped: u64,
     pub send_failures: u64,
     pub shutdown_failures: u64,
     pub timestamp_authority: TimestampAuthority,
@@ -83,6 +84,7 @@ struct CounterState {
     adapter_viewers: AtomicU64,
     adapter_media_produced: AtomicU64,
     adapter_restarts: AtomicU64,
+    detection_packets_dropped: AtomicU64,
     send_failures: AtomicU64,
     shutdown_failures: AtomicU64,
 }
@@ -141,6 +143,7 @@ impl PublicationHealth {
                 adapter_viewers: load(&self.0.counters.adapter_viewers),
                 adapter_media_produced: load(&self.0.counters.adapter_media_produced),
                 adapter_restarts: load(&self.0.counters.adapter_restarts),
+                detection_packets_dropped: load(&self.0.counters.detection_packets_dropped),
                 send_failures: load(&self.0.counters.send_failures),
                 shutdown_failures: load(&self.0.counters.shutdown_failures),
                 timestamp_authority: self.0.timestamp_authority,
@@ -153,6 +156,9 @@ impl PublicationHealth {
     /// values, and adding them here would double-count every sample.
     fn record_adapter(&self, observation: AdapterObservation) {
         let counters = &self.0.counters;
+        counters
+            .detection_packets_dropped
+            .store(observation.detection_packets_dropped, Ordering::Relaxed);
         counters
             .adapter_viewers
             .store(observation.viewers, Ordering::Relaxed);

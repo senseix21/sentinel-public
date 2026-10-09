@@ -400,6 +400,8 @@ Add sampled human detection as an independently degradable media consumer and pu
 - [x] Separate immutable past-tense events from commands.
 - [x] Publish camera, recording, storage, and detection lifecycle events without transporting media payloads.
 - [x] Persist externally relevant event versions where required.
+- [x] Implement local [continuous person presence with face-only overlays](docs/person-presence/SPEC.md): bounded dual-model lanes, time-based uncertain tracking and independent capability health. Real back-facing RTSP/browser and invalid-face-model isolation passed. [Verification](docs/person-presence/VERIFICATION.md) records open production gates, including a longer-run recorder-backpressure failure.
+- [x] Add face-only live detection as the reversible `make run` default at 70%, with distinct bounded face events, `face/v1`, camera-scoped boxes and no identity counting. Real-model fixtures, two Chromium viewers and detector-failure recording isolation passed. See [ADR 016](docs/adr/016-face-only-live-detection.md) and [qualification evidence](docs/face-detection/VERIFICATION.md); representative accuracy, Firefox and multi-camera capacity remain open.
 - [x] Assign stable cross-frame identities to detections via an IoU tracker and surface them on `PersonDetectionObserved` alongside a `results_are_fixture` flag. `crates/detector/src/tracker.rs`, `docs/superpowers/specs/2026-10-04-detection-overlay-design.md`.
 - [x] Relay tracked detections to the live-view client over the LiveKit data channel (topic `det/v1`, lossy), with session-owned shutdown so no stale relay survives a reconnect. `crates/livekit/src/relay.rs`.
 - [x] Draw tracked bounding boxes client-side on a canvas over each tile with letterbox-aware coordinate mapping, a 3-second staleness blank, and a server-authoritative `results_are_fixture` guard that shows a "detection unavailable" badge instead of boxes. Browser-verified against mocked packets; full-pipeline session awaits a configured camera. `apps/server/ui/js/detection-overlay.js`.
@@ -494,6 +496,16 @@ remains unconfirmed**, which blocks items 8 and 9 in part.
 - [!] Fuzz externally supplied parsers and range/configuration inputs where useful. Not implemented: `cargo-fuzz` needs a nightly toolchain, and adding one to a gate pinned to stable 1.88 with `unsafe_code = "forbid"` is its own decision. Targets are named and prioritised in `docs/phase-8/dependency-policy.md`. Existing hand-chosen rejection tests are not a substitute and are not reported as one.
 
 ### Operator dashboard (not a Phase 8 instruction; recorded because it ships)
+
+- [~] Local live decoding qualified on 2026-10-09 after a reported blank-video
+  failure: signalling succeeded but ICE received zero bytes because the dev SFU
+  advertised an automatically selected network interface. Explicit loopback RTC
+  configuration restored 1280×720 Chromium playback. `make verify-live-browser`
+  asserts advancing playback and decoded-frame counts across multiple dashboard
+  refreshes; the separate real-LiveKit regression checks the launcher's selected
+  address and listening sockets. Evidence in `context/2026-10-09-0049/`.
+  This is one local webcam/Chromium run, not Firefox, multi-camera or production
+  network qualification.
 
 - [~] A framework-free browser dashboard exists at `GET /` and `GET /ui`.
   Its shell, four CSS files, composition root, domain modules, components,

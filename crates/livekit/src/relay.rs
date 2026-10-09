@@ -93,12 +93,29 @@ impl DetectionPacket {
 pub struct DetectionRelay {
     sub: EventSubscription,
     participant: LocalParticipant,
+    namespace: String,
+    room: crate::domain::RoomName,
+    sequence: u64,
+    counters: Arc<crate::transcode::TranscodeCounters>,
 }
 
 impl DetectionRelay {
     #[must_use]
-    pub const fn new(sub: EventSubscription, participant: LocalParticipant) -> Self {
-        Self { sub, participant }
+    pub const fn new(
+        sub: EventSubscription,
+        participant: LocalParticipant,
+        namespace: String,
+        room: crate::domain::RoomName,
+        counters: Arc<crate::transcode::TranscodeCounters>,
+    ) -> Self {
+        Self {
+            sub,
+            participant,
+            namespace,
+            room,
+            sequence: 0,
+            counters,
+        }
     }
 
     /// Runs until the shutdown signal fires or the event bus closes.
@@ -123,7 +140,59 @@ impl DetectionRelay {
         }
     }
 
-    async fn handle(&self, event: &Arc<DomainEvent>) {
+    async fn handle(&mut self, event: &Arc<DomainEvent>) {
+        let Some(camera) = event.camera_id.as_ref() else {
+            return;
+        };
+        if !event_matches_room(camera, &self.namespace, &self.room) {
+            return;
+        }
+        if let EventPayload::PersonPresenceObserved {
+            media_time,
+            session,
+            results_are_fixture,
+            presence,
+        } = &event.payload
+        {
+            self.sequence = self.sequence.saturating_add(1);
+            let (observed, uncertain, tentative) = presence.counts();
+            let packet = PresencePacket {
+                camera_id: camera.as_str().to_owned(),
+                epoch: media_time.epoch.to_string(),
+                sequence: self.sequence.to_string(),
+                session: session.to_string(),
+                media_ticks: media_time.ticks.to_string(),
+                timebase_hz: media_time.timebase_hz.get(),
+                results_are_fixture: *results_are_fixture,
+                available: presence.available(),
+                saturated: presence.saturated(),
+                observed,
+                uncertain,
+                tentative,
+            };
+            self.send(&packet, PRESENCE_TOPIC).await;
+            return;
+        }
+        if let EventPayload::FaceDetectionObserved {
+            session,
+            media_time,
+            detections,
+            results_are_fixture,
+            ..
+        } = &event.payload
+        {
+            self.sequence = self.sequence.saturating_add(1);
+            let mut packet = FacePacket::new(
+                camera.as_str(),
+                media_time,
+                detections,
+                *results_are_fixture,
+                self.sequence,
+            );
+            packet.session = session.map(|s| s.to_string());
+            self.send(&packet, FACE_TOPIC).await;
+            return;
+        }
         let EventPayload::PersonDetectionObserved {
             media_time,
             detections,
@@ -144,21 +213,109 @@ impl DetectionRelay {
             detections,
             *results_are_fixture,
         );
-        let payload = match serde_json::to_vec(&packet) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                warn!(?error, "DetectionRelay: serialise failed");
+        self.send(&packet, DETECTION_TOPIC).await;
+    }
+    async fn send<T: Serialize>(&self, packet: &T, topic: &str) {
+        let payload = match serde_json::to_vec(packet) {
+            Ok(bytes) if bytes.len() <= MAX_DETECTION_PACKET_BYTES => bytes,
+            _ => {
+                self.counters
+                    .relay_dropped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!("DetectionRelay: oversized or unserializable packet dropped");
                 return;
             }
         };
         let data = DataPacket {
             payload,
-            topic: Some(DETECTION_TOPIC.to_owned()),
+            topic: Some(topic.to_owned()),
             reliable: false,
             destination_identities: vec![],
         };
         if let Err(error) = self.participant.publish_data(data).await {
+            self.counters
+                .relay_dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             warn!(?error, "DetectionRelay: publish_data failed");
+        }
+    }
+}
+
+pub const PRESENCE_TOPIC: &str = "presence/v1";
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PresencePacket {
+    pub camera_id: String,
+    pub epoch: String,
+    pub sequence: String,
+    pub session: String,
+    pub media_ticks: String,
+    pub timebase_hz: u64,
+    pub results_are_fixture: bool,
+    pub available: bool,
+    pub saturated: bool,
+    pub observed: usize,
+    pub uncertain: usize,
+    pub tentative: usize,
+}
+
+pub const FACE_TOPIC: &str = "face/v1";
+pub const MAX_DETECTION_PACKET_BYTES: usize = 16 * 1024;
+fn event_matches_room(
+    camera: &surveillance_common::types::CameraId,
+    namespace: &str,
+    room: &crate::domain::RoomName,
+) -> bool {
+    crate::domain::PublicationIdentity::for_camera(namespace, camera)
+        .is_ok_and(|identity| identity.room == *room)
+}
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FaceEntry {
+    pub left: f32,
+    pub top: f32,
+    pub width: f32,
+    pub height: f32,
+    pub confidence: f32,
+}
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FacePacket {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    pub camera_id: String,
+    pub epoch: String,
+    pub sequence: String,
+    pub media_ticks: String,
+    pub timebase_hz: u64,
+    pub results_are_fixture: bool,
+    pub detections: Vec<FaceEntry>,
+}
+impl FacePacket {
+    #[must_use]
+    pub fn new(
+        camera: &str,
+        time: &SourceMediaTime,
+        set: &surveillance_events::event::FaceDetectionSet,
+        fixture: bool,
+        sequence: u64,
+    ) -> Self {
+        Self {
+            session: None,
+            camera_id: camera.to_owned(),
+            epoch: time.epoch.to_string(),
+            sequence: sequence.to_string(),
+            media_ticks: time.ticks.to_string(),
+            timebase_hz: time.timebase_hz.get(),
+            results_are_fixture: fixture,
+            detections: set
+                .as_slice()
+                .iter()
+                .map(|face| FaceEntry {
+                    left: face.bounding_box.left(),
+                    top: face.bounding_box.top(),
+                    width: face.bounding_box.width(),
+                    height: face.bounding_box.height(),
+                    confidence: face.confidence.get(),
+                })
+                .collect(),
         }
     }
 }
@@ -177,6 +334,38 @@ mod tests {
             ticks,
             timebase_hz: NonZeroU64::new(90_000).unwrap(),
         }
+    }
+
+    #[test]
+    fn face_packets_are_distinct_scoped_and_within_wire_bound() {
+        use surveillance_events::event::{FaceDetection, FaceDetectionSet};
+        let camera = surveillance_common::types::CameraId::new("camera-01").unwrap();
+        let room = crate::domain::PublicationIdentity::for_camera("dev", &camera)
+            .unwrap()
+            .room;
+        assert!(event_matches_room(&camera, "dev", &room));
+        assert!(!event_matches_room(
+            &surveillance_common::types::CameraId::new("other").unwrap(),
+            "dev",
+            &room
+        ));
+        let face = FaceDetection {
+            confidence: Confidence::new(0.7).unwrap(),
+            bounding_box: NormalizedBoundingBox::new(0.1, 0.1, 0.2, 0.2).unwrap(),
+        };
+        let packet = FacePacket::new(
+            camera.as_str(),
+            &source_time(u64::MAX, 100),
+            &FaceDetectionSet::new(vec![face; 64]).unwrap(),
+            false,
+            u64::MAX,
+        );
+        let bytes = serde_json::to_vec(&packet).unwrap();
+        assert!(bytes.len() < MAX_DETECTION_PACKET_BYTES);
+        let decoded: FacePacket = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.epoch, u64::MAX.to_string());
+        assert_eq!(decoded.sequence, u64::MAX.to_string());
+        assert!(!String::from_utf8(bytes).unwrap().contains("track_id"));
     }
 
     #[test]

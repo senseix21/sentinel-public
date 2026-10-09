@@ -66,7 +66,17 @@ impl DevelopmentTokenService {
     pub fn issue_for_camera(&self, camera: &CameraId) -> Result<ViewerAccess, TokenIssueError> {
         let identity = PublicationIdentity::for_camera(&self.namespace, camera)
             .map_err(|_| TokenIssueError::Unavailable)?;
-        let viewer = ViewerIdentity::new(format!("development-viewer-{}", camera.as_str()))?;
+        // LiveKit evicts an existing participant when another joins with the
+        // same identity. Each issuance represents an independent viewer session,
+        // including separate tabs for the same camera. Randomness also prevents
+        // identity reuse across server restarts; it carries no additional grants.
+        let mut nonce = [0_u8; 16];
+        getrandom::fill(&mut nonce).map_err(|_| TokenIssueError::Unavailable)?;
+        let viewer = ViewerIdentity::new(format!(
+            "development-viewer-{}-{:032x}",
+            camera.as_str(),
+            u128::from_be_bytes(nonce)
+        ))?;
         self.issuer.issue(&viewer, &identity.room)
     }
 }
@@ -317,5 +327,39 @@ mod tests {
         assert_eq!(claims.video.room, config.identity.room.as_str());
         assert!(access.expires_in_seconds() <= 60);
         assert!(!format!("{issuer:?}").contains("development-secret"));
+    }
+
+    #[test]
+    fn independent_development_viewers_do_not_share_a_room_identity() {
+        let config = config();
+        let service =
+            DevelopmentTokenService::new(&config, "test".to_owned(), Duration::from_secs(60))
+                .unwrap_or_else(|error| panic!("{error}"));
+        let camera = CameraId::new("camera-01").unwrap_or_else(|error| panic!("{error}"));
+        let first = service
+            .issue_for_camera(&camera)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let second = service
+            .clone()
+            .issue_for_camera(&camera)
+            .unwrap_or_else(|error| panic!("{error}"));
+        let first =
+            Claims::from_unverified(first.token()).unwrap_or_else(|error| panic!("{error}"));
+        let second =
+            Claims::from_unverified(second.token()).unwrap_or_else(|error| panic!("{error}"));
+        assert_ne!(
+            first.sub, second.sub,
+            "a second tab must not evict the first viewer"
+        );
+        for claims in [first, second] {
+            assert_eq!(claims.video.room, config.identity.room.as_str());
+            assert!(claims.video.room_join && claims.video.can_subscribe);
+            assert!(
+                !claims.video.can_publish
+                    && !claims.video.can_publish_data
+                    && !claims.video.room_admin
+            );
+            assert!(ViewerIdentity::new(claims.sub).is_ok());
+        }
     }
 }

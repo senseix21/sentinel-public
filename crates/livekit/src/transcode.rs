@@ -78,6 +78,8 @@ pub struct TranscodeCounters {
     /// and (on the restart path) all `LocalTrackRepublished` dispatches.
     /// Safe to gate a re-join on: once this fires, the track is subscribable.
     pub reconnections: AtomicU64,
+    /// Detection packets lost to the wire bound or transport failure.
+    pub relay_dropped: AtomicU64,
 }
 
 /// Subscribes to the event bus and spawns a `DetectionRelay` on the room's
@@ -89,6 +91,9 @@ pub struct TranscodeCounters {
 fn spawn_detection_relay(
     bus: &surveillance_events::bus::EventBus,
     participant: livekit::participant::LocalParticipant,
+    namespace: String,
+    room: crate::domain::RoomName,
+    counters: Arc<TranscodeCounters>,
 ) -> (
     Option<tokio::task::JoinHandle<()>>,
     Option<tokio::sync::watch::Sender<bool>>,
@@ -103,7 +108,7 @@ fn spawn_detection_relay(
         tracing::warn!("DetectionRelay: event bus refused subscription");
         return (None, None);
     };
-    let relay = DetectionRelay::new(sub, participant);
+    let relay = DetectionRelay::new(sub, participant, namespace, room, counters);
     let (tx, rx) = tokio::sync::watch::channel(false);
     let handle = tokio::spawn(relay.run(rx));
     (Some(handle), Some(tx))
@@ -112,6 +117,7 @@ fn spawn_detection_relay(
 /// Publishes a camera into a `LiveKit` room by decoding and re-encoding it.
 pub struct TranscodePublicationAdapter {
     identity: PublicationIdentity,
+    deployment_namespace: String,
     tokens: PublisherTokenIssuer,
     endpoint: String,
     decoder_program: String,
@@ -191,6 +197,7 @@ impl TranscodePublicationAdapter {
         })?;
         Ok(Self {
             identity: config.identity.clone(),
+            deployment_namespace: config.deployment_namespace.clone(),
             tokens,
             endpoint: config.endpoint.as_str().to_owned(),
             decoder_program: config.decoder_program.clone(),
@@ -397,6 +404,7 @@ impl PublicationAdapter for TranscodePublicationAdapter {
             viewers: u64::try_from(self.viewers()).unwrap_or(u64::MAX),
             media_produced: self.counters.frames_published.load(Ordering::Relaxed),
             restarts: self.counters.decoder_restarts.load(Ordering::Relaxed),
+            detection_packets_dropped: self.counters.relay_dropped.load(Ordering::Relaxed),
         }
     }
 
@@ -439,7 +447,13 @@ impl PublicationAdapter for TranscodePublicationAdapter {
             // `LocalParticipant` is `Clone`; `Room` is not, so we hand the
             // relay the participant handle instead of a `Room` reference.
             let (relay_handle, relay_shutdown) = match self.event_bus.as_ref() {
-                Some(bus) => spawn_detection_relay(bus, room.local_participant()),
+                Some(bus) => spawn_detection_relay(
+                    bus,
+                    room.local_participant(),
+                    self.deployment_namespace.clone(),
+                    self.identity.room.clone(),
+                    Arc::clone(&self.counters),
+                ),
                 None => (None, None),
             };
 

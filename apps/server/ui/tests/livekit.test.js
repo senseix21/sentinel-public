@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createLiveKitOwner } from "../js/livekit.js";
+import { createLiveKitOwner, localFirefoxHelp } from "../js/livekit.js";
 
 function owner(overrides = {}) {
   return createLiveKitOwner({
@@ -202,6 +202,55 @@ test("stopLive cancels reconnect intent", async () => {
     assert.equal(sessions.live.desired.has("north"), false);
     assert.equal(sessions.live.retries.has("north"), false);
     assert.deepEqual(cleared, [42]);
+  } finally {
+    globalThis.document = previousDocument;
+  }
+});
+
+
+test("Firefox loopback guidance applies only to a local Firefox viewer", () => {
+  const firefox = "Mozilla/5.0 Firefox/157.0";
+  for (const endpoint of ["ws://127.0.0.1:7880", "ws://localhost:7880", "ws://[::1]:7880"]) {
+    assert.match(localFirefoxHelp(endpoint, firefox), /media\.peerconnection\.ice\.loopback/);
+  }
+  assert.equal(localFirefoxHelp("wss://live.example.com", firefox), "");
+  assert.equal(localFirefoxHelp("ws://127.0.0.1:7880", "Chrome/156.0"), "");
+  assert.equal(localFirefoxHelp("not a URL", firefox), "");
+});
+
+test("local Firefox retry guidance survives dashboard reconciliation and clears on stop", async () => {
+  const previousDocument = globalThis.document;
+  let note = { dataset: { liveNote: "north" }, innerHTML: "" };
+  const video = { dataset: { liveTile: "north", liveWatchable: "" }, hidden: true, removeAttribute() {} };
+  globalThis.document = {
+    querySelectorAll(selector) {
+      if (selector.includes("data-live-note")) return [note];
+      if (selector.includes("data-live-tile")) return [video];
+      return [];
+    },
+  };
+  class Room {
+    on() {}
+    async connect() { throw new Error("ICE failed"); }
+    async disconnect() {}
+  }
+  try {
+    const sessions = owner({
+      api: async () => ({ endpoint: "ws://127.0.0.1:7880", token: "secret", room: "north" }),
+      sdkLoader: async () => ({ Room, RoomEvent: {}, Track: { Kind: { Video: "video" } } }),
+      userAgent: "Firefox/157.0",
+      banner: (_kind, title, detail) => title + " " + detail,
+      setRetryTimer: () => 1,
+      clearRetryTimer: () => {},
+    });
+    await sessions.startLive("north", video);
+    assert.match(note.innerHTML, /media\.peerconnection\.ice\.loopback/);
+    note = { dataset: { liveNote: "north" }, innerHTML: "" };
+    sessions.reattachLive();
+    assert.match(note.innerHTML, /media\.peerconnection\.ice\.loopback/);
+    await sessions.stopLive("north");
+    assert.equal(note.innerHTML, "");
+    assert.equal(sessions.live.notes.size, 0);
   } finally {
     globalThis.document = previousDocument;
   }
