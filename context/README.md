@@ -4,6 +4,8 @@ This directory contains compact, dated handoff snapshots. Its purpose is to let 
 
 ## Latest snapshot
 
+**2026-10-20 12:35 +06:** [`context/2026-10-20-1235/`](2026-10-20-1235/) — README startup/testing walkthrough; local system qualification passed initial live/recording checks but exposed live/detection stalls after RTSP recovery and failing dependency advisories. Read this snapshot before the historical entries below.
+
 **2026-10-09 23:36 +06:** [`context/2026-10-09-2336/`](2026-10-09-2336/) — combined default implemented; real back-facing RTSP/browser and face failure tests pass. Sustained recorder backpressure remains unresolved.
 
 **2026-10-09 17:38 +06:** [`context/2026-10-09-1738/`](2026-10-09-1738/) — specification for continuous person presence with face-only boxes; proposed bounded dual-model design, no runtime changes.
@@ -20,8 +22,8 @@ This directory contains compact, dated handoff snapshots. Its purpose is to let 
 
 Read in this order:
 
-1. [`next-actions.md`](2026-10-09-2336/next-actions.md) — remaining reliability and production gates.
-2. [`repository-status.md`](2026-10-09-2336/repository-status.md) — implementation and verification.
+1. [`next-actions.md`](2026-10-20-1235/next-actions.md) — remaining reliability and production gates.
+2. [`repository-status.md`](2026-10-20-1235/repository-status.md) — implementation and verification.
 3. [`architecture.md`](2026-10-09-2336/architecture.md) — combined mode and ownership.
 4. [`decisions-and-open-questions.md`](2026-10-09-2336/decisions-and-open-questions.md) — qualification gates.
 
