@@ -104,6 +104,7 @@ verify: ## Run the gate without the live advisory database (used by pull-request
 	bash -n scripts/dev/local-webcam-stack.sh scripts/dev/onnx-defaults.sh scripts/dev/livekit-config.sh scripts/phase9/direct-camera-qualification.sh
 	python3 -m unittest scripts/dev/test_trust_boundary_proxy.py scripts/dev/test_onnx_defaults.py scripts/dev/test_livekit_loopback.py scripts/phase9/test_direct_camera_report.py
 	"$(NODE)" --check scripts/dev/check-live-browser.cjs
+	"$(NODE)" --check scripts/dev/check-rtsp-recovery.cjs
 	"$(NODE)" --test apps/server/ui/tests/*.test.js
 	"$(CARGO)" fmt --all --check
 	"$(CARGO)" clippy --workspace --all-targets -- -D warnings

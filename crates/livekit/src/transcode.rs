@@ -158,6 +158,8 @@ struct PublishedTrack {
     source: NativeVideoSource,
     size: FrameSize,
     decoder: Option<H264ToI420>,
+    /// The decodable media run that owns this decoder, independent of the room.
+    decoder_epoch: Option<u64>,
 }
 
 impl TranscodePublicationAdapter {
@@ -292,6 +294,24 @@ impl Session {
         }
     }
 
+    /// Keep the room/track, but never reuse reference pictures across media runs.
+    async fn reset_decoder_epoch(&mut self, epoch: u64, counters: &TranscodeCounters) {
+        if let Some(track) = self.track.as_mut() {
+            if track
+                .decoder_epoch
+                .is_some_and(|previous| previous != epoch)
+            {
+                track.stop_decoder().await;
+                track.decoder_epoch = None;
+                counters.decoder_restarts.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn decoder_mut(&mut self) -> Option<&mut H264ToI420> {
+        self.track.as_mut().and_then(|track| track.decoder.as_mut())
+    }
+
     /// Creates and publishes the track at a geometry the stream itself declared.
     async fn publish(
         &mut self,
@@ -341,6 +361,7 @@ impl Session {
             source,
             size,
             decoder: None,
+            decoder_epoch: None,
         });
         Ok(())
     }
@@ -349,6 +370,7 @@ impl Session {
     fn start_decoder(
         &mut self,
         program: &str,
+        epoch: u64,
         decode_counters: &Arc<DecodeCounters>,
         counters: &Arc<TranscodeCounters>,
     ) -> Result<(), AdapterError> {
@@ -362,6 +384,7 @@ impl Session {
         let decoder = H264ToI420::spawn(program, track.size, sink, Arc::clone(decode_counters))
             .map_err(|error| AdapterError::new(start_failure_kind(error)))?;
         track.decoder = Some(decoder);
+        track.decoder_epoch = Some(epoch);
         Ok(())
     }
 
@@ -492,6 +515,10 @@ impl PublicationAdapter for TranscodePublicationAdapter {
             };
             session.refresh_viewers(counters);
 
+            session
+                .reset_decoder_epoch(access_unit.epoch, counters)
+                .await;
+
             if should_stop_publishing(
                 session.viewers,
                 Instant::now(),
@@ -510,11 +537,7 @@ impl PublicationAdapter for TranscodePublicationAdapter {
                 // grace. That preserves a current decoder and track for a
                 // quick route change without creating another queue or camera
                 // connection.
-                let Some(decoder) = session
-                    .track
-                    .as_mut()
-                    .and_then(|track| track.decoder.as_mut())
-                else {
+                let Some(decoder) = session.decoder_mut() else {
                     counters
                         .access_units_dropped
                         .fetch_add(1, Ordering::Relaxed);
@@ -553,14 +576,15 @@ impl PublicationAdapter for TranscodePublicationAdapter {
                     let size = publish_size(access_unit.annex_b, *max_publish_height)?;
                     session.publish(identity, size).await?;
                 }
-                session.start_decoder(decoder_program, decode_counters, counters)?;
+                session.start_decoder(
+                    decoder_program,
+                    access_unit.epoch,
+                    decode_counters,
+                    counters,
+                )?;
             }
 
-            let Some(decoder) = session
-                .track
-                .as_mut()
-                .and_then(|track| track.decoder.as_mut())
-            else {
+            let Some(decoder) = session.decoder_mut() else {
                 return Err(AdapterError::new(AdapterErrorKind::Connection));
             };
             match decoder.feed(access_unit.annex_b).await {

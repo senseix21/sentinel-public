@@ -52,7 +52,7 @@ same command to reuse the saved database and recordings.
 For a startup failure, inspect `.local/webcam-run/logs/build.log` and
 `.local/webcam-run/logs/server.log`. For device selection, optional settings,
 and recording checks, follow [the detailed startup guide](#start-the-system-step-by-step).
-The [latest verification](#latest-local-verification--2026-10-20) records the
+The [latest verification](#latest-local-verification--2026-10-23) records the
 remaining RTSP recovery, shutdown, build, and dependency-check failures.
 
 ## Documentation
@@ -826,6 +826,36 @@ RECORDING_ROOT=./.local/rtsp-test-recordings CAMERA_ID=qualification-01 make ver
 
 ### 7. Check recovery and sustained operation
 
+For the isolated file-backed stack above, enable the MediaMTX API on loopback in
+its YAML before starting MediaMTX:
+
+```yaml
+api: true
+apiAddress: 127.0.0.1:9997
+```
+
+Then run the automated recovery fixture (replace the source file with the same
+H.264 MP4 used by your publisher):
+
+```bash
+SENTINEL_RECOVERY_SOURCE=/absolute/path/source.mp4 \
+SENTINEL_RTSP_FIXTURE_URL=rtsp://127.0.0.1:8554/qualification \
+SENTINEL_RECOVERY_CAMERA=qualification-01 \
+PLAYWRIGHT_MODULE_PATH="$PWD/.local/browser-tests/node_modules/playwright" \
+node scripts/dev/check-rtsp-recovery.cjs
+```
+
+Run this only against the isolated development fixture: it disconnects the
+selected MediaMTX publisher, starts an owned replacement FFmpeg publisher, and
+stops that replacement when finished. Restart your original publisher afterward
+if you want to keep using the fixture. The test keeps two Chromium viewers open,
+requires a new camera epoch, advancing inference/publication, a complete new
+recording segment, advancing viewer frames and exactly one upstream reader.
+Recorder rejection/failure counters must not increase. It requires the ONNX
+combined detection configuration and a source that the browser can decode;
+this is a recovery check, not an accuracy or latency benchmark.
+
+
 While the file-backed stack is recording, stop only the RTSP publisher. Confirm
 liveness remains available, camera health reports degradation/reconnection, and
 logs explain the source loss. Restart the publisher and confirm a new connected
@@ -836,6 +866,38 @@ backpressure failure. Save `/metrics`, server/LiveKit logs, duration, completed
 segments and any partials. A short smoke test cannot close that reliability gate.
 Do not increase queue capacity to hide drops. Physical webcam, Firefox, genuine
 disk-full and 10/20-camera target-hardware tests remain separate qualifications.
+
+## Latest local verification — 2026-10-23
+
+The RTSP reconnect stalls observed on October 20 are fixed for the local fixture.
+Detection teardown now disconnects its full frame queue before joining the reader.
+Live publication resets pacing, RTP mapping and decoder state together at a new
+media run, keeping the existing room and track. Combined detection reports
+Degraded while resetting or failing decode and Running after decoded frames return.
+
+Two deterministic regressions first reproduced the old deadlock/publication
+stall, then passed with the fixes; another covers detection health recovery.
+All-feature workspace tests passed: **590 passed, 39 ignored**. Formatting,
+all-target/all-feature Clippy, the default `make verify` gate and all-feature
+release passed, using `CARGO_PROFILE_RELEASE_STRIP=none` for macOS release builds.
+The two real FFmpeg decode tests were also executed explicitly and passed.
+
+Three automated local outage/recovery cycles passed with real ONNX models and
+two Chromium viewers. The final clean-state replay required a complete new
+recording segment: camera epoch 1→2, inference 29→270, publication 27→631 access
+units, completed segments 0→2, no recorder rejections/failures, and exactly one
+surveillance RTSP reader. Both existing browser tabs continued advancing frames.
+All 33 files from the earlier run and three clean-state files decoded. Rust server
+and detection teardown finished within one second; whole-stack shutdown varied
+from about one second to 26 seconds, with the latter waiting on LiveKit.
+Use [the recovery fixture](#7-check-recovery-and-sustained-operation) to repeat it.
+
+Raw logs are in `target/verification-2026-10-23/` (ignored local output).
+Long source-offline gaps in the manually interrupted run produced two immutable
+recording-metadata conflict errors; that separate indexing/reconciliation issue
+needs investigation. This is not a sustained-load qualification. The older
+recorder-backpressure incident, dependency advisories, plain macOS release issue,
+physical-camera/Firefox checks and production capacity/accuracy gates remain open.
 
 ## Latest local verification — 2026-10-20
 

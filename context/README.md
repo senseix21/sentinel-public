@@ -4,6 +4,8 @@ This directory contains compact, dated handoff snapshots. Its purpose is to let 
 
 ## Latest snapshot
 
+**2026-10-23:** [`context/2026-10-23/`](2026-10-23/) — RTSP consumer recovery fixed and regression-tested; three real two-viewer outage replays passed, 590 Rust tests passed, 36 recordings decoded and Rust server/detection teardown is prompt. Whole-stack shutdown still varied while waiting on LiveKit. Long-outage metadata conflicts remain a separate investigation.
+
 **2026-10-20 12:35 +06:** [`context/2026-10-20-1235/`](2026-10-20-1235/) — README startup/testing walkthrough; local system qualification passed initial live/recording checks but exposed live/detection stalls after RTSP recovery and failing dependency advisories. Read this snapshot before the historical entries below.
 
 **2026-10-09 23:36 +06:** [`context/2026-10-09-2336/`](2026-10-09-2336/) — combined default implemented; real back-facing RTSP/browser and face failure tests pass. Sustained recorder backpressure remains unresolved.
@@ -22,8 +24,8 @@ This directory contains compact, dated handoff snapshots. Its purpose is to let 
 
 Read in this order:
 
-1. [`next-actions.md`](2026-10-20-1235/next-actions.md) — remaining reliability and production gates.
-2. [`repository-status.md`](2026-10-20-1235/repository-status.md) — implementation and verification.
+1. [`next-actions.md`](2026-10-23/next-actions.md) — remaining reliability and production gates.
+2. [`repository-status.md`](2026-10-23/repository-status.md) — implementation and verification.
 3. [`architecture.md`](2026-10-09-2336/architecture.md) — combined mode and ownership.
 4. [`decisions-and-open-questions.md`](2026-10-09-2336/decisions-and-open-questions.md) — qualification gates.
 

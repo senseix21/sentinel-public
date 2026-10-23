@@ -106,6 +106,25 @@ Amended 2026-08-19 after the authenticated Chrome fixture measured cold and
 warm reconnects. Evidence and limitations are in
 `docs/phase-9/livekit-low-latency-2026-08-19.md`.
 
+### Recovery amendment — 2026-10-23
+
+A camera connection epoch change, backward timestamp/timebase change, or pacing
+resynchronisation starts a new decodable media run at a parameterised keyframe.
+The publication owner allocates a monotonic run identity, clears cached parameter
+sets and RTP mapping, and re-establishes pacing. `EncodedAccessUnit::epoch`
+identifies that run, rather than only a LiveKit room connection. The transcoding
+adapter shuts down the prior decoder before feeding the new run; the room and
+published track remain owned by the same session and viewer gating still applies.
+
+Previously pacing reset alone left RTP mapping anchored to old timestamps and
+rejected every later frame. The owner now reports Degraded during
+resynchronisation/adaptation rejection and clears it only after adapter acceptance.
+This changes no upstream connection, queue bounds, codec policy or clock authority.
+Reversal must preserve coherent decoder, RTP and pacing resets; reverting only
+one boundary reintroduces the demonstrated stall. Unit regressions cover backward
+and forward camera epochs and same-epoch timestamp reversal. The local recovery
+fixture is `scripts/dev/check-rtsp-recovery.cjs`.
+
 ### Decision 3 — the timestamp authority is the adapter clock, and no latency claim follows
 
 Raw-frame capture gives libwebrtc a *capture* time for pacing and rate control.

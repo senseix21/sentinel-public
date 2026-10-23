@@ -370,6 +370,7 @@ Publish live camera feeds with low latency without coupling LiveKit availability
 ### Tests
 
 - [x] Publisher starts/stops without adding an upstream camera connection.
+- [x] Local RTSP camera-epoch recovery: reset pacing, RTP mapping and viewer-gated decoder as one media run; two existing Chromium viewers resume and detection/recording continue. `scripts/dev/check-rtsp-recovery.cjs` and deterministic teardown/timestamp regressions cover the 2026-10-20 failure. Representative-camera and LiveKit-server outage gates remain separate.
 - [~] LiveKit startup outage and bounded slow writes do not interrupt recorder admission; real server stop/restart while recording remains to be deterministically qualified.
 - [~] Shutdown leaves no publisher process; duplicate-track recovery after real server restart remains unverified.
 - [x] A non-retryable adapter failure stops publication once instead of reconnecting forever, and recording continues. Covered by `a_non_retryable_send_failure_stops_publication_instead_of_reconnecting`, and measured live on 2026-08-16: `livekit_connection_attempts_total=1`, `send_failures_total=1`, `state=8` (Stopped), `camera_connection_epochs_total=1`, `recorder_segments_completed_total=8`. Evidence: `docs/phase-5/local-evidence-2026-08-16.md`.

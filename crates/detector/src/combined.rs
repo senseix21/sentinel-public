@@ -557,7 +557,7 @@ impl DetectionOwner {
                 .0
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            h.state = DetectionState::Running;
+            h.state = DetectionState::Starting;
             h.backend = Some(InferenceDescriptor::combined(
                 config
                     .person
@@ -625,6 +625,11 @@ impl DetectionOwner {
             let reason = loop {
                 let unit = tokio::select! {_=stop.changed()=>break DetectionStopReason::Requested,item=input.receive()=>match item {ReceiveOutcome::Item(u)=>u,ReceiveOutcome::Closed=>break DetectionStopReason::InputClosed,ReceiveOutcome::Empty=>continue}};
                 if epoch != Some(unit.connection_epoch()) {
+                    task_health
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .state = DetectionState::Degraded;
                     decoder.reset();
                     epoch = Some(unit.connection_epoch());
                     session = SESSION.fetch_add(1, Ordering::Relaxed);
@@ -634,6 +639,12 @@ impl DetectionOwner {
                     face.session.store(session, Ordering::Relaxed);
                     face_at = None;
                 }
+                task_health
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .counters
+                    .decode_attempts += 1;
                 let cam = config.camera.clone();
                 let observed = SystemTime::now();
                 let started = Instant::now();
@@ -651,7 +662,6 @@ impl DetectionOwner {
                         .0
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    h.counters.decode_attempts += 1;
                     h.counters.decode_duration_micros =
                         h.counters.decode_duration_micros.saturating_add(
                             u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
@@ -660,9 +670,21 @@ impl DetectionOwner {
                     h.sampler = sampler.counters();
                 }
                 let frame = match result {
-                    Ok(Some(f)) => f,
+                    Ok(Some(f)) => {
+                        task_health
+                            .0
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .state = DetectionState::Running;
+                        f
+                    }
                     Ok(None) => continue,
                     Err(_) => {
+                        task_health
+                            .0
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .state = DetectionState::Degraded;
                         decoder.reset();
                         session = SESSION.fetch_add(1, Ordering::Relaxed);
                         person.clear();
@@ -896,6 +918,74 @@ mod tests {
         })))
         .await;
     }
+    struct FailingDecoder {
+        inner: FixtureH264Decoder,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl H264Decoder for FailingDecoder {
+        fn reset(&mut self) {
+            self.inner.reset();
+        }
+        fn decode(
+            &mut self,
+            camera: &CameraId,
+            unit: &H264AccessUnit,
+            at: SystemTime,
+        ) -> Result<Option<DecodedFrame>, crate::detector::DecodeError> {
+            if self.fail.swap(false, Ordering::Relaxed) {
+                return Err(crate::detector::DecodeError::Unavailable);
+            }
+            self.inner.decode(camera, unit, at)
+        }
+    }
+    #[tokio::test]
+    async fn decode_failure_is_degraded_until_new_epoch_frames_resume() {
+        let capacity = QueueCapacity::new(8).unwrap();
+        let (distributor, subscriptions) =
+            MediaDistributor::new_with_detection(capacity, capacity, capacity);
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (owner, health) = DetectionOwner::start_combined(
+            CombinedConfig {
+                camera: CameraId::new("test-camera").unwrap(),
+                person: Some(Box::new(DeterministicFakeInference::new().unwrap())),
+                face: None,
+                person_geometry: (2, 2),
+                face_geometry: (2, 2),
+                policy: policy(),
+                permits: (Arc::new(Semaphore::new(1)), Arc::new(Semaphore::new(1))),
+                face_interval: Duration::from_millis(200),
+                roi: None,
+            },
+            subscriptions.detection,
+            TimestampSampler::new(SampleRateHz::new(5).unwrap(), Duration::from_secs(2)).unwrap(),
+            FailingDecoder {
+                inner: FixtureH264Decoder::new(FrameLimits::new(2, 2, 12).unwrap(), 2, 2),
+                fail,
+            },
+            EventBus::new(),
+        );
+        distributor.publish(keyframe(0));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while health.snapshot().counters.decode_failed == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(health.snapshot().state, DetectionState::Degraded);
+        let next = (*keyframe(0)).clone().with_connection_epoch(2).unwrap();
+        distributor.publish(Arc::new(next));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while health.snapshot().counters.inferred == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(health.snapshot().state, DetectionState::Running);
+        owner.stop_and_join().await.unwrap();
+    }
+
     #[test]
     fn pending_slot_replaces_oldest_and_resize_preserves_rgb_channels() {
         let frame = DecodedFrame::new(
