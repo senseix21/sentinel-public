@@ -2688,12 +2688,25 @@ fn encode_recording_cursor(
     recording_id: &surveillance_common::types::RecordingId,
 ) -> String {
     let timestamp = jiff::Timestamp::try_from(started_at).map_or(0, jiff::Timestamp::as_nanosecond);
-    format!("{timestamp:x}.{}", recording_id.as_str())
+    // Signed LowerHex formats negatives as two's complement. The decoder uses
+    // signed radix parsing, so preserve an explicit minus sign before the epoch.
+    if timestamp < 0 {
+        format!("-{:x}.{}", timestamp.unsigned_abs(), recording_id.as_str())
+    } else {
+        format!("{timestamp:x}.{}", recording_id.as_str())
+    }
 }
 
 fn decode_recording_cursor(value: &str) -> Result<RecordingCursor, ()> {
     let (timestamp, recording_id) = value.split_once('.').ok_or(())?;
     let timestamp = i128::from_str_radix(timestamp, 16).map_err(|_| ())?;
+    // Reject untrusted integers before conversion: jiff-core 0.1.0 can panic
+    // internally when very large nanosecond values narrow to epoch seconds.
+    if !(jiff::Timestamp::MIN.as_nanosecond()..=jiff::Timestamp::MAX.as_nanosecond())
+        .contains(&timestamp)
+    {
+        return Err(());
+    }
     let timestamp = jiff::Timestamp::from_nanosecond(timestamp).map_err(|_| ())?;
     let started_at = std::time::SystemTime::from(timestamp);
     let recording_id =
@@ -3884,6 +3897,56 @@ fn response(status: &str, content_type: &str, body: &str) -> String {
     // interface with no way to know it. Found by upgrading the page underneath
     // a running browser, which kept serving the previous one.
     format!("HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}", body.len())
+}
+
+/// Exercises the production playback parsers without sockets, files, or a database.
+///
+/// Only the isolated fuzz workspace enables this entry point. Input is bounded
+/// by the ordinary default HTTP request limit; no media or model work is started.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_playback_request(input: &[u8]) {
+    if input.len() > DEFAULT_MAX_REQUEST_BYTES {
+        return;
+    }
+    let _ = content_length(input);
+    if let Some(head) = request_head(input) {
+        let _ = header_value(head, "content-length");
+    }
+    if let Some(target) = playback_target(input) {
+        let query = match target {
+            PlaybackTarget::Range { query, .. } | PlaybackTarget::Recording { query, .. } => query,
+        };
+        fuzz_playback_query(query);
+    }
+    if let Ok(text) = std::str::from_utf8(input) {
+        fuzz_playback_query(text);
+    }
+}
+
+#[cfg(feature = "fuzzing")]
+fn fuzz_playback_query(query: &str) {
+    if let Ok(RecordingVideoExtent::Leading(duration)) = parse_recording_video_extent(query) {
+        assert!((1..=ClipDuration::MAX_SECONDS).contains(&duration.seconds()));
+    }
+    let parameters = url::form_urlencoded::parse(query.as_bytes())
+        .into_owned()
+        .collect();
+    if let Some((start, end, range)) = parse_range(&parameters) {
+        assert!(start < end);
+        assert_eq!(range.start(), std::time::SystemTime::from(start));
+        assert_eq!(range.end(), std::time::SystemTime::from(end));
+        assert!(range
+            .end()
+            .duration_since(range.start())
+            .is_ok_and(|span| !span.is_zero() && span <= Duration::from_secs(24 * 60 * 60)));
+    }
+    for value in std::iter::once(query).chain(parameters.get("cursor").map(String::as_str)) {
+        if let Ok(cursor) = decode_recording_cursor(value) {
+            let encoded = encode_recording_cursor(cursor.started_at(), cursor.recording_id());
+            assert_eq!(decode_recording_cursor(&encoded).ok(), Some(cursor));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5591,6 +5654,43 @@ mod tests {
 
         let _ = handle.shutdown().await;
         let _ = task.await;
+    }
+
+    #[test]
+    fn recording_cursor_round_trips_across_unix_epoch() {
+        let recording_id = surveillance_common::types::RecordingId::new("cursor-recording")
+            .unwrap_or_else(|error| panic!("recording ID: {error}"));
+        for nanos in [-1_000_000_000_i128, -1, 0, 1, 1_000_000_000] {
+            let timestamp = jiff::Timestamp::from_nanosecond(nanos)
+                .unwrap_or_else(|error| panic!("fixture timestamp: {error}"));
+            let started_at = std::time::SystemTime::from(timestamp);
+            let encoded = encode_recording_cursor(started_at, &recording_id);
+            let decoded = decode_recording_cursor(&encoded)
+                .unwrap_or_else(|()| panic!("cursor must decode for {nanos}: {encoded}"));
+            assert_eq!(decoded.started_at(), started_at);
+            assert_eq!(decoded.recording_id(), &recording_id);
+        }
+    }
+
+    #[test]
+    fn recording_cursor_rejects_extreme_timestamps_without_panicking() {
+        for value in [
+            "-1CCCCCCCCCCCCCCCCCCCCCC.segment-1".to_owned(),
+            "1CCCCCCCCCCCCCCCCCCCCCC.segment-1".to_owned(),
+            format!("{:x}.segment-1", i128::MAX),
+            format!("-{:x}.segment-1", i128::MAX),
+        ] {
+            assert!(decode_recording_cursor(&value).is_err(), "{value}");
+        }
+        let id = surveillance_common::types::RecordingId::new("segment-1")
+            .unwrap_or_else(|error| panic!("recording ID: {error}"));
+        for timestamp in [jiff::Timestamp::MIN, jiff::Timestamp::MAX] {
+            let started_at = std::time::SystemTime::from(timestamp);
+            let encoded = encode_recording_cursor(started_at, &id);
+            let decoded = decode_recording_cursor(&encoded)
+                .unwrap_or_else(|()| panic!("boundary cursor: {encoded}"));
+            assert_eq!(decoded.started_at(), started_at);
+        }
     }
 
     #[test]

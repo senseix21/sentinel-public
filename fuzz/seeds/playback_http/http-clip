@@ -1,0 +1,2 @@
+GET /api/cameras/camera-01/recordings/segment-1/video?duration_seconds=60 HTTP/1.1
+

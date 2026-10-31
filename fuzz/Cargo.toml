@@ -1,0 +1,37 @@
+[package]
+name = "surveillance-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Separate tooling workspace: nightly and libFuzzer never enter the production
+# workspace dependency graph or change its pinned stable toolchain.
+[workspace]
+members = ["."]
+
+[features]
+http = ["dep:surveillance-server"]
+
+[dependencies]
+libfuzzer-sys = "=0.4.10"
+surveillance-common = { path = "../crates/common" }
+surveillance-storage = { path = "../crates/storage" }
+surveillance-server = { path = "../apps/server", optional = true, features = ["fuzzing"] }
+
+[[bin]]
+name = "playback_plan"
+path = "fuzz_targets/playback_plan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "playback_http"
+path = "fuzz_targets/playback_http.rs"
+required-features = ["http"]
+test = false
+doc = false
+bench = false

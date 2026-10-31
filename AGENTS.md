@@ -101,8 +101,9 @@ Not yet implemented, and not to be described as working:
 - ROI, rules, and analytics remain absent, blocked on product semantics.
 - No packaging, and no deployment/upgrade/rollback/backup runbooks: the
   deployment target is unconfirmed and ADR 009 declines to guess one.
-- Alert rules exist but have never been executed against an evaluator, and no
-  fuzzing exists. Neither is to be described as tested.
+- Alert rules exist but have never been executed against an evaluator.
+  Playback parser/range fuzzing exists as isolated development tooling (ADR 018);
+  camera-media, socket-framing, and configuration fuzz targets remain absent.
 
 ### The prototype
 

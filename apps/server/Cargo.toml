@@ -11,6 +11,8 @@ publish = false
 workspace = true
 
 [features]
+# Development-only entry point for the isolated coverage-guided fuzz workspace.
+fuzzing = []
 # Passes the detector's optional ONNX backend through, so a build either has
 # real inference everywhere or nowhere.
 onnx-inference = ["surveillance-detector/onnx-inference"]
