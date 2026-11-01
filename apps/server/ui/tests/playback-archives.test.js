@@ -23,3 +23,15 @@ test("archive and active identities are merged once and escaped", () => {
   assert.equal((html.match(/option value="north"/g) || []).length, 1);
   assert.match(html, /value="&lt;south&gt;"/);
 });
+
+test("folder selection uses its camera coverage and recorded date without a live camera", () => {
+  const pb = createPlaybackState(); pb.source = "archive-1";
+  const screen = createPlaybackScreen({
+    state: { archiveCameras: ["primary-camera"], recordingSources: [{ id: "archive-1", label: ".local/laptop-recordings", state: "ready", cameras: [{camera_id: "camera-01", first_recorded_at: "2026-10-29T17:46:23Z", last_recorded_at: "2026-10-29T17:48:35Z", recordings: 5}] }] },
+    pb, fleetCounts: () => ({ cameras: [] }), fleetProblem: () => "", errorBanner: () => "error",
+  });
+  const html = screen();
+  assert.equal(pb.camera, "camera-01"); assert.equal(pb.date, "2026-10-29");
+  assert.match(html, /Choose existing folder/); assert.match(html, /5 recordings indexed/);
+  assert.doesNotMatch(html, /option value="primary-camera"/);
+});

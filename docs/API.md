@@ -149,7 +149,7 @@ mutating API surface to be enabled. When it is disabled, the route returns
 | Method | Path | Minimum role | Purpose |
 |---|---|---:|---|
 | `GET` | `/live` | Public | Process liveness |
-| `GET` | `/ready` | Public | Dependency and camera-aware readiness |
+| `GET` | `/ready` | Public | Application dependency readiness |
 | `GET` | `/metrics` | Public | Prometheus metrics |
 | `GET` | `/api/system` | Viewer | Runtime capabilities and wired surfaces |
 | `GET` | `/api/cameras` | Viewer | List visible cameras |
@@ -436,6 +436,40 @@ marks it inconsistent and refuses to describe or stream it as healthy footage.
 
 The `playback` field is the supported media-retrieval link for that recording.
 There is no endpoint that exposes its internal filesystem locator.
+
+### Recording folder selection
+
+`GET /api/recording-folders` (Administrator) lists supported folders beneath
+approved browse roots. Each result has an opaque `id` and relative `label`;
+absolute server paths are not returned. Arbitrary paths are never accepted.
+
+`POST /api/recording-folders/index` (Administrator, mutating surface enabled)
+accepts `{"id":"<folder-id>"}` and returns **202** with
+`{"source_id":"archive-1"}`. Unknown fields are rejected. One owned worker
+indexes a folder at a time; **409 `index_busy`** means retry after the current
+job finishes. Only established camera/UTC segment layouts are supported.
+
+`GET /api/recording-sources` (Viewer) lists registered sources, `state`, and
+camera-scoped coverage (`camera_id`, `first_recorded_at`, `last_recorded_at`,
+`recordings`). Empty sources outside a restricted camera scope are hidden.
+States include `indexing`, `ready`, `partial`, `failed`, `interrupted` and
+`unavailable`. Source indexes and roots persist; media files remain read-only.
+
+Archive searches, details, range playback and single-recording video use the
+same query contracts below, with this explicit prefix:
+
+```text
+/api/recording-sources/{source_id}/cameras/{camera_id}/recordings
+/api/recording-sources/{source_id}/cameras/{camera_id}/recordings/{recording_id}
+/api/recording-sources/{source_id}/cameras/{camera_id}/recordings/playback
+/api/recording-sources/{source_id}/cameras/{camera_id}/recordings/{recording_id}/video
+```
+
+Camera-scoped authorization applies before source lookup. Video export audit
+rows include `recording_source_id` so duplicate IDs in different folders remain
+distinguishable. Existing `/api/cameras/...` URLs continue to use `primary`.
+Archive sources are excluded from the recorder's retention and reconciliation
+owners. See [ADR 020](adr/020-playback-recording-folders.md).
 
 ### `GET /api/cameras/{camera_id}/recordings`
 

@@ -498,6 +498,15 @@ remains unconfirmed**, which blocks items 8 and 9 in part.
 
 ### Operator dashboard (not a Phase 8 instruction; recorded because it ships)
 
+- [x] Playback recording-folder picker (2026-11-01, ADR 020): approved server
+  folders can be selected after plain `make run`. One bounded owned worker
+  indexes media in place into durable source namespaces, without copying or
+  deleting archives. Camera-scoped search/playback URLs carry source identity;
+  current recorder retention cannot claim archive rows. Folder/camera/date
+  selection and actual browser decoding are exercised with duplicate IDs across
+  two archives, and source indexes survive process-owner restart.
+
+
 - [x] Camera-independent startup (2026-11-01, ADR 019): `make run` starts the
   dashboard without a webcam or bootstrap RTSP camera. Supervisor-owned secret
   catalog persists dashboard registration and running/stopped intent; credentials

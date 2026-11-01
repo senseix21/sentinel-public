@@ -135,40 +135,55 @@ identifiers are the names used for playback:
   `/home/dev/camera_project/.local/server-demo/recordings/`.
 - **`camera-01`** — 5 copied laptop recordings from **October 29, 2026 (UTC)**,
   around **17:46–17:48 UTC**, stored in
-  `/home/dev/camera_project/.local/laptop-recordings/`. These copies have not
-  been indexed for Playback; copying files alone does not add them to its list.
+  `/home/dev/camera_project/.local/laptop-recordings/`. These copies are not
+  indexed automatically; select this folder in Playback to index them.
 
 Counts describe that inventory check; configured retention may remove footage
 later. Normal `make run` uses `.local/server-run`, whose recording index was
 empty at the time of the check. It does not automatically load the separate
 demo database or laptop copies.
 
-To view the existing **`dev-test-pattern`** footage:
+To choose these recordings entirely from the dashboard:
 
-1. Stop the current `make run` with **Ctrl+C**. If the optional demo services
-   are running, stop them too, so the same ports and state are not used twice:
-
-   ```bash
-   systemctl stop sentinel-demo.service sentinel-demo-source.service
-   ```
-
-2. On the server, reuse the demo's existing database and recording directory:
+1. Start normally on the server:
 
    ```bash
    cd /home/dev/camera_project
-   STATE_DIR=/home/dev/camera_project/.local/server-demo \
-   make run RECORDING_ROOT=/home/dev/camera_project/.local/server-demo/recordings
+   make run
    ```
 
-3. Keep your port-3001 SSH tunnel open, open **http://127.0.0.1:3001/**, and
+2. Keep your port-3001 SSH tunnel open, open **http://127.0.0.1:3001/**, and
    sign in with the development login above.
-4. Open **Playback**, select **`dev-test-pattern`**, choose **UTC**, and select
-   **2026-10-31** or **2026-11-01**. Choose a time range containing saved footage
-   and click **Load**, then **Play recording**.
+3. Open **Playback** and click **Choose existing folder**.
+4. Select **`.local/server-demo/recordings`** for the synthetic demo, or
+   **`.local/laptop-recordings`** for the copied laptop footage. Click **Use folder**.
+5. Wait for indexing. Camera names and available UTC dates appear automatically;
+   select **`dev-test-pattern`** for demo footage or **`camera-01`** for the laptop
+   recordings. Choose a date/time range, click **Load**, then **Play recording**.
 
-No connected camera is required to play these saved recordings. This command
-serves existing footage; the optional source demo below is used to generate new
-synthetic footage.
+No `STATE_DIR` or recording-directory argument is needed in `make run`. Registered
+folders and their indexes survive server restarts, and the browser remembers its
+last selected folder. The current recorder's destination remains separate.
+Indexing and playback read archive files in place: they do not copy, move or
+apply the active recording-retention policy to those files. No connected camera
+is required. Folder indexing requires an administrator; camera-scoped viewers
+can play indexed footage they are authorized to see.
+
+The picker lists supported SENTINEL recording layouts under approved server
+roots, by default the checkout's `.local/` tree. It does not browse arbitrary
+server files or upload laptop folders. To approve another location, configure
+`SURVEILLANCE_RECORDING_BROWSE_ROOTS` before startup (colon-separated paths on
+Linux/macOS). Folders must contain the existing
+`camera-id/YYYY/MM/DD/HH-MM-SS--recording-id.mp4` layout with H.264 recordings.
+Symlink folders are refused. Discovery is bounded to 5,000 directory entries,
+two nested levels and 32 sources; point the approved roots closer to an archive
+if a larger tree exceeds these bounds. Index scans use the configured
+reconciliation scan limit, and each probe uses the playback probe deadline.
+
+Only one folder is indexed at a time. The dashboard reports indexing progress,
+partial imports, unavailable folders and interrupted/failed jobs. Valid indexed
+footage remains playable after a partial import; choose the folder again to retry.
+The optional source demo below is needed only to generate new synthetic footage.
 
 ## Optional: open the synthetic recording demo, step by step
 

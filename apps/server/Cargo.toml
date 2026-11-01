@@ -33,6 +33,7 @@ surveillance-media = { path = "../../crates/media" }
 surveillance-livekit = { path = "../../crates/livekit" }
 surveillance-recorder = { path = "../../crates/recorder" }
 surveillance-storage = { path = "../../crates/storage" }
+sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -43,5 +44,4 @@ url.workspace = true
 [dev-dependencies]
 # Only to prove the vendored LiveKit browser SDK is byte-for-byte the bundle
 # recorded in `ui/vendor/README.md`. Not used by the server itself.
-sha2 = { workspace = true }
 sqlx.workspace = true

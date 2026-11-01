@@ -1,5 +1,6 @@
 export function createPlaybackState() {
   return {
+    source: "primary", folder: "", folderChoices: null, folderError: null, folderBusy: false,
     camera: "", date: "", from: "00:00:00", to: "01:00:00", result: null,
     error: null, busy: false, selected: null, timezone: "UTC",
     clipDuration: "full", customClipDuration: "15",
@@ -72,18 +73,22 @@ export function playbackTime(ms, timezone = "UTC") {
   return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
 }
 
-export function recordingSearchPath(cameraId, range) {
-  return `/api/cameras/${encodeURIComponent(cameraId)}/recordings`
+export function recordingApiPrefix(source = "primary") {
+  return source && source !== "primary" ? `/api/recording-sources/${encodeURIComponent(source)}` : "/api";
+}
+
+export function recordingSearchPath(cameraId, range, source = "primary") {
+  return `${recordingApiPrefix(source)}/cameras/${encodeURIComponent(cameraId)}/recordings`
     + `?start=${encodeURIComponent(range.start)}&end=${encodeURIComponent(range.end)}`;
 }
 
-export function playbackPath(cameraId, start, end) {
-  return `/api/cameras/${encodeURIComponent(cameraId)}/recordings/playback`
+export function playbackPath(cameraId, start, end, source = "primary") {
+  return `${recordingApiPrefix(source)}/cameras/${encodeURIComponent(cameraId)}/recordings/playback`
     + `?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`;
 }
 
-export function recordingVideoPath(cameraId, recordingId, durationSeconds = null) {
-  const base = `/api/cameras/${encodeURIComponent(cameraId)}/recordings/${encodeURIComponent(recordingId)}/video`;
+export function recordingVideoPath(cameraId, recordingId, durationSeconds = null, source = "primary") {
+  const base = `${recordingApiPrefix(source)}/cameras/${encodeURIComponent(cameraId)}/recordings/${encodeURIComponent(recordingId)}/video`;
   if (durationSeconds === null || durationSeconds === "" || durationSeconds === "full") return base;
   const seconds = Number(durationSeconds);
   if (!Number.isInteger(seconds) || seconds < 1 || seconds > 60) {

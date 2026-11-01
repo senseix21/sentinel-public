@@ -119,6 +119,12 @@ PHASE4_PLAYBACK_ROOT="$playback_root" \
     cargo test --manifest-path "$repo_root/Cargo.toml" -p surveillance-server \
     --test playback_assembler -- --ignored --test-threads=1
 
+PHASE4_DATABASE_URL="postgres://127.0.0.1:$port/surveillance_repository" \
+PHASE4_RECORDING_FOLDERS_ROOT="$fixture_root/recording-folders" \
+PHASE4_OUTAGE_MEDIA="$playback_root/playback-camera/segment-1.mp4" \
+    cargo test --manifest-path "$repo_root/Cargo.toml" -p surveillance-server \
+    --test recording_folders -- --ignored --test-threads=1
+
 reconciliation_root="$fixture_root/reconciliation"
 retention_root="$fixture_root/retention"
 mkdir -p "$reconciliation_root" "$retention_root"

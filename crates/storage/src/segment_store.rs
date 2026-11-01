@@ -63,6 +63,7 @@ impl StoredSegment {
 pub struct SegmentFileStore {
     layout: RecordingLayout,
     ffprobe: PathBuf,
+    probe_timeout: Option<std::time::Duration>,
 }
 
 /// Singular owner of one exclusively created active partial file.
@@ -125,7 +126,11 @@ impl ActiveSegmentFile {
 impl SegmentFileStore {
     #[must_use]
     pub const fn new(layout: RecordingLayout, ffprobe: PathBuf) -> Self {
-        Self { layout, ffprobe }
+        Self {
+            layout,
+            ffprobe,
+            probe_timeout: None,
+        }
     }
 
     /// Writes a new partial file, flushes and syncs it, atomically renames it,
@@ -238,6 +243,13 @@ impl SegmentFileStore {
         })
     }
 
+    /// Sets a positive process deadline, expressed in milliseconds.
+    #[must_use]
+    pub fn with_probe_timeout(mut self, milliseconds: std::num::NonZeroU64) -> Self {
+        self.probe_timeout = Some(std::time::Duration::from_millis(milliseconds.get()));
+        self
+    }
+
     /// Syncs and atomically publishes a nonempty active partial, then probes it.
     ///
     /// # Errors
@@ -284,7 +296,9 @@ impl SegmentFileStore {
     }
 
     async fn probe(&self, path: PathBuf) -> Result<StoredSegment, SegmentStoreError> {
-        let output = Command::new(&self.ffprobe)
+        let mut command = Command::new(&self.ffprobe);
+        command
+            .kill_on_drop(true)
             .args([
                 "-v",
                 "error",
@@ -295,10 +309,22 @@ impl SegmentFileStore {
                 "-of",
                 "default=noprint_wrappers=1",
             ])
-            .arg(&path)
-            .output()
-            .await
-            .map_err(|error| io_error(SegmentStoreStage::Probe, error))?;
+            .arg(&path);
+        let output = if let Some(deadline) = self.probe_timeout {
+            tokio::time::timeout(deadline, command.output())
+                .await
+                .map_err(|_| {
+                    io_error(
+                        SegmentStoreStage::Probe,
+                        std::io::Error::new(std::io::ErrorKind::TimedOut, "media probe timed out"),
+                    )
+                })?
+        } else {
+            // Existing recorder/reconciliation callers retain their policy;
+            // the new archive owner explicitly supplies its process deadline.
+            command.output().await
+        }
+        .map_err(|error| io_error(SegmentStoreStage::Probe, error))?;
         if !output.status.success() {
             return Err(SegmentStoreError::new(
                 SegmentStoreStage::Probe,
@@ -482,6 +508,38 @@ mod tests {
         path::PathBuf,
         time::{Duration, SystemTime},
     };
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn media_probe_deadline_cancels_a_stalled_process(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "sentinel-probe-timeout-{}-{nonce}",
+            std::process::id()
+        ));
+        tokio::fs::create_dir_all(&root).await?;
+        let program = root.join("probe");
+        tokio::fs::write(&program, b"#!/bin/sh\nexec sleep 30\n").await?;
+        tokio::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).await?;
+        let file = root.join("test.mp4");
+        tokio::fs::write(&file, b"fixture").await?;
+        let store = SegmentFileStore::new(RecordingLayout::new(root.clone())?, program)
+            .with_probe_timeout(std::num::NonZeroU64::new(50).ok_or("nonzero timeout")?);
+        let start = std::time::Instant::now();
+        let error = store
+            .probe_durable(file)
+            .await
+            .err()
+            .ok_or("expected timeout")?;
+        assert_eq!(error.stage(), SegmentStoreStage::Probe);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        tokio::fs::remove_dir_all(root).await?;
+        Ok(())
+    }
 
     #[test]
     fn parses_probe_decimal_duration_without_float_rounding() {

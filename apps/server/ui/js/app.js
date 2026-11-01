@@ -262,6 +262,7 @@ const screenDashboard = createDashboardScreen({
 // ------------------------------------------------------------------ playback
 
 const pb = createPlaybackState();
+let playbackRequest = 0;
 const screenPlayback = createPlaybackScreen({ state, fleetCounts, fleetProblem, errorBanner, pb });
 
 // What the operator has typed into the add-camera form.
@@ -419,7 +420,9 @@ async function loadSettings() {
 }
 
 async function poll() {
-  const [fleet, metrics, archives] = await Promise.allSettled([api("/api/cameras"), apiText("/metrics"), api("/api/recording-cameras")]);
+  const [fleet, metrics, archives, sources] = await Promise.allSettled([api("/api/cameras"), apiText("/metrics"), api("/api/recording-cameras"), api("/api/recording-sources")]);
+  if (sources.status === "fulfilled") { state.recordingSources = sources.value; state.recordingSourcesError = null; }
+  else state.recordingSourcesError = sources.reason;
   if (archives.status === "fulfilled") { state.archiveCameras = archives.value; state.archiveError = null; }
   else state.archiveError = archives.reason;
   if (fleet.status === "fulfilled") {
@@ -451,6 +454,7 @@ async function tick() {
   const { name, args } = route();
   const editingCamera = name === "cameras" && document.activeElement?.dataset?.add;
   if (LIVE_SCREENS.includes(name) && !(name === "cameras" && args.length) && !editingCamera) await render();
+  else if (name === "playback" && !pb.result && !document.activeElement?.dataset?.bind) await render();
   else renderGauges();
 }
 
@@ -526,7 +530,7 @@ document.addEventListener("click", async (event) => {
   if (act === "play") {
     const video = document.getElementById("v");
     if (!video) return;
-    await playInto(video, playbackPath(pb.camera, target.dataset.start, target.dataset.end));
+    await playInto(video, playbackPath(pb.camera, target.dataset.start, target.dataset.end, pb.source));
     return;
   }
 
@@ -535,7 +539,7 @@ document.addEventListener("click", async (event) => {
     if (!video) return;
     const duration = pb.clipDuration === "custom" ? pb.customClipDuration : pb.clipDuration;
     try {
-      await playInto(video, recordingVideoPath(pb.camera, target.dataset.recording, duration));
+      await playInto(video, recordingVideoPath(pb.camera, target.dataset.recording, duration, pb.source));
     } catch (error) {
       pb.error = error instanceof Error ? error.message : "Invalid clip duration.";
       await render();
@@ -551,6 +555,31 @@ document.addEventListener("click", async (event) => {
   if (act === "pb-stop") {
     stopPlayback(document.getElementById("v"));
     return;
+  }
+
+  if (act === "folder-browse") {
+    try {
+      pb.folderChoices = await api("/api/recording-folders");
+      pb.folder = pb.folderChoices[0]?.id || "";
+      pb.folderError = null;
+    } catch (error) { pb.folderError = error; }
+    await render(); return;
+  }
+  if (act === "folder-index") {
+    if (!pb.folder || pb.folderBusy) return;
+    pb.folderBusy = true; pb.folderError = null;
+    await render();
+    try {
+      const accepted = await api("/api/recording-folders/index", { method: "POST", body: JSON.stringify({id: pb.folder}) });
+      playbackRequest++; pb.busy = false;
+      pb.source = accepted.source_id; pb.camera = ""; pb.date = ""; pb.result = null;
+      pb.timezone = "UTC"; pb.from = "00:00:00"; pb.to = "23:59:59";
+      pb.folderChoices = null;
+      try { localStorage.setItem("sentinel.playbackSource", pb.source); } catch { /* storage is optional */ }
+      await poll();
+    } catch (error) { pb.folderError = error; }
+    pb.folderBusy = false;
+    await render(); return;
   }
 
   if (act === "pb-load") { await loadPlayback(); return; }
@@ -655,7 +684,19 @@ document.addEventListener("input", (event) => {
   const node = event.target;
   if (node.dataset && node.dataset.bind) {
     pb[node.dataset.bind] = node.value;
-    if (node.dataset.bind === "timezone") void render();
+    if (node.dataset.bind === "source") {
+      playbackRequest++; pb.busy = false;
+      stopPlayback(document.getElementById("v"));
+      pb.camera = ""; pb.date = ""; pb.result = null; pb.error = null;
+      pb.timezone = "UTC"; pb.from = "00:00:00"; pb.to = "23:59:59";
+      try { localStorage.setItem("sentinel.playbackSource", pb.source); } catch { /* storage is optional */ }
+      void render();
+    } else if (node.dataset.bind === "camera") {
+      playbackRequest++; pb.busy = false;
+      stopPlayback(document.getElementById("v"));
+      pb.result = null; pb.error = null;
+      void render();
+    } else if (node.dataset.bind === "timezone") void render();
     return;
   }
   if (node.dataset && node.dataset.add) {
@@ -690,18 +731,20 @@ async function cameraOperation(path, method, message) {
 
 async function loadPlayback() {
   if (!pb.camera) { pb.error = new ApiError(0, "no_camera_selected"); await render(); return; }
-  pb.busy = true;
-  pb.error = null;
+  const request = ++playbackRequest;
+  const camera = pb.camera;
+  const source = pb.source;
+  pb.busy = true; pb.error = null;
   await render();
   try {
-    // `start`/`end`, not `from`/`to`. The route reads those two names and
-    // answers `missing_recording_range` to anything else, so the wrong pair
-    // does not degrade — every search fails, whatever the range.
-    pb.result = await api(recordingSearchPath(pb.camera, searchRange(pb)));
+    const result = await api(recordingSearchPath(camera, searchRange(pb), source));
+    if (request !== playbackRequest || camera !== pb.camera || source !== pb.source) return;
+    pb.result = result;
   } catch (error) {
-    pb.result = null;
-    pb.error = error;
+    if (request !== playbackRequest) return;
+    pb.result = null; pb.error = error;
   }
+  if (request !== playbackRequest) return;
   pb.busy = false;
   await render();
 }
@@ -752,6 +795,10 @@ function startClock() {
   renderNav();
   await Promise.all([loadSystem(), loadSettings()]);
   await poll();
+  try {
+    const saved = localStorage.getItem("sentinel.playbackSource");
+    if (saved && state.recordingSources.some((source) => source.id === saved)) pb.source = saved;
+  } catch { /* storage is optional */ }
   await render();
   setInterval(tick, 5000);
 })();

@@ -77,6 +77,10 @@ impl MutatingSurface {
 pub enum Action {
     /// List the cameras this principal can see.
     ListCameras,
+    /// Browse deployment-approved recording folders.
+    ViewRecordingFolders,
+    /// Register and index a read-only archive folder.
+    IndexRecordingFolder,
     /// Read one camera's state and health.
     ViewCamera(CameraId),
     /// Search or read recording metadata for one camera.
@@ -130,6 +134,8 @@ impl Action {
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::ListCameras => "list_cameras",
+            Self::ViewRecordingFolders => "view_recording_folders",
+            Self::IndexRecordingFolder => "index_recording_folder",
             Self::ViewCamera(_) => "view_camera",
             Self::ViewRecordings(_) => "view_recordings",
             Self::IssueViewerToken(_) => "issue_viewer_token",
@@ -153,6 +159,8 @@ impl Action {
         match self {
             Self::ListCameras
             | Self::ViewSettings
+            | Self::ViewRecordingFolders
+            | Self::IndexRecordingFolder
             | Self::ViewSystemCapabilities
             | Self::ViewIdentities
             | Self::AddCamera
@@ -204,6 +212,8 @@ impl Action {
             | Self::RemoveCamera(_) => Role::Operator,
 
             Self::ViewIdentities
+            | Self::ViewRecordingFolders
+            | Self::IndexRecordingFolder
             | Self::UpdateGlobalSettings
             | Self::UpdateCameraSettings(_)
             | Self::ManageIdentities => Role::Administrator,
@@ -220,7 +230,10 @@ impl Action {
     pub const fn requires_mutating_surface(&self) -> bool {
         matches!(
             self,
-            Self::UpdateGlobalSettings | Self::UpdateCameraSettings(_) | Self::ManageIdentities
+            Self::UpdateGlobalSettings
+                | Self::UpdateCameraSettings(_)
+                | Self::ManageIdentities
+                | Self::IndexRecordingFolder
         )
     }
 
@@ -239,6 +252,7 @@ impl Action {
             | Self::ViewSettings
             | Self::ViewSystemCapabilities
             | Self::ViewIdentities
+            | Self::ViewRecordingFolders
             // An export changes nothing in this system, so it is audited
             // rather than refused during a drain. Refusing it while draining
             // would block an operator retrieving footage during an incident,
@@ -250,7 +264,8 @@ impl Action {
             | Self::RemoveCamera(_)
             | Self::UpdateGlobalSettings
             | Self::UpdateCameraSettings(_)
-            | Self::ManageIdentities => true,
+            | Self::ManageIdentities
+            | Self::IndexRecordingFolder => true,
         }
     }
 }
@@ -547,6 +562,8 @@ mod tests {
         let subject = camera("camera-01");
         vec![
             Action::ListCameras,
+            Action::ViewRecordingFolders,
+            Action::IndexRecordingFolder,
             Action::ViewCamera(subject.clone()),
             Action::ViewRecordings(subject.clone()),
             Action::IssueViewerToken(subject.clone()),
@@ -787,6 +804,7 @@ mod tests {
             let expected = matches!(
                 action,
                 Action::UpdateGlobalSettings
+                    | Action::IndexRecordingFolder
                     | Action::UpdateCameraSettings(_)
                     | Action::ManageIdentities
             );

@@ -2,7 +2,7 @@
 
 use std::{fmt::Write as _, io, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use surveillance_camera::connection::ConnectionState;
 use surveillance_common::types::CameraId;
 use surveillance_config::{
@@ -551,6 +551,7 @@ async fn record_export(
     camera: &CameraId,
     exported: Option<Exported>,
     succeeded: bool,
+    source_id: &str,
 ) {
     let Some(repository) = guard.audit else {
         return;
@@ -573,7 +574,8 @@ async fn record_export(
         AuditOutcome::Failed
     };
     let record = AccessAuditRecord::export(&actor, camera.as_str(), outcome, extent)
-        .with_client(guard.context.client());
+        .with_client(guard.context.client())
+        .with_recording_source(source_id);
 
     if let Err(error) = repository.record(&record).await {
         // The footage has already left; refusing now would change nothing and
@@ -1153,6 +1155,7 @@ async fn playback_stall_timeout(settings: Option<&SettingsService>) -> Duration 
 /// an endpoint of their choosing.
 pub struct CameraDefaults {
     recording_root: PathBuf,
+    folders: Option<Arc<crate::recording_folders::RecordingFolders>>,
     livekit: Option<LiveKitSettings>,
     settings: Option<Arc<surveillance_config::resolution::ResolvedSettings>>,
 }
@@ -1165,9 +1168,19 @@ impl CameraDefaults {
     pub const fn new(recording_root: PathBuf, livekit: Option<LiveKitSettings>) -> Self {
         Self {
             recording_root,
+            folders: None,
             livekit,
             settings: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_recording_folders(
+        mut self,
+        folders: Option<Arc<crate::recording_folders::RecordingFolders>>,
+    ) -> Self {
+        self.folders = folders;
+        self
     }
 
     /// Enables durable dashboard registration using resolved deployment defaults.
@@ -1260,6 +1273,10 @@ pub async fn serve_health(
     clippy::too_many_arguments,
     reason = "adapter dependencies retain singular owners"
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "stream authorization, source resolution and export audit remain in one boundary"
+)]
 async fn handle_client(
     mut stream: TcpStream,
     camera_defaults: &CameraDefaults,
@@ -1324,6 +1341,30 @@ async fn handle_client(
         {
             return write_response(&mut stream, io_timeout, &response).await;
         }
+        let archive = if let Some(id) = request_archive_id(&request) {
+            let resolved = match camera_defaults.folders.as_ref() {
+                Some(folders) => folders.resolve_for_camera(id, &camera_id).await,
+                None => Err("recording_folders_unavailable"),
+            };
+            match resolved {
+                Ok(archive) => Some(archive),
+                Err(category) => {
+                    return write_response(
+                        &mut stream,
+                        io_timeout,
+                        &json_error("404 Not Found", category),
+                    )
+                    .await
+                }
+            }
+        } else {
+            None
+        };
+        let (repository, assembler) = archive
+            .as_ref()
+            .map_or((repository, assembler), |(repository, assembler)| {
+                (repository, assembler)
+            });
         let exported = match target {
             PlaybackTarget::Range { query, .. } => {
                 Box::pin(stream_playback(
@@ -1364,7 +1405,14 @@ async fn handle_client(
             Ok(exported) => Some(*exported),
             Err(partial) => partial.delivered,
         };
-        record_export(&guard, &camera_id, delivered, exported.is_ok()).await;
+        record_export(
+            &guard,
+            &camera_id,
+            delivered,
+            exported.is_ok(),
+            request_archive_id(&request).unwrap_or("primary"),
+        )
+        .await;
         return exported.map(|_| ()).map_err(|partial| partial.error);
     }
     let response = route_with_recordings(
@@ -1418,6 +1466,31 @@ impl PlaybackTarget<'_> {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FolderSelection {
+    id: String,
+}
+
+/// Separates a registered source ID from the existing camera-scoped resource.
+fn archive_path(path: &str) -> Option<(&str, String)> {
+    let rest = path.strip_prefix("/api/recording-sources/")?;
+    let (id, tail) = rest.split_once('/')?;
+    CameraId::new(id).ok()?;
+    tail.starts_with("cameras/")
+        .then(|| (id, format!("/api/{tail}")))
+}
+
+fn request_archive_id(request: &[u8]) -> Option<&str> {
+    let header_end = find_header_end(request)?;
+    let line = std::str::from_utf8(&request[..header_end])
+        .ok()?
+        .lines()
+        .next()?;
+    let target = line.split_whitespace().nth(1)?;
+    archive_path(target.split('?').next()?).map(|(id, _)| id)
+}
+
 fn playback_target(request: &[u8]) -> Option<PlaybackTarget<'_>> {
     let header_end = find_header_end(request)?;
     let head = std::str::from_utf8(&request[..header_end]).ok()?;
@@ -1427,6 +1500,8 @@ fn playback_target(request: &[u8]) -> Option<PlaybackTarget<'_>> {
     }
     let target = line.next()?;
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let normalized = archive_path(path).map(|(_, path)| path);
+    let path = normalized.as_deref().unwrap_or(path);
     let parts: Vec<_> = path.trim_matches('/').split('/').collect();
     if parts.first() != Some(&"api")
         || parts.get(1) != Some(&"cameras")
@@ -2118,6 +2193,37 @@ async fn route_with_recordings(
         audit: access_audit,
     };
 
+    if let Some((source_id, normalized)) = archive_path(path) {
+        let segments: Vec<_> = normalized.split('/').collect();
+        let Some(camera) = segments.get(3).and_then(|id| CameraId::new(*id).ok()) else {
+            return json_error("400 Bad Request", "invalid_camera_id");
+        };
+        if let Err(response) =
+            authorize_audited(&guard, Action::ViewRecordings(camera.clone())).await
+        {
+            return response;
+        }
+        let Some(folders) = camera_defaults.folders.as_ref() else {
+            return json_error("503 Service Unavailable", "recording_folders_unavailable");
+        };
+        let (repository, assembler) = match folders.resolve_for_camera(source_id, &camera).await {
+            Ok(source) => source,
+            Err(category) => return json_error("404 Not Found", category),
+        };
+        return match (method, segments.as_slice()) {
+            ("GET", ["", "api", "cameras", _, "recordings"]) => {
+                recording_search(camera, query, assembler.root(), Some(&repository)).await
+            }
+            ("GET", ["", "api", "cameras", _, "recordings", recording]) => {
+                let Ok(recording) = surveillance_common::types::RecordingId::new(*recording) else {
+                    return json_error("400 Bad Request", "invalid_recording_id");
+                };
+                recording_detail(camera, recording, assembler.root(), Some(&repository)).await
+            }
+            _ => json_error("404 Not Found", "not_found"),
+        };
+    }
+
     if method == "GET" {
         if let Some(asset) = find_ui_asset(path) {
             return response("200 OK", asset.content_type, asset.body);
@@ -2142,7 +2248,7 @@ async fn route_with_recordings(
         ("GET", "/metrics") => response(
             "200 OK",
             "text/plain; version=0.0.4; charset=utf-8",
-            &format!("# HELP surveillance_camera_catalog_available Whether camera registration storage accepts writes.\n# TYPE surveillance_camera_catalog_available gauge\nsurveillance_camera_catalog_available {}\n{}", u8::from(supervisor.catalog_available()), render_metrics(
+            &format!("# HELP surveillance_camera_catalog_available Whether camera registration storage accepts writes.\n# TYPE surveillance_camera_catalog_available gauge\nsurveillance_camera_catalog_available {}\n{}{}", u8::from(supervisor.catalog_available()), camera_defaults.folders.as_ref().map_or_else(String::new, |folders| folders.metrics()), render_metrics(
                 &registry.snapshots(),
                 recordings,
                 metadata,
@@ -2152,6 +2258,47 @@ async fn route_with_recordings(
                 auth_metrics.as_deref(),
             )),
         ),
+        ("GET", "/api/recording-folders") => match authorize_audited(&guard, Action::ViewRecordingFolders).await {
+            Ok(_authorized) => match camera_defaults.folders.as_ref() {
+                Some(folders) => match folders.discover().await {
+                    Ok(choices) => json_response("200 OK", &choices),
+                    Err(category) => json_error("503 Service Unavailable", category),
+                },
+                None => json_error("503 Service Unavailable", "recording_folders_unavailable"),
+            },
+            Err(response) => response,
+        },
+        ("POST", "/api/recording-folders/index") => match authorize_audited(&guard, Action::IndexRecordingFolder).await {
+            Ok(_authorized) => {
+                let Ok(request) = serde_json::from_slice::<FolderSelection>(body) else { return json_error("400 Bad Request", "invalid_folder_selection"); };
+                let id = request.id.as_str();
+                let Some(folders) = camera_defaults.folders.as_ref() else { return json_error("503 Service Unavailable", "recording_folders_unavailable"); };
+                match folders.index(id).await {
+                    Ok(id) => json_response("202 Accepted", &serde_json::json!({"source_id":id})),
+                    Err("index_busy") => json_error("409 Conflict", "index_busy"),
+                    Err(category @ ("index_worker_starting" | "index_worker_unavailable" | "recording_index_unavailable")) => json_error("503 Service Unavailable", category),
+                    Err(category) => json_error("400 Bad Request", category),
+                }
+            },
+            Err(response) => response,
+        },
+        ("GET", "/api/recording-sources") => match authorize_audited(&guard, Action::ListCameras).await {
+            Ok(_authorized) => {
+                let scope = match guard.context().authentication().principal().map(surveillance_auth::principal::Principal::scope) {
+                    Some(surveillance_auth::principal::CameraScope::All) => None,
+                    Some(surveillance_auth::principal::CameraScope::Only(ids)) => Some(ids.iter().map(|id| id.as_str().to_owned()).collect()),
+                    None => Some(Vec::new()),
+                };
+                match camera_defaults.folders.as_ref() {
+                    Some(folders) => match folders.list(scope).await {
+                        Ok(sources) => json_response("200 OK", &sources),
+                        Err(category) => json_error("503 Service Unavailable", category),
+                    },
+                    None => json_response("200 OK", &Vec::<String>::new()),
+                }
+            },
+            Err(response) => response,
+        },
         ("GET", "/api/cameras") => match authorize_audited(&guard, Action::ListCameras).await {
             // The listing is filtered to what this principal may see, so a
             // scoped operator cannot enumerate the estate by listing it.
@@ -2627,7 +2774,10 @@ async fn recording_search(
                         .map(|row| encode_recording_cursor(row.started_at(), row.recording_id()))
                 })
                 .flatten();
-            let recordings = rows.iter().map(recording_response).collect();
+            let recordings = rows
+                .iter()
+                .map(|row| recording_response(row, &repository.playback_api_prefix()))
+                .collect();
             json_response(
                 "200 OK",
                 &RecordingSearchResponse {
@@ -2657,7 +2807,10 @@ async fn recording_detail(
             if recordings_are_present(repository, recording_root, std::slice::from_ref(&row))
                 .await =>
         {
-            json_response("200 OK", &recording_response(&row))
+            json_response(
+                "200 OK",
+                &recording_response(&row, &repository.playback_api_prefix()),
+            )
         }
         Ok(Some(_)) => json_error("409 Conflict", "recording_storage_inconsistent"),
         Ok(None) => json_error("404 Not Found", "recording_not_found"),
@@ -2691,6 +2844,7 @@ async fn recordings_are_present(
 
 fn recording_response(
     row: &surveillance_storage::metadata::CompletedRecording,
+    api_prefix: &str,
 ) -> RecordingResponse {
     RecordingResponse {
         recording_id: row.recording_id().as_str().to_owned(),
@@ -2705,7 +2859,7 @@ fn recording_response(
         size_bytes: row.size_bytes(),
         status: "completed",
         playback: format!(
-            "/api/cameras/{}/recordings/playback?start={}&end={}",
+            "{api_prefix}/cameras/{}/recordings/playback?start={}&end={}",
             row.camera_id(),
             jiff::Timestamp::try_from(row.started_at())
                 .map_or_else(|_| "invalid".to_owned(), |value| value.to_string()),
@@ -2713,7 +2867,7 @@ fn recording_response(
                 .map_or_else(|_| "invalid".to_owned(), |value| value.to_string()),
         ),
         video: format!(
-            "/api/cameras/{}/recordings/{}/video",
+            "{api_prefix}/cameras/{}/recordings/{}/video",
             row.camera_id(),
             row.recording_id()
         ),
@@ -5281,6 +5435,18 @@ mod tests {
 
         // (method, path, body). Every route under /api.
         let protected: Vec<(&str, &str, &str)> = vec![
+            ("GET", "/api/recording-folders", ""),
+            (
+                "POST",
+                "/api/recording-folders/index",
+                r#"{"id":"folder-test"}"#,
+            ),
+            ("GET", "/api/recording-sources", ""),
+            (
+                "GET",
+                "/api/recording-sources/archive-1/cameras/camera-01/recordings",
+                "",
+            ),
             ("GET", "/api/cameras", ""),
             ("POST", "/api/cameras", r#"{"camera_id":"camera-01"}"#),
             ("GET", "/api/cameras/camera-01", ""),
@@ -5769,6 +5935,26 @@ mod tests {
         assert!(super::readiness_response(&[], None, None, Some(&metrics))
             .await
             .starts_with("HTTP/1.1 503"));
+    }
+
+    #[test]
+    fn archive_playback_targets_keep_source_and_camera_scopes_explicit() {
+        let request = b"GET /api/recording-sources/archive-1/cameras/front/recordings/rec-1/video HTTP/1.1\r\n\r\n";
+        assert_eq!(super::request_archive_id(request), Some("archive-1"));
+        let mut binary_body = request.to_vec();
+        binary_body.push(0xff);
+        assert_eq!(
+            super::request_archive_id(&binary_body),
+            Some("archive-1"),
+            "source routing must inspect headers only"
+        );
+        let target =
+            super::playback_target(request).unwrap_or_else(|| panic!("archive video target"));
+        assert_eq!(target.camera_id().as_str(), "front");
+        assert!(
+            super::archive_path("/api/recording-sources/../cameras/front/recordings").is_none()
+        );
+        assert!(super::archive_path("/api/recording-sources/archive-1/settings").is_none());
     }
 
     fn supervisor() -> (

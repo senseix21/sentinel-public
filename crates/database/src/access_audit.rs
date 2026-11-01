@@ -106,6 +106,7 @@ pub struct AccessAuditRecord {
     action: String,
     actor: String,
     camera_id: Option<String>,
+    recording_source_id: Option<String>,
     outcome: AuditOutcome,
     reason: Option<&'static str>,
     client_address: Option<std::net::IpAddr>,
@@ -122,6 +123,7 @@ impl AccessAuditRecord {
             action: truncate(action, 64),
             actor: truncate(actor, 128),
             camera_id: None,
+            recording_source_id: None,
             outcome,
             reason: None,
             client_address: None,
@@ -142,6 +144,13 @@ impl AccessAuditRecord {
     #[must_use]
     pub fn with_camera(mut self, camera: &str) -> Self {
         self.camera_id = Some(truncate(camera, 64));
+        self
+    }
+
+    /// Associates an export with a registered source, never a filesystem path.
+    #[must_use]
+    pub fn with_recording_source(mut self, source: &str) -> Self {
+        self.recording_source_id = Some(truncate(source, 64));
         self
     }
 
@@ -248,8 +257,8 @@ impl PostgresAccessAuditRepository {
         sqlx::query(
             "INSERT INTO access_audit \
                  (category, action, actor, camera_id, outcome, reason, client_address, \
-                  range_start, range_end, byte_count, detail_fingerprint) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7::text::inet, $8, $9, $10, $11)",
+                  range_start, range_end, byte_count, detail_fingerprint, recording_source_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7::text::inet, $8, $9, $10, $11, $12)",
         )
         .bind(record.category.as_str())
         .bind(&record.action)
@@ -262,6 +271,7 @@ impl PostgresAccessAuditRepository {
         .bind(extent.map(|extent| extent.range_end))
         .bind(extent.map(|extent| extent.byte_count))
         .bind(record.detail_fingerprint.map(|print| print.to_hex()))
+        .bind(record.recording_source_id.as_deref())
         .execute(&self.pool)
         .await
         .map_err(RepositoryError::from_sqlx)?;

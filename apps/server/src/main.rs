@@ -30,6 +30,7 @@ use surveillance_server::{
     phase4_metrics::Phase4Metrics,
     playback::PlaybackAssembler,
     reconciliation_owner::ReconciliationOwner,
+    recording_folders::RecordingFolders,
     retention_owner::RetentionOwner,
     runtime_config::{
         bootstrap_count, bootstrap_duration, bootstrap_flag, bootstrap_path, bootstrap_secret,
@@ -67,6 +68,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .map(PathBuf::from)
         .or_else(|| bootstrap_path(&configuration.bootstrap, SettingId::StorageRecordingRoot))
         .unwrap_or_else(|| PathBuf::from("recordings"));
+    tokio::fs::create_dir_all(&recording_root).await?;
     let layout = surveillance_storage::filesystem::RecordingLayout::new(recording_root.clone())?;
     let ffprobe = bootstrap_path(&configuration.bootstrap, SettingId::CameraRecordingFfprobe)
         .unwrap_or_else(|| PathBuf::from("ffprobe"));
@@ -185,7 +187,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         recording_repository = Some(repository);
         playback_assembler = Some(PlaybackAssembler::new(
             layout.root().to_path_buf(),
-            ffmpeg,
+            ffmpeg.clone(),
             bootstrap_duration(&configuration.bootstrap, SettingId::PlaybackProbeTimeout)
                 .unwrap_or(std::time::Duration::from_secs(5)),
         ));
@@ -349,9 +351,42 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
     let security = Some(Arc::new(security));
 
+    let mut folder_owner = None;
+    let folders = if let Some(repository) = recording_repository.as_ref() {
+        let roots = if let Some(value) = std::env::var_os("SURVEILLANCE_RECORDING_BROWSE_ROOTS") {
+            std::env::split_paths(&value).collect()
+        } else {
+            let local = std::env::current_dir()?.join(".local");
+            tokio::fs::create_dir_all(&local).await?;
+            vec![local]
+        };
+        let (folders, owner) = RecordingFolders::new(
+            roots,
+            recording_root.clone(),
+            repository.clone(),
+            ffprobe,
+            ffmpeg,
+            std::num::NonZeroU64::new(u64::try_from(
+                bootstrap_duration(&configuration.bootstrap, SettingId::PlaybackProbeTimeout)
+                    .unwrap_or(std::time::Duration::from_secs(5))
+                    .as_millis(),
+            )?)
+            .ok_or("archive probe timeout must be positive")?,
+            reconciliation_limit,
+        )
+        .await?;
+        let (shutdown, receiver) = watch::channel(false);
+        folder_owner = Some((shutdown, tokio::spawn(owner.run(receiver))));
+        Some(folders)
+    } else {
+        None
+    };
+
     let mut adapter_task = tokio::spawn(serve_health(
         health_bind,
-        CameraDefaults::new(recording_root, livekit_template).with_settings(camera_settings),
+        CameraDefaults::new(recording_root, livekit_template)
+            .with_settings(camera_settings)
+            .with_recording_folders(folders),
         registry,
         handle.clone(),
         recording_repository,
@@ -380,6 +415,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     tracing::info!("process shutdown requested; joining all camera pipelines");
     adapter_shutdown.send_replace(true);
+    if let Some((shutdown, task)) = folder_owner {
+        shutdown.send_replace(true);
+        task.await?;
+    }
     handle.shutdown().await?;
     supervisor_task.await?;
     if let Some((shutdown, task)) = metadata_owner {

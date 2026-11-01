@@ -19,7 +19,8 @@ pub(crate) static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migr
 
 #[derive(Clone)]
 pub struct PostgresRecordingRepository {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
+    pub(crate) source_id: String,
 }
 
 impl PostgresRecordingRepository {
@@ -30,7 +31,10 @@ impl PostgresRecordingRepository {
             .max_connections(config.maximum_connections())
             .acquire_timeout(config.acquire_timeout())
             .connect_lazy_with(config.connect_options());
-        Self { pool }
+        Self {
+            pool,
+            source_id: "primary".to_owned(),
+        }
     }
 
     /// Connects using an explicitly bounded pool.
@@ -44,12 +48,18 @@ impl PostgresRecordingRepository {
             .connect_with(config.connect_options())
             .await
             .map_err(RepositoryError::from_sqlx)?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            source_id: "primary".to_owned(),
+        })
     }
 
     #[must_use]
     pub fn from_pool(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            source_id: "primary".to_owned(),
+        }
     }
 
     #[must_use]
@@ -97,8 +107,8 @@ impl PostgresRecordingRepository {
         &self,
         scope: Option<Vec<String>>,
     ) -> Result<Vec<String>, RepositoryError> {
-        let ids: Vec<String> = sqlx::query_scalar("SELECT camera_id FROM cameras c WHERE ($1::text[] IS NULL OR camera_id = ANY($1)) AND EXISTS (SELECT 1 FROM recording_segments s WHERE s.camera_id = c.camera_id) ORDER BY camera_id LIMIT 1025")
-            .bind(scope).fetch_all(&self.pool).await.map_err(RepositoryError::from_sqlx)?;
+        let ids: Vec<String> = sqlx::query_scalar("SELECT camera_id FROM cameras c WHERE ($1::text[] IS NULL OR camera_id = ANY($1)) AND EXISTS (SELECT 1 FROM recording_segments s WHERE s.camera_id = c.camera_id AND s.source_id = $2) ORDER BY camera_id LIMIT 1025")
+            .bind(scope).bind(&self.source_id).fetch_all(&self.pool).await.map_err(RepositoryError::from_sqlx)?;
         if ids.len() > 1024 {
             return Err(RepositoryError::invariant());
         }
@@ -132,7 +142,7 @@ impl PostgresRecordingRepository {
             .map_err(RepositoryError::from_sqlx)?;
 
         let inserted = sqlx::query(
-            "INSERT INTO recording_segments (recording_id, camera_id, started_at, ended_at, storage_locator, container, video_codec, width, height, size_bytes, status, provenance) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'completed', $11::recording_provenance) ON CONFLICT (recording_id) DO NOTHING",
+            "INSERT INTO recording_segments (recording_id, camera_id, started_at, ended_at, storage_locator, container, video_codec, width, height, size_bytes, status, provenance, source_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'completed', $11::recording_provenance, $12) ON CONFLICT (source_id, recording_id) DO NOTHING",
         )
         .bind(completed.recording_id().as_str())
         .bind(completed.camera_id().as_str())
@@ -145,6 +155,7 @@ impl PostgresRecordingRepository {
         .bind(height)
         .bind(i64::try_from(completed.size_bytes()).map_err(|_| RepositoryError::invariant())?)
         .bind(provenance_text(completed.provenance()))
+        .bind(&self.source_id)
         .execute(&mut *transaction)
         .await
         .map_err(RepositoryError::from_sqlx)?
@@ -154,9 +165,10 @@ impl PostgresRecordingRepository {
             PersistCompletedOutcome::Inserted
         } else {
             let row = sqlx::query(
-                "SELECT camera_id, started_at, ended_at, storage_locator, container, video_codec, width, height, size_bytes, status::text AS status, provenance::text AS provenance FROM recording_segments WHERE recording_id = $1",
+                "SELECT camera_id, started_at, ended_at, storage_locator, container, video_codec, width, height, size_bytes, status::text AS status, provenance::text AS provenance FROM recording_segments WHERE recording_id = $1 AND source_id = $2",
             )
             .bind(completed.recording_id().as_str())
+            .bind(&self.source_id)
             .fetch_one(&mut *transaction)
             .await
             .map_err(RepositoryError::from_sqlx)?;
@@ -196,7 +208,7 @@ impl PostgresRecordingRepository {
             .await
             .map_err(RepositoryError::from_sqlx)?;
         let inserted = sqlx::query(
-            "INSERT INTO recording_segments (recording_id, camera_id, started_at, ended_at, storage_locator, status, provenance, failure_category) VALUES ($1, $2, $3, $4, $5, $6::recording_status, $7::recording_provenance, $8) ON CONFLICT (recording_id) DO NOTHING",
+            "INSERT INTO recording_segments (recording_id, camera_id, started_at, ended_at, storage_locator, status, provenance, failure_category, source_id) VALUES ($1, $2, $3, $4, $5, $6::recording_status, $7::recording_provenance, $8, $9) ON CONFLICT (source_id, recording_id) DO NOTHING",
         )
         .bind(evidence.recording_id().as_str())
         .bind(evidence.camera_id().as_str())
@@ -206,6 +218,7 @@ impl PostgresRecordingRepository {
         .bind(status_text(evidence.status()))
         .bind(provenance_text(evidence.provenance()))
         .bind(failure_text(evidence.failure()))
+        .bind(&self.source_id)
         .execute(&mut *transaction)
         .await
         .map_err(RepositoryError::from_sqlx)?
@@ -214,9 +227,10 @@ impl PostgresRecordingRepository {
             PersistCompletedOutcome::Inserted
         } else {
             let row = sqlx::query(
-                "SELECT camera_id, started_at, ended_at, storage_locator, status::text AS status, provenance::text AS provenance, failure_category FROM recording_segments WHERE recording_id = $1",
+                "SELECT camera_id, started_at, ended_at, storage_locator, status::text AS status, provenance::text AS provenance, failure_category FROM recording_segments WHERE recording_id = $1 AND source_id = $2",
             )
             .bind(evidence.recording_id().as_str())
+            .bind(&self.source_id)
             .fetch_one(&mut *transaction)
             .await
             .map_err(RepositoryError::from_sqlx)?;
@@ -280,7 +294,7 @@ impl PostgresRecordingRepository {
         let limit =
             i64::try_from(search.limit().get()).map_err(|_| RepositoryError::invariant())?;
         let rows = sqlx::query(
-            "SELECT recording_id, camera_id, started_at, ended_at, storage_locator, container, video_codec, width, height, size_bytes, provenance::text AS provenance FROM recording_segments WHERE camera_id = $1 AND status = 'completed' AND started_at < $2 AND ended_at > $3 AND ($4::timestamptz IS NULL OR (started_at, recording_id) > ($4, $5::text)) ORDER BY started_at, recording_id LIMIT $6",
+            "SELECT recording_id, camera_id, started_at, ended_at, storage_locator, container, video_codec, width, height, size_bytes, provenance::text AS provenance FROM recording_segments WHERE source_id = $7 AND camera_id = $1 AND status = 'completed' AND started_at < $2 AND ended_at > $3 AND ($4::timestamptz IS NULL OR (started_at, recording_id) > ($4, $5::text)) ORDER BY started_at, recording_id LIMIT $6",
         )
         .bind(search.camera_id().as_str())
         .bind(range_end)
@@ -288,6 +302,7 @@ impl PostgresRecordingRepository {
         .bind(cursor_time)
         .bind(cursor_id)
         .bind(limit)
+        .bind(&self.source_id)
         .fetch_all(&self.pool)
         .await
         .map_err(RepositoryError::from_sqlx)?;
@@ -305,10 +320,11 @@ impl PostgresRecordingRepository {
         recording_id: &RecordingId,
     ) -> Result<Option<CompletedRecording>, RepositoryError> {
         let row = sqlx::query(
-            "SELECT recording_id, camera_id, started_at, ended_at, storage_locator, container, video_codec, width, height, size_bytes, provenance::text AS provenance FROM recording_segments WHERE camera_id = $1 AND recording_id = $2 AND status = 'completed'",
+            "SELECT recording_id, camera_id, started_at, ended_at, storage_locator, container, video_codec, width, height, size_bytes, provenance::text AS provenance FROM recording_segments WHERE source_id = $3 AND camera_id = $1 AND recording_id = $2 AND status = 'completed'",
         )
         .bind(camera_id.as_str())
         .bind(recording_id.as_str())
+        .bind(&self.source_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(RepositoryError::from_sqlx)?;
@@ -324,9 +340,10 @@ impl PostgresRecordingRepository {
         recording_id: &RecordingId,
     ) -> Result<Option<RecordingStatus>, RepositoryError> {
         let value = sqlx::query_scalar::<_, String>(
-            "SELECT status::text FROM recording_segments WHERE recording_id = $1",
+            "SELECT status::text FROM recording_segments WHERE source_id = $2 AND recording_id = $1",
         )
         .bind(recording_id.as_str())
+        .bind(&self.source_id)
         .fetch_optional(&self.pool)
         .await
         .map_err(RepositoryError::from_sqlx)?;
@@ -346,10 +363,11 @@ impl PostgresRecordingRepository {
             return Err(RepositoryError::invariant());
         }
         let rows = sqlx::query(
-            "SELECT recording_id, storage_locator FROM recording_segments WHERE status = 'completed' AND ($1::text IS NULL OR recording_id > $1) ORDER BY recording_id LIMIT $2",
+            "SELECT recording_id, storage_locator FROM recording_segments WHERE source_id = $3 AND status = 'completed' AND ($1::text IS NULL OR recording_id > $1) ORDER BY recording_id LIMIT $2",
         )
         .bind(after.map(RecordingId::as_str))
         .bind(i64::try_from(limit).map_err(|_| RepositoryError::invariant())?)
+        .bind(&self.source_id)
         .fetch_all(&self.pool)
         .await
         .map_err(RepositoryError::from_sqlx)?;
@@ -382,9 +400,10 @@ impl PostgresRecordingRepository {
         recording_id: &RecordingId,
     ) -> Result<bool, RepositoryError> {
         let changed = sqlx::query(
-            "UPDATE recording_segments SET status = 'inconsistent', status_changed_at = clock_timestamp(), failure_category = 'reconciliation' WHERE recording_id = $1 AND status = 'completed'",
+            "UPDATE recording_segments SET status = 'inconsistent', status_changed_at = clock_timestamp(), failure_category = 'reconciliation' WHERE source_id = $2 AND recording_id = $1 AND status = 'completed'",
         )
         .bind(recording_id.as_str())
+        .bind(&self.source_id)
         .execute(&self.pool)
         .await
         .map_err(RepositoryError::from_sqlx)?
@@ -403,6 +422,9 @@ impl PostgresRecordingRepository {
         maximum_files: usize,
         maximum_bytes: u64,
     ) -> Result<Vec<RetentionCandidate>, RepositoryError> {
+        if self.source_id != "primary" {
+            return Err(RepositoryError::invariant());
+        }
         if maximum_files == 0 || maximum_files > 1_000 || maximum_bytes == 0 {
             return Err(RepositoryError::invariant());
         }
@@ -412,7 +434,7 @@ impl PostgresRecordingRepository {
             .await
             .map_err(RepositoryError::from_sqlx)?;
         let rows = sqlx::query(
-            "SELECT recording_id, storage_locator, size_bytes FROM recording_segments WHERE status = 'completed' AND ended_at <= $1 AND ended_at < $2 ORDER BY ended_at, recording_id FOR UPDATE SKIP LOCKED LIMIT $3",
+            "SELECT recording_id, storage_locator, size_bytes FROM recording_segments WHERE source_id = 'primary' AND status = 'completed' AND ended_at <= $1 AND ended_at < $2 ORDER BY ended_at, recording_id FOR UPDATE SKIP LOCKED LIMIT $3",
         )
         .bind(system_timestamp(age_cutoff))
         .bind(system_timestamp(protected_cutoff))
@@ -430,7 +452,7 @@ impl PostgresRecordingRepository {
             if next_bytes > maximum_bytes {
                 break;
             }
-            sqlx::query("UPDATE recording_segments SET status = 'deletion_pending', status_changed_at = clock_timestamp() WHERE recording_id = $1 AND status = 'completed'")
+            sqlx::query("UPDATE recording_segments SET status = 'deletion_pending', status_changed_at = clock_timestamp() WHERE source_id = 'primary' AND recording_id = $1 AND status = 'completed'")
                 .bind(candidate.recording_id.as_str())
                 .execute(&mut *transaction).await.map_err(RepositoryError::from_sqlx)?;
             claimed_bytes = next_bytes;
@@ -451,10 +473,13 @@ impl PostgresRecordingRepository {
         &self,
         limit: usize,
     ) -> Result<Vec<RetentionCandidate>, RepositoryError> {
+        if self.source_id != "primary" {
+            return Err(RepositoryError::invariant());
+        }
         if limit == 0 || limit > 1_000 {
             return Err(RepositoryError::invariant());
         }
-        let rows = sqlx::query("SELECT recording_id, storage_locator, size_bytes FROM recording_segments WHERE status = 'deletion_pending' ORDER BY status_changed_at, recording_id LIMIT $1")
+        let rows = sqlx::query("SELECT recording_id, storage_locator, size_bytes FROM recording_segments WHERE source_id = 'primary' AND status = 'deletion_pending' ORDER BY status_changed_at, recording_id LIMIT $1")
             .bind(i64::try_from(limit).map_err(|_| RepositoryError::invariant())?)
             .fetch_all(&self.pool).await.map_err(RepositoryError::from_sqlx)?;
         rows.iter().map(retention_candidate_from_row).collect()
@@ -468,7 +493,10 @@ impl PostgresRecordingRepository {
         &self,
         recording_id: &RecordingId,
     ) -> Result<bool, RepositoryError> {
-        let changed = sqlx::query("UPDATE recording_segments SET status = 'deleted', status_changed_at = clock_timestamp() WHERE recording_id = $1 AND status = 'deletion_pending'")
+        if self.source_id != "primary" {
+            return Err(RepositoryError::invariant());
+        }
+        let changed = sqlx::query("UPDATE recording_segments SET status = 'deleted', status_changed_at = clock_timestamp() WHERE source_id = 'primary' AND recording_id = $1 AND status = 'deletion_pending'")
             .bind(recording_id.as_str()).execute(&self.pool).await.map_err(RepositoryError::from_sqlx)?.rows_affected();
         Ok(changed == 1)
     }

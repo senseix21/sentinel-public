@@ -4,6 +4,8 @@ This directory contains compact, dated handoff snapshots. Its purpose is to let 
 
 ## Latest snapshot
 
+**2026-11-01 (Playback folders):** [Dashboard recording folders](2026-11-01/playback-folders.md) — choose an existing server folder after plain `make run`; bounded read-only indexing, durable source namespaces, source-scoped playback and recording dates. Both actual server recording collections decoded in Chromium.
+
 **2026-11-01:** [Camera-independent startup](2026-11-01/camera-independent-startup.md) — durable dashboard camera setup, desired state, write-only RTSP credentials, separate dependency readiness and archived-camera playback. Local workspace, PostgreSQL and browser checks passed; see the snapshot for scope and remaining hardware gates.
 
 **2026-10-31:** [`context/2026-10-31/`](2026-10-31/) — isolated playback fuzz targets ran 605,965 clean executions after finding and fixing two cursor bugs; 592 workspace tests passed with 39 ignored. Plain macOS release remains blocked by the SQLx LINKEDIT issue; the explicit unstripped workaround passed. Runtime qualification and production gates from October 23 remain open.
