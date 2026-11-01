@@ -21,7 +21,7 @@ RTSP_URL ?= $(SURVEILLANCE_RTSP_URL)
 RECORDING_ROOT ?= ./recordings
 HEALTH_BIND ?= 127.0.0.1:3000
 
-.PHONY: help prerequisites webcam-devices run run-release server direct-camera-qualification health live ready metrics recordings play verify-recordings check verify verify-onnx container-shell container-verify container-verify-onnx container-verify-model container-verify-accuracy container-verify-livekit container-reproduce-livekit-restart
+.PHONY: help prerequisites webcam-devices webcam webcam-release fixture run run-release server direct-camera-qualification health live ready metrics recordings play verify-recordings check verify verify-onnx container-shell container-verify container-verify-onnx container-verify-model container-verify-accuracy container-verify-livekit container-reproduce-livekit-restart
 
 help: ## Show manual development commands and configurable values.
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-20s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -44,11 +44,21 @@ prerequisites: ## Verify required manual-run executables are available.
 webcam-devices: ## List macOS AVFoundation video and audio device indices.
 	@"$(FFMPEG_BIN)" -hide_banner -f avfoundation -list_devices true -i "" 2>&1 || true
 
-run: ## Run webcam + ONNX detection and open the web UI.
+run: ## Start the dashboard and services without requiring a camera.
+	RECORDING_ROOT="$(RECORDING_ROOT)" scripts/dev/local-stack.sh
+
+run-release: ## Start the camera-independent dashboard with an optimized build.
+	RECORDING_ROOT="$(RECORDING_ROOT)" SENTINEL_BUILD_PROFILE=release scripts/dev/local-stack.sh
+
+webcam: ## Run webcam + ONNX detection and open the web UI.
 	WEBCAM_DEVICE="$(WEBCAM_DEVICE)" VIDEO_WIDTH="$(VIDEO_WIDTH)" VIDEO_HEIGHT="$(VIDEO_HEIGHT)" VIDEO_FPS="$(VIDEO_FPS)" VIDEO_BITRATE_KBPS="$(VIDEO_BITRATE_KBPS)" CAMERA_ID="$(CAMERA_ID)" RECORDING_ROOT="$(RECORDING_ROOT)" scripts/dev/local-webcam-stack.sh
 
-run-release: ## Run the optimized local webcam stack.
+webcam-release: ## Run the optimized local webcam stack.
 	WEBCAM_DEVICE="$(WEBCAM_DEVICE)" VIDEO_WIDTH="$(VIDEO_WIDTH)" VIDEO_HEIGHT="$(VIDEO_HEIGHT)" VIDEO_FPS="$(VIDEO_FPS)" VIDEO_BITRATE_KBPS="$(VIDEO_BITRATE_KBPS)" CAMERA_ID="$(CAMERA_ID)" RECORDING_ROOT="$(RECORDING_ROOT)" SENTINEL_BUILD_PROFILE=release scripts/dev/local-webcam-stack.sh
+
+fixture: ## Start with a loopback RTSP fixture supplied via SENTINEL_RTSP_FIXTURE_URL.
+	@test -n "$${SENTINEL_RTSP_FIXTURE_URL}" || { echo "missing SENTINEL_RTSP_FIXTURE_URL" >&2; exit 2; }
+	SENTINEL_SOURCE_MODE=fixture scripts/dev/local-webcam-stack.sh
 
 server: ## Run the development server against a direct RTSP camera.
 	@test -n "$(RTSP_URL)" || { echo "missing RTSP_URL (or SURVEILLANCE_RTSP_URL)" >&2; exit 2; }
@@ -69,7 +79,7 @@ health: live ready metrics ## Query all operational endpoints.
 live: ## Query process liveness.
 	@"$(CURL_BIN)" --fail --silent --show-error "http://$(HEALTH_BIND)/live"
 
-ready: ## Query camera-dependent readiness.
+ready: ## Query application dependency readiness.
 	@"$(CURL_BIN)" --fail --silent --show-error "http://$(HEALTH_BIND)/ready"
 
 metrics: ## Print Prometheus text metrics.
@@ -101,7 +111,7 @@ verify-live-browser: ## Check the running local live UI; supply Playwright via P
 .PHONY: verify-live-browser
 
 verify: ## Run the gate without the live advisory database (used by pull-request CI).
-	bash -n scripts/dev/local-webcam-stack.sh scripts/dev/onnx-defaults.sh scripts/dev/livekit-config.sh scripts/phase9/direct-camera-qualification.sh
+	bash -n scripts/dev/local-stack.sh scripts/dev/local-webcam-stack.sh scripts/dev/onnx-defaults.sh scripts/dev/livekit-config.sh scripts/phase9/direct-camera-qualification.sh
 	python3 -m unittest scripts/dev/test_trust_boundary_proxy.py scripts/dev/test_onnx_defaults.py scripts/dev/test_livekit_loopback.py scripts/phase9/test_direct_camera_report.py
 	"$(NODE)" --check scripts/dev/check-live-browser.cjs
 	"$(NODE)" --check scripts/dev/check-rtsp-recovery.cjs

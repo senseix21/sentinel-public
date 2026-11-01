@@ -18,6 +18,7 @@ fuzzing = []
 onnx-inference = ["surveillance-detector/onnx-inference"]
 
 [dependencies]
+fs2.workspace = true
 jiff.workspace = true
 chrono = { workspace = true }
 subtle = { workspace = true }

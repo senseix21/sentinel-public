@@ -7,6 +7,10 @@ Date: 2026-08-15
 Closes the identity question ADR 008 deferred to Phase 8, and the production
 secret store question left open by ADR 003 and deferred again by ADR 008.
 
+Amended 2026-11-01 by [ADR 019](019-camera-independent-startup.md): camera
+registrations and desired running state are durable in a protected local catalog;
+write-only dashboard RTSP credentials are permitted for camera onboarding.
+
 ## Context
 
 `docs/phase-8/HANDOFF.md` names five decisions that must precede code. Three of

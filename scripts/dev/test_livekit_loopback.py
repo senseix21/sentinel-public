@@ -25,6 +25,36 @@ class LiveKitLoopbackTest(unittest.TestCase):
         self.assertEqual(commands.call_args_list, [call(["route", "-n", "get", "default"], text=True),
                                                    call(["ipconfig", "getifaddr", "test-nic"], text=True)])
 
+    def test_linux_auto_public_route_falls_back_to_loopback(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+        helper = Path(__file__).with_name("livekit-config.sh").read_text()
+        script = helper.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        output = io.StringIO()
+        with patch("sys.platform", "linux"), patch("sys.argv", ["test", "auto"]), \
+             patch("socket.socket") as sockets, contextlib.redirect_stdout(output):
+            probe = sockets.return_value.__enter__.return_value
+            probe.getsockname.return_value = ("172.104.62.66", 12345)
+            exec(compile(script, "livekit-ip-selection", "exec"), {})
+            probe.bind.assert_called_once_with(("127.0.0.1", 0))
+        self.assertEqual(output.getvalue().strip(), "127.0.0.1")
+
+    def test_linux_auto_keeps_a_private_route_address(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+        helper = Path(__file__).with_name("livekit-config.sh").read_text()
+        script = helper.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        output = io.StringIO()
+        with patch("sys.platform", "linux"), patch("sys.argv", ["test", "auto"]), \
+             patch("socket.socket") as sockets, contextlib.redirect_stdout(output):
+            probe = sockets.return_value.__enter__.return_value
+            probe.getsockname.return_value = ("10.20.0.5", 12345)
+            exec(compile(script, "livekit-ip-selection", "exec"), {})
+            probe.bind.assert_called_once_with(("10.20.0.5", 0))
+        self.assertEqual(output.getvalue().strip(), "10.20.0.5")
+
     @unittest.skipUnless(shutil.which("livekit-server") and shutil.which("lsof"),
                          "requires livekit-server and lsof")
     def test_local_stack_advertises_loopback_media_address(self):

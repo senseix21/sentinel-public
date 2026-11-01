@@ -6,16 +6,18 @@ import { contiguousRuns, coverageBuckets, playbackTime, PLAYBACK_TIMEZONES } fro
 export function createPlaybackScreen({ state, fleetCounts, fleetProblem, errorBanner, pb }) {
   function screenPlayback() {
     const counts = fleetCounts();
-    if (!pb.camera && counts.cameras.length) pb.camera = counts.cameras[0].camera_id;
+    const cameras = [...new Set([...counts.cameras.map((camera) => camera.camera_id), ...(state.archiveCameras || [])])].sort();
+    if (!pb.camera && cameras.length) pb.camera = cameras[0];
     if (!pb.date) pb.date = new Date().toISOString().slice(0, 10);
   
     return `${fleetProblem()}
+      ${state.archiveError ? errorBanner(state.archiveError) : ""}
       <div class="card">
         <div class="filters">
           <div class="field">
             <label class="f">Camera</label>
             <select class="f" data-bind="camera">
-              ${counts.cameras.map((camera) => `<option value="${esc(camera.camera_id)}" ${camera.camera_id === pb.camera ? "selected" : ""}>${esc(camera.camera_id)}</option>`).join("")}
+              ${cameras.map((id) => `<option value="${esc(id)}" ${id === pb.camera ? "selected" : ""}>${esc(id)}</option>`).join("")}
             </select>
           </div>
           <div class="field">

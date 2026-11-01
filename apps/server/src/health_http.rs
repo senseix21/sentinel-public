@@ -2,7 +2,7 @@
 
 use std::{fmt::Write as _, io, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use surveillance_camera::connection::ConnectionState;
 use surveillance_common::types::CameraId;
 use surveillance_config::{
@@ -1154,6 +1154,7 @@ async fn playback_stall_timeout(settings: Option<&SettingsService>) -> Duration 
 pub struct CameraDefaults {
     recording_root: PathBuf,
     livekit: Option<LiveKitSettings>,
+    settings: Option<Arc<surveillance_config::resolution::ResolvedSettings>>,
 }
 
 impl CameraDefaults {
@@ -1165,7 +1166,18 @@ impl CameraDefaults {
         Self {
             recording_root,
             livekit,
+            settings: None,
         }
+    }
+
+    /// Enables durable dashboard registration using resolved deployment defaults.
+    #[must_use]
+    pub fn with_settings(
+        mut self,
+        settings: Arc<surveillance_config::resolution::ResolvedSettings>,
+    ) -> Self {
+        self.settings = Some(settings);
+        self
     }
 
     #[must_use]
@@ -2123,13 +2135,14 @@ async fn route_with_recordings(
         // unprovisioned person would meet a raw JSON `401` instead of the
         // screen that explains signing in again cannot help them.
         ("GET", "/live") => response("200 OK", "text/plain; charset=utf-8", "live\n"),
+        ("GET", "/ready") if !supervisor.catalog_available() => response("503 Service Unavailable", "text/plain; charset=utf-8", "camera configuration store is unavailable\n"),
         ("GET", "/ready") => {
             readiness_response(&registry.snapshots(), recordings, metadata, phase4).await
         }
         ("GET", "/metrics") => response(
             "200 OK",
             "text/plain; version=0.0.4; charset=utf-8",
-            &render_metrics(
+            &format!("# HELP surveillance_camera_catalog_available Whether camera registration storage accepts writes.\n# TYPE surveillance_camera_catalog_available gauge\nsurveillance_camera_catalog_available {}\n{}", u8::from(supervisor.catalog_available()), render_metrics(
                 &registry.snapshots(),
                 recordings,
                 metadata,
@@ -2137,7 +2150,7 @@ async fn route_with_recordings(
                 Some(&supervisor.event_bus()),
                 configuration_view.as_ref(),
                 auth_metrics.as_deref(),
-            ),
+            )),
         ),
         ("GET", "/api/cameras") => match authorize_audited(&guard, Action::ListCameras).await {
             // The listing is filtered to what this principal may see, so a
@@ -2146,6 +2159,30 @@ async fn route_with_recordings(
                 "200 OK",
                 &camera_list(&visible_snapshots(registry, guard.context())),
             ),
+            Err(response) => response,
+        },
+        ("GET", "/api/recording-cameras") => match authorize_audited(&guard, Action::ListCameras)
+            .await
+        {
+            Ok(_authorized) => {
+                let Some(principal) = guard.context().authentication().principal() else {
+                    return json_error("401 Unauthorized", "authentication_required");
+                };
+                let Some(repository) = recordings else {
+                    return json_response("200 OK", &Vec::<String>::new());
+                };
+                // An empty scope stays empty; it never means unrestricted.
+                let scope = match principal.scope() {
+                    surveillance_auth::principal::CameraScope::All => None,
+                    surveillance_auth::principal::CameraScope::Only(ids) => {
+                        Some(ids.iter().map(|id| id.as_str().to_owned()).collect())
+                    }
+                };
+                match repository.archive_cameras(scope).await {
+                    Ok(ids) => json_response("200 OK", &ids),
+                    Err(_) => json_error("503 Service Unavailable", "recording_index_unavailable"),
+                }
+            }
             Err(response) => response,
         },
         ("POST", "/api/cameras") => match authorize_audited(&guard, Action::AddCamera).await {
@@ -2714,33 +2751,7 @@ fn decode_recording_cursor(value: &str) -> Result<RecordingCursor, ()> {
     Ok(RecordingCursor::new(started_at, recording_id))
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AddCameraRequest {
-    camera_id: String,
-    rtsp_endpoint: String,
-    username: Option<String>,
-    password: Option<String>,
-    width: u32,
-    height: u32,
-    #[serde(default = "default_detection_enabled")]
-    detection_enabled: bool,
-    /// Whether this camera publishes to the deployment's `LiveKit`.
-    ///
-    /// Absent means "whatever this deployment does": publish when `LiveKit` is
-    /// configured, and do not when it is not. Before this field existed the
-    /// answer was always *no*, so every camera added through the API was
-    /// silently created unable to publish while the bootstrap camera published
-    /// — a fleet that could not be watched, with nothing anywhere saying why.
-    ///
-    /// It carries no endpoint and no credential. Those are deployment facts
-    /// held in [`CameraDefaults`]; this is the one bit that is per-camera.
-    live_publication_enabled: Option<bool>,
-}
-
-const fn default_detection_enabled() -> bool {
-    true
-}
+type AddCameraRequest = crate::camera_catalog::CameraRegistration;
 
 /// Whether a request asks for this camera to publish.
 ///
@@ -2769,35 +2780,45 @@ async fn add_camera(
     let Ok(request) = serde_json::from_slice::<AddCameraRequest>(body) else {
         return json_error("400 Bad Request", "invalid_camera_configuration");
     };
-    let credentials = match (request.username, request.password) {
-        (None, None) => None,
-        (Some(username), Some(password)) => Some(CameraCredentialsSettings { username, password }),
-        _ => return json_error("400 Bad Request", "incomplete_camera_credentials"),
-    };
-    let mut settings = OneCameraSettings::h264_mvp(
-        request.camera_id,
-        request.rtsp_endpoint,
-        credentials,
-        request.width,
-        request.height,
-        defaults.recording_root().to_path_buf(),
-    );
-    settings.detection_enabled = request.detection_enabled;
-    if wants_live_publication(request.live_publication_enabled, defaults.publishes_live()) {
-        // Refused rather than ignored. Accepting the camera without publication
-        // would answer 201 to a request that asked for something this
-        // deployment cannot do, and the operator would find out by watching a
-        // tile stay dark. An absent field never reaches here without LiveKit,
-        // so only an explicit `true` can be rejected this way.
-        let Some(livekit) = defaults.livekit() else {
-            return json_error("400 Bad Request", "live_publication_not_configured");
+    let settings = if let Some(resolved) = defaults.settings.as_ref() {
+        match crate::runtime_config::load_registered_camera(&request, resolved) {
+            Ok(settings) => settings,
+            Err(_) => return json_error("400 Bad Request", "invalid_camera_configuration"),
+        }
+    } else {
+        let credentials = match (request.username.clone(), request.password.clone()) {
+            (None, None) => None,
+            (Some(username), Some(password)) => {
+                Some(CameraCredentialsSettings { username, password })
+            }
+            _ => return json_error("400 Bad Request", "incomplete_camera_credentials"),
         };
-        settings.livekit = Some(livekit);
-    }
+        let mut settings = OneCameraSettings::h264_mvp(
+            request.camera_id.clone(),
+            request.rtsp_endpoint.clone(),
+            credentials,
+            request.width,
+            request.height,
+            defaults.recording_root().to_path_buf(),
+        );
+        settings.detection_enabled = request.detection_enabled;
+        if wants_live_publication(request.live_publication_enabled, defaults.publishes_live()) {
+            let Some(livekit) = defaults.livekit() else {
+                return json_error("400 Bad Request", "live_publication_not_configured");
+            };
+            settings.livekit = Some(livekit);
+        }
+        settings
+    };
     let Ok(config) = OneCameraConfig::validate(settings) else {
         return json_error("400 Bad Request", "invalid_camera_configuration");
     };
-    operation_response(supervisor.add(Arc::new(config)).await, "201 Created")
+    let result = if defaults.settings.is_some() {
+        supervisor.register(Arc::new(config), request).await
+    } else {
+        supervisor.add(Arc::new(config)).await
+    };
+    operation_response(result, "201 Created")
 }
 
 fn operation_response(result: Result<(), SupervisorRequestError>, success: &str) -> String {
@@ -2811,6 +2832,10 @@ fn operation_response(result: Result<(), SupervisorRequestError>, success: &str)
             crate::camera_supervisor::SupervisorOperationError::UnknownCamera => {
                 json_error("404 Not Found", "camera_not_found")
             }
+            crate::camera_supervisor::SupervisorOperationError::Persistence => json_error(
+                "503 Service Unavailable",
+                "camera_configuration_store_unavailable",
+            ),
             crate::camera_supervisor::SupervisorOperationError::RegistryFull => {
                 json_error("409 Conflict", "camera_capacity_reached")
             }
@@ -3033,18 +3058,11 @@ fn camera_list(snapshots: &[CameraStatusSnapshot]) -> Vec<CameraResponse> {
 }
 
 async fn readiness_response(
-    snapshots: &[CameraStatusSnapshot],
+    _snapshots: &[CameraStatusSnapshot],
     recordings: Option<&PostgresRecordingRepository>,
     metadata: Option<&MetadataWriterHandle>,
     phase4: Option<&Phase4Metrics>,
 ) -> String {
-    let ready = !snapshots.is_empty()
-        && snapshots.iter().all(|snapshot| {
-            snapshot.pipeline_state == PipelineState::Running
-                && snapshot.health.as_ref().is_some_and(|health| {
-                    matches!(health.connection.state(), ConnectionState::Connected { .. })
-                })
-        });
     let database_ready = match recordings {
         Some(repository) => repository.health().await.is_ok(),
         None => true,
@@ -3057,7 +3075,7 @@ async fn readiness_response(
         metrics.snapshot().storage_pressure
             < surveillance_storage::retention::StoragePressure::Critical
     });
-    if ready && database_ready && metadata_ready && storage_ready {
+    if database_ready && metadata_ready && storage_ready {
         response("200 OK", "text/plain; charset=utf-8", "ready\n")
     } else {
         response(
@@ -3070,7 +3088,7 @@ async fn readiness_response(
             } else if !storage_ready {
                 "recording storage pressure is critical\n"
             } else {
-                "one or more cameras are degraded\n"
+                "application dependencies are degraded\n"
             },
         )
     }
@@ -5715,6 +5733,42 @@ mod tests {
             decode_recording_cursor(&encoded).unwrap_or_else(|()| panic!("cursor must decode"));
         assert_eq!(decoded.started_at(), range.start());
         assert_eq!(decoded.recording_id(), &recording_id);
+    }
+
+    #[tokio::test]
+    async fn application_readiness_accepts_empty_stopped_and_disconnected_cameras() {
+        let empty = super::readiness_response(&[], None, None, None).await;
+        assert!(empty.starts_with("HTTP/1.1 200"));
+        for state in [
+            PipelineState::Configured,
+            PipelineState::Stopped,
+            PipelineState::Degraded,
+        ] {
+            let camera = super::CameraStatusSnapshot {
+                camera_id: surveillance_common::types::CameraId::new("offline")
+                    .unwrap_or_else(|_| panic!("id")),
+                pipeline_state: state,
+                health: None,
+                last_failure: None,
+            };
+            assert!(super::readiness_response(&[camera], None, None, None)
+                .await
+                .starts_with("HTTP/1.1 200"));
+        }
+        let metrics = crate::phase4_metrics::Phase4Metrics::default();
+        metrics.retention(crate::retention_owner::RetentionPass {
+            candidates: 0,
+            deleted: 0,
+            already_missing: 0,
+            failures: 0,
+            bytes_reclaimed: 0,
+            pressure: surveillance_storage::retention::StoragePressure::Critical,
+            total_bytes: 100,
+            free_bytes: 0,
+        });
+        assert!(super::readiness_response(&[], None, None, Some(&metrics))
+            .await
+            .starts_with("HTTP/1.1 503"));
     }
 
     fn supervisor() -> (

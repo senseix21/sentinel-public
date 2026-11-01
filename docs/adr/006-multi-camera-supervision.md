@@ -4,6 +4,10 @@ Status: accepted for Phase 3 synthetic qualification; representative-camera qual
 
 Date: 2026-08-11
 
+Amended 2026-11-01 by [ADR 019](019-camera-independent-startup.md): camera
+registrations and desired running state are durable in a protected local catalog;
+write-only dashboard RTSP credentials are permitted for camera onboarding.
+
 ## Context
 
 Phase 2 has one structured camera-to-recorder lifetime, but `main` constructs it

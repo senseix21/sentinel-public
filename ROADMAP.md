@@ -498,6 +498,16 @@ remains unconfirmed**, which blocks items 8 and 9 in part.
 
 ### Operator dashboard (not a Phase 8 instruction; recorded because it ships)
 
+- [x] Camera-independent startup (2026-11-01, ADR 019): `make run` starts the
+  dashboard without a webcam or bootstrap RTSP camera. Supervisor-owned secret
+  catalog persists dashboard registration and running/stopped intent; credentials
+  are write-only. Camera failures are separate from application readiness.
+  Playback merges runtime and indexed archive identities. `make webcam` and
+  `make fixture` retain explicit manual sources. Verified with zero-camera login,
+  authenticated RTSP configuration, offline start, restart, stop/remove and
+  archive scope tests. Physical RTSP camera connectivity remains unqualified.
+
+
 - [~] Local live decoding qualified on 2026-10-09 after a reported blank-video
   failure: signalling succeeded but ICE received zero bytes because the dev SFU
   advertised an automatically selected network interface. Explicit loopback RTC

@@ -38,10 +38,16 @@ export function createCamerasScreen({
   
       <div class="card mt">
         <h3>${icon("plus")} Add a camera</h3>
-        <p class="note">Registers a camera with the supervisor. It is added stopped; press Start on its row when you want it to connect.</p>
+        <p class="note">Saves a camera on this server, initially stopped. Press Start to connect; running cameras resume after a server restart.</p>
         <div class="filters">
           <div class="field"><label class="f">Camera identifier</label><input class="f" id="add-camera-id" data-add="id" value="${esc(add.id)}" placeholder="camera-02" autocomplete="off"></div>
           <div class="field grow"><label class="f">RTSP endpoint</label><input class="f" id="add-camera-rtsp" data-add="rtsp" value="${esc(add.rtsp)}" placeholder="rtsp://192.168.1.20:554/stream1" autocomplete="off"></div>
+          <div class="field"><label class="f">Camera username (optional)</label><input class="f" data-add="username" value="${esc(add.username || "")}" autocomplete="off"></div>
+          <div class="field"><label class="f">Camera password (optional)</label><input class="f" type="password" data-add="password" value="${esc(add.password || "")}" autocomplete="new-password"></div>
+          <div class="field"><label class="f">Detection</label><select class="f" data-add="detection">
+            <option value="off" ${add.detection !== "on" ? "selected" : ""}>Disabled</option>
+            <option value="on" ${add.detection === "on" ? "selected" : ""}>Enabled (requires configured backend)</option>
+          </select></div>
           <div class="field"><label class="f">Width</label><input class="f" id="add-camera-width" data-add="width" type="number" min="1" value="${esc(add.width)}"></div>
           <div class="field"><label class="f">Height</label><input class="f" id="add-camera-height" data-add="height" type="number" min="1" value="${esc(add.height)}"></div>
         </div>
@@ -54,7 +60,7 @@ export function createCamerasScreen({
             </select></div>
           <div class="row"><button class="btn primary" data-act="camera-add">${icon("plus")} Add camera</button></div>
         </div>
-        <p class="note">This form takes no RTSP username or password: the dashboard holds no credential of any kind, so there is nothing on it for a script injection to read. A camera that needs one is added through <code>POST /api/cameras</code>, which accepts both.</p>
+        <p class="note">Enter credentials separately from the RTSP URL. They are saved in a protected server file and are never returned by the API. Fields clear after a successful add. The dev server must be able to reach the camera's network address.</p>
         <p class="note">Live publication carries no endpoint or credential from this page. The server holds one LiveKit deployment and stamps it onto the camera; leaving this on <em>Same as this deployment</em> publishes when the server publishes. Choosing <em>Publish to LiveKit</em> on a server with none configured is refused rather than quietly ignored.</p>
         <div id="add-camera-out"></div>
       </div>`;

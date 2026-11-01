@@ -2,6 +2,7 @@
 
 pub mod authenticate;
 pub mod authorize;
+pub mod camera_catalog;
 pub mod camera_supervisor;
 pub mod health_http;
 pub mod metadata_writer;

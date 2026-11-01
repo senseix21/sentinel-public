@@ -89,6 +89,22 @@ impl PostgresRecordingRepository {
             .map_err(RepositoryError::migration)
     }
 
+    /// Lists archive identities independently of the runtime camera registry.
+    /// Scope filtering happens before the bounded result limit.
+    /// # Errors
+    /// Returns a typed repository error, including an over-capacity catalog.
+    pub async fn archive_cameras(
+        &self,
+        scope: Option<Vec<String>>,
+    ) -> Result<Vec<String>, RepositoryError> {
+        let ids: Vec<String> = sqlx::query_scalar("SELECT camera_id FROM cameras c WHERE ($1::text[] IS NULL OR camera_id = ANY($1)) AND EXISTS (SELECT 1 FROM recording_segments s WHERE s.camera_id = c.camera_id) ORDER BY camera_id LIMIT 1025")
+            .bind(scope).fetch_all(&self.pool).await.map_err(RepositoryError::from_sqlx)?;
+        if ids.len() > 1024 {
+            return Err(RepositoryError::invariant());
+        }
+        Ok(ids)
+    }
+
     /// Atomically creates the camera identity and inserts or confirms immutable
     /// completed evidence.
     ///

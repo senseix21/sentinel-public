@@ -244,6 +244,22 @@ async fn overlap_query_is_camera_scoped_half_open_ordered_and_paginated() {
             .await
             .unwrap_or_else(|error| panic!("fixture insert succeeds: {error}"));
     }
+    let archives = repository
+        .archive_cameras(Some(vec!["query-camera".to_owned()]))
+        .await
+        .unwrap_or_else(|error| panic!("archive scope query: {error}"));
+    assert_eq!(archives, vec!["query-camera"]);
+    assert!(repository
+        .archive_cameras(Some(Vec::new()))
+        .await
+        .unwrap_or_else(|error| panic!("empty archive scope: {error}"))
+        .is_empty());
+    let all_archives = repository
+        .archive_cameras(None)
+        .await
+        .unwrap_or_else(|error| panic!("all archive cameras: {error}"));
+    assert!(all_archives.contains(&"query-camera".to_owned()));
+    assert!(all_archives.contains(&"other-camera".to_owned()));
     let range = RecordingTimeRange::new(
         SystemTime::UNIX_EPOCH + Duration::from_secs(630),
         SystemTime::UNIX_EPOCH + Duration::from_secs(750),

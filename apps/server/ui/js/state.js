@@ -1,6 +1,8 @@
 export function createAppState() {
   return {
     cameras: null,
+    archiveCameras: [],
+    archiveError: null,
     system: null,
     settings: null,
     settingsError: null,

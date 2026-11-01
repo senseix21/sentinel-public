@@ -26,3 +26,16 @@ test("a missing camera does not reveal whether authorization hid it", async () =
     assert.equal(html.toLowerCase().includes(leak), false, `leaked ${leak}`);
   }
 });
+
+test("empty fleet offers durable camera onboarding with separate credential inputs", () => {
+  const screen = createCamerasScreen({
+    add: { id: "", rtsp: "", width: "1280", height: "720", detection: "off" },
+    cameraTile: () => "", fleetCounts: () => ({ cameras: [], total: 0, connected: 0, readable: true }),
+    fleetProblem: () => "", route: () => ({ name: "cameras", args: [] }),
+  });
+  const html = screen.render([]);
+  assert.match(html, /No cameras are configured/);
+  assert.match(html, /type="password" data-add="password"/);
+  assert.match(html, /running cameras resume/);
+  assert.doesNotMatch(html, /This form takes no RTSP/);
+});

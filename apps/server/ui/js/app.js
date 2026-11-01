@@ -271,7 +271,7 @@ const screenPlayback = createPlaybackScreen({ state, fleetCounts, fleetProblem, 
 // five seconds — a camera identifier and an RTSP URL cannot be typed faster
 // than that. `pb` is the same idea for the playback filters; this is that
 // pattern applied to the one form that did not have it.
-const add = { id: "", rtsp: "", width: "1280", height: "720", live: "default" };
+const add = { id: "", rtsp: "", width: "1280", height: "720", live: "default", username: "", password: "", detection: "off" };
 
 // ------------------------------------------------------------------- storage
 
@@ -419,7 +419,9 @@ async function loadSettings() {
 }
 
 async function poll() {
-  const [fleet, metrics] = await Promise.allSettled([api("/api/cameras"), apiText("/metrics")]);
+  const [fleet, metrics, archives] = await Promise.allSettled([api("/api/cameras"), apiText("/metrics"), api("/api/recording-cameras")]);
+  if (archives.status === "fulfilled") { state.archiveCameras = archives.value; state.archiveError = null; }
+  else state.archiveError = archives.reason;
   if (fleet.status === "fulfilled") {
     state.cameras = fleet.value;
     state.fleetError = null;
@@ -447,7 +449,8 @@ const LIVE_SCREENS = ["dashboard", "live", "storage", "cameras", "events", "syst
 async function tick() {
   await poll();
   const { name, args } = route();
-  if (LIVE_SCREENS.includes(name) && !(name === "cameras" && args.length)) await render();
+  const editingCamera = name === "cameras" && document.activeElement?.dataset?.add;
+  if (LIVE_SCREENS.includes(name) && !(name === "cameras" && args.length) && !editingCamera) await render();
   else renderGauges();
 }
 
@@ -588,11 +591,14 @@ document.addEventListener("click", async (event) => {
       out.innerHTML = banner("warn", "Enter the stream width and height.", "Both must be positive whole numbers.");
       return;
     }
-    // No credential fields, deliberately. ADR 009 Decision 6 keeps this page
-    // free of anything worth stealing from it, and an RTSP password sits in the
-    // DOM while it is being typed. A camera that needs one is added through the
-    // API, which takes both.
-    const request = { camera_id: id, rtsp_endpoint: rtsp, width, height };
+    if (Boolean(add.username) !== Boolean(add.password)) {
+      out.innerHTML = banner("warn", "Enter both the camera username and password, or leave both blank.", ""); return;
+    }
+    const request = { camera_id: id, rtsp_endpoint: rtsp, width, height, detection_enabled: add.detection === "on" };
+    if (add.username && add.password) {
+      request.username = add.username;
+      request.password = add.password;
+    }
     // Absent means "follow the deployment". Sending `false` in that case is what
     // the page used to do implicitly, and it is why every camera added here was
     // created unable to publish.
@@ -609,6 +615,8 @@ document.addEventListener("click", async (event) => {
       // retype a URL to fix one character of it.
       add.id = "";
       add.rtsp = "";
+      add.username = "";
+      add.password = "";
       const message = banner("info", `Camera ${esc(id)} added, stopped.`, publication === "off"
         ? "It will not publish to LiveKit. Press Start on its row to connect it."
         : "Press Start on its row to connect it.");

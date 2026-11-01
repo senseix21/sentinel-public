@@ -28,6 +28,11 @@ if value == 'auto':
         except OSError:
             value = '127.0.0.1'
 address = ipaddress.IPv4Address(value)
+# Public-only VPS hosts have no usable private default-route address. Keep the
+# development stack available on loopback instead of refusing dashboard startup.
+# Explicit overrides still undergo the strict validation below.
+if sys.argv[1] == 'auto' and (address.is_unspecified or address.is_multicast or address.is_link_local or not address.is_private):
+    address = ipaddress.IPv4Address('127.0.0.1')
 if address.is_unspecified or address.is_multicast or address.is_link_local or not address.is_private:
     raise SystemExit('LIVEKIT_MEDIA_IP must be a private or loopback IPv4 address')
 # Reject an address that is not assigned to this machine before starting services.

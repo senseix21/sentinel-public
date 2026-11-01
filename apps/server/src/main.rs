@@ -23,6 +23,7 @@ use surveillance_server::{
         DEFAULT_VERIFY_MEMORY_BUDGET_BYTES,
     },
     authorize::MutatingSurface,
+    camera_catalog::CameraCatalog,
     camera_supervisor::CameraSupervisor,
     health_http::{serve_health, CameraDefaults},
     metadata_writer::MetadataWriter,
@@ -33,8 +34,9 @@ use surveillance_server::{
     runtime_config::{
         bootstrap_count, bootstrap_duration, bootstrap_flag, bootstrap_path, bootstrap_secret,
         load_configuration_layers, load_database_from_environment, load_ffmpeg_from_environment,
-        load_from_environment, load_health_bind_from_environment, load_retention,
-        load_supervision_from_environment, load_webcam_source_from_environment,
+        load_from_environment, load_health_bind_from_environment, load_livekit_from_environment,
+        load_registered_camera, load_retention, load_supervision_from_environment,
+        load_webcam_source_from_environment,
     },
     security_config::{load_trust_boundary, resolve_bind},
     settings_service::SettingsService,
@@ -60,22 +62,39 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .try_init()?;
 
     let configuration = load_configuration_layers()?;
-    let bootstrap_camera = load_from_environment(&configuration.bootstrap)?;
-    // Kept before validation consumes the settings. `OneCameraConfig` holds a
-    // validated `LiveKitConfig`, which is camera-scoped and cannot be turned
-    // back into the deployment template, so the API's add path would have
-    // nothing to stamp onto a new camera.
-    let livekit_template = bootstrap_camera.livekit.clone();
-    let mut config = OneCameraConfig::validate(bootstrap_camera)?;
-    if let Some(source) = load_webcam_source_from_environment(
-        config.recorder.width(),
-        config.recorder.height(),
-        config.max_access_unit_bytes,
-        config.max_nals_per_access_unit,
-    )? {
-        config = config.with_source(source)?;
-    }
-    let config = Arc::new(config);
+    // Process storage and publication settings do not require a camera source.
+    let recording_root = std::env::var_os("SURVEILLANCE_RECORDING_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| bootstrap_path(&configuration.bootstrap, SettingId::StorageRecordingRoot))
+        .unwrap_or_else(|| PathBuf::from("recordings"));
+    let layout = surveillance_storage::filesystem::RecordingLayout::new(recording_root.clone())?;
+    let ffprobe = bootstrap_path(&configuration.bootstrap, SettingId::CameraRecordingFfprobe)
+        .unwrap_or_else(|| PathBuf::from("ffprobe"));
+    let reconciliation_limit =
+        surveillance_storage::reconciliation::ReconciliationLimit::new(bootstrap_count(
+            &configuration.bootstrap,
+            SettingId::CameraRecordingReconciliationScanEntries,
+            100_000,
+        ))?;
+    let livekit_template = load_livekit_from_environment(&configuration.bootstrap)?;
+    let optional_camera = if std::env::var_os("SURVEILLANCE_CAMERA_ID").is_some()
+        || std::env::var_os("SURVEILLANCE_RTSP_URL").is_some()
+        || std::env::var_os("SURVEILLANCE_WEBCAM_DEVICE").is_some()
+    {
+        let settings = load_from_environment(&configuration.bootstrap)?;
+        let mut camera = OneCameraConfig::validate(settings)?;
+        if let Some(source) = load_webcam_source_from_environment(
+            camera.recorder.width(),
+            camera.recorder.height(),
+            camera.max_access_unit_bytes,
+            camera.max_nals_per_access_unit,
+        )? {
+            camera = camera.with_source(source)?;
+        }
+        Some(Arc::new(camera))
+    } else {
+        None
+    };
     let health_bind = load_health_bind_from_environment()?;
     let supervision = load_supervision_from_environment()?;
     let database = load_database_from_environment()?;
@@ -83,24 +102,23 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let ffmpeg = load_ffmpeg_from_environment();
     let phase4_metrics = Phase4Metrics::default();
     let event_bus = EventBus::new();
-    let viewer_tokens = config
-        .livekit
-        .as_ref()
-        .map(|livekit| {
+    let viewer_tokens = livekit_template
+        .clone()
+        .map(|settings| {
+            // Token validation has no pipeline, source, decoder or camera session.
+            let livekit = surveillance_livekit::config::LiveKitConfig::validate(
+                &surveillance_common::types::CameraId::new("deployment-validation")?,
+                settings,
+            )?;
             DevelopmentTokenService::new(
-                livekit,
+                &livekit,
                 livekit.deployment_namespace.clone(),
                 bootstrap_duration(&configuration.bootstrap, SettingId::LiveKitViewerTokenTtl)
                     .unwrap_or(std::time::Duration::from_secs(5 * 60)),
             )
+            .map_err(|error| -> Box<dyn Error + Send + Sync> { Box::new(error) })
         })
         .transpose()?;
-    tracing::info!(
-        camera_id = %config.camera_id,
-        source_kind = ?config.source.kind(),
-        bounded_memory_bytes = config.bounded_memory_bytes,
-        "validated initial camera configuration"
-    );
     let mut metadata_owner = None;
     let mut reconciliation_owner = None;
     let mut retention_owner = None;
@@ -112,9 +130,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let repository = PostgresRecordingRepository::connect_lazy(database);
         let reconciliation = ReconciliationOwner::new(
             repository.clone(),
-            config.layout.clone(),
-            SegmentFileStore::new(config.layout.clone(), config.ffprobe.clone()),
-            config.reconciliation_limit,
+            layout.clone(),
+            SegmentFileStore::new(layout.clone(), ffprobe.clone()),
+            reconciliation_limit,
             bootstrap_count(
                 &configuration.bootstrap,
                 SettingId::ReconciliationQueueItems,
@@ -138,8 +156,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         reconciliation_owner = Some((reconciliation_shutdown, reconciliation_task));
         let retention_task_owner = RetentionOwner::new(
             repository.clone(),
-            SafeRecordingDelete::new(config.layout.clone()),
-            config.layout.root().to_path_buf(),
+            SafeRecordingDelete::new(layout.clone()),
+            layout.root().to_path_buf(),
             retention.policy,
             retention.interval,
         )
@@ -166,7 +184,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         metadata_owner = Some((shutdown, task));
         recording_repository = Some(repository);
         playback_assembler = Some(PlaybackAssembler::new(
-            config.layout.root().to_path_buf(),
+            layout.root().to_path_buf(),
             ffmpeg,
             bootstrap_duration(&configuration.bootstrap, SettingId::PlaybackProbeTimeout)
                 .unwrap_or(std::time::Duration::from_secs(5)),
@@ -174,8 +192,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         Some(writer_handle)
     } else {
         tracing::warn!("database is not configured; recordings remain durable but unindexed until reconciliation");
-        let discovery =
-            discover_reconciliation_candidates(&config.layout, config.reconciliation_limit).await?;
+        let discovery = discover_reconciliation_candidates(&layout, reconciliation_limit).await?;
         if !discovery.candidates.is_empty() {
             tracing::warn!(
                 candidates = discovery.candidates.len(),
@@ -187,6 +204,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
     let metadata_observer = metadata_handle.clone();
 
+    let catalog_path = std::env::var_os("SURVEILLANCE_CAMERA_CATALOG_PATH")
+        .map_or_else(|| PathBuf::from(".local/cameras.json"), PathBuf::from);
+    let catalog = CameraCatalog::open(catalog_path, supervision.maximum_cameras.get()).await?;
+    let registrations = catalog.registrations();
     let (supervisor, handle) = CameraSupervisor::with_event_bus(
         supervision.command_queue_items,
         supervision.maximum_cameras,
@@ -194,13 +215,46 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         metadata_handle,
         event_bus,
     );
-    let supervisor_task = tokio::spawn(supervisor.run());
-    handle.add(Arc::clone(&config)).await?;
-    handle.start(config.camera_id.clone()).await?;
+    let supervisor_task = tokio::spawn(supervisor.with_catalog(catalog).run());
+    for registration in registrations {
+        let id = registration.camera.camera_id.clone();
+        let config = if let Ok(config) =
+            load_registered_camera(&registration.camera, &configuration.bootstrap)
+                .map_err(|_| ())
+                .and_then(|settings| OneCameraConfig::validate(settings).map_err(|_| ()))
+        {
+            Arc::new(config)
+        } else {
+            tracing::error!(
+                "saved camera configuration is invalid; registration preserved for repair"
+            );
+            continue;
+        };
+        let camera_id = config.camera_id.clone();
+        if handle.add(config).await.is_err() {
+            tracing::error!(camera_id = %id, "saved camera registration could not be restored");
+        } else if registration.desired_running && handle.start(camera_id).await.is_err() {
+            tracing::error!(camera_id = %id, "saved running intent could not be started");
+        }
+    }
+    if let Some(config) = optional_camera {
+        if handle
+            .health_registry()
+            .snapshot(&config.camera_id)
+            .is_none()
+        {
+            let camera_id = config.camera_id.clone();
+            handle.add(config).await?;
+            if handle.start(camera_id).await.is_err() {
+                tracing::error!(
+                    "optional environment camera failed to start; dashboard remains available"
+                );
+            }
+        }
+    }
 
     let (adapter_shutdown, adapter_shutdown_rx) = watch::channel(false);
     let registry = handle.health_registry();
-    let recording_root = config.layout.root().to_path_buf();
 
     // Persistent configuration. The settings store is optional: without it the
     // server runs on bootstrap layers and refuses changes, rather than
@@ -208,6 +262,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let settings_repository = load_database_from_environment()?
         .as_ref()
         .map(PostgresSettingsRepository::connect_lazy);
+    let camera_settings = Arc::new(configuration.bootstrap.clone());
     let settings_service = Arc::new(SettingsService::new(
         configuration.base,
         configuration.environment,
@@ -296,7 +351,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let mut adapter_task = tokio::spawn(serve_health(
         health_bind,
-        CameraDefaults::new(recording_root, livekit_template),
+        CameraDefaults::new(recording_root, livekit_template).with_settings(camera_settings),
         registry,
         handle.clone(),
         recording_repository,

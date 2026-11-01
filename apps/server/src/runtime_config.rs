@@ -509,8 +509,10 @@ fn load_with(
     let height_value = required(&lookup, HEIGHT)?;
     let width = parse_u32(&width_value, WIDTH)?;
     let height = parse_u32(&height_value, HEIGHT)?;
-    let recording_root =
-        lookup(RECORDING_ROOT).map_or_else(|| PathBuf::from("recordings"), PathBuf::from);
+    let recording_root = lookup(RECORDING_ROOT)
+        .map(PathBuf::from)
+        .or_else(|| bootstrap_path(resolved, SettingId::StorageRecordingRoot))
+        .unwrap_or_else(|| PathBuf::from("recordings"));
     let credentials = match (lookup(RTSP_USERNAME), lookup(RTSP_PASSWORD)) {
         (None, None) => None,
         (Some(username), Some(password)) => Some(CameraCredentialsSettings { username, password }),
@@ -523,6 +525,13 @@ fn load_with(
         width,
         height,
         recording_root,
+    );
+    settings.ffprobe = bootstrap_path(resolved, SettingId::CameraRecordingFfprobe)
+        .unwrap_or_else(|| PathBuf::from("ffprobe"));
+    settings.reconciliation_scan_entries = bootstrap_count(
+        resolved,
+        SettingId::CameraRecordingReconciliationScanEntries,
+        100_000,
     );
     settings.detection_enabled = match lookup(DETECTION_ENABLED).as_deref() {
         None | Some("true" | "1") => true,
@@ -678,7 +687,24 @@ fn load_with(
     if let Some(rect) = parse_roi_exclude(&lookup, DETECTION_ROI_EXCLUDE) {
         settings.detection_roi_exclude = Some(rect);
     }
-    settings.livekit = match (
+    settings.livekit = load_livekit_with(&lookup, resolved)?;
+    Ok(settings)
+}
+
+/// Loads deployment publication settings without constructing a camera.
+/// # Errors
+/// Rejects incomplete deployment credentials.
+pub fn load_livekit_from_environment(
+    resolved: &ResolvedSettings,
+) -> Result<Option<LiveKitSettings>, EnvironmentConfigError> {
+    load_livekit_with(&|key| std::env::var(key).ok(), resolved)
+}
+
+fn load_livekit_with(
+    lookup: &impl Fn(&str) -> Option<String>,
+    resolved: &ResolvedSettings,
+) -> Result<Option<LiveKitSettings>, EnvironmentConfigError> {
+    let livekit = match (
         lookup(LIVEKIT_URL),
         lookup(LIVEKIT_API_KEY),
         lookup(LIVEKIT_API_SECRET),
@@ -742,6 +768,36 @@ fn load_with(
         }),
         _ => return Err(EnvironmentConfigError::IncompleteLiveKitCredentials),
     };
+    Ok(livekit)
+}
+
+/// Resolves a dashboard registration with deployment defaults, independently of
+/// the optional legacy environment camera identity and credentials.
+/// # Errors
+/// Returns validation errors without echoing secrets.
+pub fn load_registered_camera(
+    camera: &crate::camera_catalog::CameraRegistration,
+    resolved: &ResolvedSettings,
+) -> Result<OneCameraSettings, EnvironmentConfigError> {
+    let mut settings = load_with(
+        |key| match key {
+            CAMERA_ID => Some(camera.camera_id.clone()),
+            RTSP_URL => Some(camera.rtsp_endpoint.clone()),
+            WIDTH => Some(camera.width.to_string()),
+            HEIGHT => Some(camera.height.to_string()),
+            RTSP_USERNAME => camera.username.clone(),
+            RTSP_PASSWORD => camera.password.clone(),
+            DETECTION_ENABLED => Some(camera.detection_enabled.to_string()),
+            _ => std::env::var(key).ok(),
+        },
+        resolved,
+    )?;
+    if camera.live_publication_enabled == Some(false) {
+        settings.livekit = None;
+    }
+    if camera.live_publication_enabled == Some(true) && settings.livekit.is_none() {
+        return Err(EnvironmentConfigError::IncompleteLiveKitCredentials);
+    }
     Ok(settings)
 }
 
