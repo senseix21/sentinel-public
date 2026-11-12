@@ -206,26 +206,27 @@ async fn an_unreadable_recording_is_refused_before_any_media() {
     let root = fixture_root();
     let repository = fixture_repository().await;
     let recording = insert_segment(&repository, &root, 1, 100).await;
-    let truncated = root.join(CAMERA).join("segment-1.mp4.empty");
-    tokio::fs::write(&truncated, b"")
+    let truncated = root.join(CAMERA).join("unreadable.mp4");
+    let invalid_media = b"not an MP4 file";
+    tokio::fs::write(&truncated, invalid_media)
         .await
-        .unwrap_or_else(|error| panic!("write empty fixture: {error}"));
+        .unwrap_or_else(|error| panic!("write unreadable fixture: {error}"));
 
-    // The indexed locator still points at the valid segment, so this asserts
-    // the readiness gate on a file FFmpeg cannot remux rather than on a missing
-    // path: a spawn that succeeds must not be reported as a ready stream.
+    // A durable locator and nonzero size pass the metadata contract, so this
+    // reaches the readiness gate on existing bytes FFmpeg cannot remux. A
+    // successful spawn must not be reported as a ready media stream.
     let empty = CompletedRecording::new(
         RecordingId::new("playback-empty").unwrap_or_else(|error| panic!("recording ID: {error}")),
         camera(),
         SystemTime::UNIX_EPOCH + Duration::from_secs(200),
         SystemTime::UNIX_EPOCH + Duration::from_secs(202),
-        RecordingLocator::new(PathBuf::from(format!("{CAMERA}/segment-1.mp4.empty")))
+        RecordingLocator::new(PathBuf::from(format!("{CAMERA}/unreadable.mp4")))
             .unwrap_or_else(|error| panic!("locator: {error}")),
         RecordingContainer::FragmentedMp4,
         VideoCodec::H264,
         320,
         240,
-        0,
+        invalid_media.len() as u64,
         MetadataProvenance::Recorder,
     )
     .unwrap_or_else(|error| panic!("completed evidence: {error}"));

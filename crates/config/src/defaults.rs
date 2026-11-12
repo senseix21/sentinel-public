@@ -36,6 +36,8 @@ pub const WITHOUT_DEFAULTS: &[SettingId] = &[
     // string. A configured path that cannot be loaded is a startup failure,
     // which is a different condition entirely.
     SettingId::CameraDetectionModelPath,
+    SettingId::CameraDetectionFaceModelPath,
+    SettingId::CameraDetectionFaceModelSha256,
     SettingId::CameraDetectionModelSha256,
     // No default: unset means software decode, and `Text` would carry an empty
     // string that reads like a configured accelerator named "".
@@ -117,6 +119,10 @@ fn bootstrap(layer: &mut Layer) {
 
 fn global_operational(layer: &mut Layer) {
     let mut set = |id, value| put(layer, id, value);
+    set(
+        SettingId::CameraDetectionInferenceConcurrency,
+        SettingValue::Unsigned(4),
+    );
     set(
         SettingId::SupervisionCommandTimeout,
         SettingValue::Duration(Duration::from_secs(10)),
@@ -346,8 +352,36 @@ fn camera_detection(layer: &mut Layer) {
         SettingValue::Unsigned(1),
     );
     set(
+        SettingId::CameraDetectionPresenceConfirmation,
+        SettingValue::Duration(Duration::from_secs(1)),
+    );
+    set(
+        SettingId::CameraDetectionPresenceGrace,
+        SettingValue::Duration(Duration::from_secs(1)),
+    );
+    set(
+        SettingId::CameraDetectionPresenceFreshness,
+        SettingValue::Duration(Duration::from_secs(1)),
+    );
+    set(
+        SettingId::CameraDetectionFaceSampleFps,
+        SettingValue::Unsigned(5),
+    );
+    set(
+        SettingId::CameraDetectionOverlayMaxAge,
+        SettingValue::Duration(Duration::from_secs(3)),
+    );
+    set(
+        SettingId::CameraDetectionMode,
+        SettingValue::Text("person".to_owned()),
+    );
+    set(
+        SettingId::CameraDetectionFaceScoreThresholdPercent,
+        SettingValue::Unsigned(70),
+    );
+    set(
         SettingId::CameraDetectionScoreThresholdPercent,
-        SettingValue::Unsigned(30),
+        SettingValue::Unsigned(70),
     );
     set(
         SettingId::CameraDetectionNmsIouPercent,

@@ -119,7 +119,7 @@ impl ModelArtifact {
         &self.sha256
     }
 
-    fn discard_verified_bytes(&mut self) {
+    pub(crate) fn discard_verified_bytes(&mut self) {
         self.bytes = None;
     }
 }
@@ -305,7 +305,7 @@ fn model_name_from(artifact: &ModelArtifact) -> String {
         .to_owned()
 }
 
-fn build_session(
+pub(crate) fn build_session(
     config: &InferenceBackendConfig,
     artifact: &ModelArtifact,
 ) -> Result<ort::session::Session, String> {

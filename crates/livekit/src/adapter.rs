@@ -74,6 +74,8 @@ pub struct AdapterObservation {
     /// session. A steadily climbing value is a degraded live view that reports
     /// itself healthy, which is the failure this exists to make visible.
     pub restarts: u64,
+    /// Detection packets rejected by the bound or transport.
+    pub detection_packets_dropped: u64,
 }
 
 pub trait PublicationAdapter: Send + 'static {

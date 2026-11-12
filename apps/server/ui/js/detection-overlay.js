@@ -12,6 +12,9 @@
 // show a sibling badge in the tile.
 
 export const DETECTION_TOPIC = "det/v1";
+export const PRESENCE_TOPIC = "presence/v1";
+export const FACE_TOPIC = "face/v1";
+export const MAX_DETECTION_PACKET_BYTES = 16 * 1024;
 export const DETECTION_MAX_AGE_MS = 3000;
 
 const BOX_STROKE = "rgba(40,220,100,";
@@ -67,7 +70,19 @@ function drawBox(ctx, det, rect, dpr) {
  * `results_are_fixture` is true.
  */
 export class DetectionOverlay {
-  constructor() {
+  constructor({ mode = "person", cameraId = null, maxAgeMs = DETECTION_MAX_AGE_MS } = {}) {
+    this._presence = null;
+    this._presenceAt = 0;
+    this._presenceSequence = null;
+    this._presenceSession = null;
+    this._faceSession = null;
+    this._personUnavailable = false;
+    this._mode = mode;
+    this._maxAgeMs = Number.isFinite(maxAgeMs) && maxAgeMs > 0 && maxAgeMs <= 60000 ? maxAgeMs : DETECTION_MAX_AGE_MS;
+    this._unavailable = false;
+    this._cameraId = cameraId;
+    this._epoch = null;
+    this._sequence = null;
     this._video = null;
     this._canvas = null;
     this._raf = null;
@@ -100,8 +115,14 @@ export class DetectionOverlay {
     this._video = null;
     this._lastPacket = null;
     this._lastReceivedAt = 0;
+    this._presence = null;
+    this._presenceSession = null;
+    this._faceSession = null;
+    this._presenceSequence = null;
     this._activeTrackIds.clear();
     this._sessionTrackIds.clear();
+    this._epoch = null;
+    this._sequence = null;
   }
 
   // Re-point the overlay at a new <video> element without forgetting the
@@ -159,6 +180,7 @@ export class DetectionOverlay {
   }
 
   onPacket(packet) {
+    if (this._mode !== "person") return false;
     if (!packet || !Array.isArray(packet.detections)) return;
     this._lastPacket = packet;
     this._lastReceivedAt = this._now();
@@ -176,6 +198,86 @@ export class DetectionOverlay {
     }
   }
 
+  // Face packets are actual localized observations, not tracks or person boxes.
+  onFacePacket(packet) {
+    if (this._unavailable) return false;
+    if (!["face", "person_face"].includes(this._mode) || !packet || packet.camera_id !== this._cameraId ||
+        typeof packet.results_are_fixture !== "boolean" ||
+        !Array.isArray(packet.detections) || packet.detections.length > 64 ||
+        typeof packet.epoch !== "string" || !/^[1-9][0-9]{0,19}$/.test(packet.epoch) ||
+        typeof packet.sequence !== "string" || !/^[1-9][0-9]{0,19}$/.test(packet.sequence)) return false;
+    let incomingSession = null;
+    if (this._mode === "person_face") {
+      if (typeof packet.session !== "string" || !/^[1-9][0-9]{0,19}$/.test(packet.session) || BigInt(packet.session)>18446744073709551615n) return false;
+      const session=BigInt(packet.session);
+      if ((this._faceSession !== null && session<this._faceSession) || (this._presenceSession !== null && session<this._presenceSession)) return false;
+      incomingSession=session;
+    }
+    const epoch = BigInt(packet.epoch), sequence = BigInt(packet.sequence);
+    if (epoch > 18446744073709551615n || sequence > 18446744073709551615n) return false;
+    if ((incomingSession === null || incomingSession === this._faceSession) && this._epoch !== null && (epoch < this._epoch ||
+        (epoch === this._epoch && sequence <= this._sequence))) return false;
+    for (const d of packet.detections) {
+      if (!d || ![d.left, d.top, d.width, d.height, d.confidence].every(Number.isFinite) ||
+          d.left < 0 || d.top < 0 || d.width <= 0 || d.height <= 0 ||
+          d.left + d.width > 1.000001 || d.top + d.height > 1.000001 ||
+          d.confidence < 0 || d.confidence > 1 || d.track_id !== undefined) return false;
+    }
+    if(incomingSession !== null) this._faceSession=incomingSession;
+    this._epoch = epoch;
+    this._sequence = sequence;
+    this._lastPacket = packet;
+    this._lastReceivedAt = this._now();
+    return true;
+  }
+
+  onPresencePacket(packet) {
+    if (this._mode !== "person_face" || !packet || packet.camera_id !== this._cameraId ||
+        ![packet.available, packet.saturated, packet.results_are_fixture].every(v => typeof v === "boolean") ||
+        ![packet.observed, packet.uncertain, packet.tentative].every(v => Number.isInteger(v) && v >= 0 && v <= 64) ||
+        packet.observed + packet.uncertain + packet.tentative > 64 || (!packet.available && packet.observed !== 0)) return false;
+    const valid = v => typeof v === "string" && /^[1-9][0-9]{0,19}$/.test(v) && BigInt(v) <= 18446744073709551615n;
+    if (![packet.epoch, packet.session, packet.sequence].every(valid)) return false;
+    const session=BigInt(packet.session), sequence=BigInt(packet.sequence);
+    if(this._faceSession !== null && session<this._faceSession) return false;
+    if (this._presenceSession !== null && (session < this._presenceSession || (session === this._presenceSession && sequence <= this._presenceSequence))) return false;
+    if(this._presenceSession !== session && this._faceSession !== session) this._lastPacket=null;
+    this._presenceSession=session; this._presenceSequence=sequence;
+    this._presence=packet; this._presenceAt=this._now();
+    return true;
+  }
+
+  setPersonUnavailable(value) { this._personUnavailable=value; }
+
+  updateConfiguration(mode, maxAgeMs) {
+    if (!["face", "person", "person_face"].includes(mode)) return;
+    if (this._mode !== mode) {
+      this._mode = mode;
+      this._presence = null;
+      this._presenceSession = null;
+      this._faceSession = null;
+      this._presenceSequence = null;
+      this._lastPacket = null;
+      this._epoch = null;
+      this._sequence = null;
+      this._activeTrackIds.clear();
+      this._sessionTrackIds.clear();
+    }
+    if (Number.isFinite(maxAgeMs) && maxAgeMs > 0 && maxAgeMs <= 60000) this._maxAgeMs = maxAgeMs;
+  }
+
+  setUnavailable(value) {
+    this._unavailable = value;
+    if (value) {
+      this._lastPacket = null;
+      this._activeTrackIds.clear();
+    }
+  }
+
+  faceUnavailable() {
+    return this._unavailable || this.isFixture() || (!!this._lastPacket && this._now()-this._lastReceivedAt > this._maxAgeMs);
+  }
+
   isFixture() {
     return !!(this._lastPacket && this._lastPacket.results_are_fixture);
   }
@@ -183,7 +285,13 @@ export class DetectionOverlay {
   // {active, cumulative} — distinct track IDs in the latest packet, and
   // distinct track IDs ever seen since this overlay was attached.
   personCounts() {
-    const stale = this._now() - this._lastReceivedAt > DETECTION_MAX_AGE_MS;
+    const stale = this._now() - this._lastReceivedAt > this._maxAgeMs;
+    if (this._mode === "person_face") {
+      const p=this._presence;
+      const available=!!p && p.available && !p.results_are_fixture && !this._personUnavailable && this._now()-this._presenceAt <= this._maxAgeMs;
+      return {mode:"person_face", received:!!p, available, active:available ? p.observed : 0, uncertain:available ? p.uncertain : 0, tentative:available ? p.tentative : 0, saturated:!!p?.saturated, faces:stale || this.isFixture() ? 0 : (this._lastPacket?.detections.length || 0)};
+    }
+    if (this._mode === "face") return { mode: "face", active: stale || this.isFixture() ? 0 : (this._lastPacket?.detections.length || 0), cumulative: 0, received: this._lastPacket !== null };
     return {
       active: stale ? 0 : this._activeTrackIds.size,
       cumulative: this._sessionTrackIds.size,
@@ -216,7 +324,7 @@ export class DetectionOverlay {
 
     const packet = this._lastPacket;
     if (!packet) return;
-    if (this._now() - this._lastReceivedAt > DETECTION_MAX_AGE_MS) return;
+    if (this._now() - this._lastReceivedAt > this._maxAgeMs) return;
     if (packet.results_are_fixture) return;
 
     const rect = contentRect(this._video);

@@ -738,6 +738,7 @@ fn detection_capability(backends: &[Option<InferenceDescriptor>]) -> DetectionCa
     let live: Vec<&InferenceDescriptor> = backends.iter().flatten().collect();
     let Some(first) = live.first() else {
         return DetectionCapability {
+            mode: "none".to_owned(),
             model_name: "none".to_owned(),
             model_version: "none".to_owned(),
             is_production_model: false,
@@ -750,10 +751,17 @@ fn detection_capability(backends: &[Option<InferenceDescriptor>]) -> DetectionCa
     // real model and another on a fixture is the mixture that matters most, and
     // naming one of them would describe a deployment that does not exist.
     let uniform = live.iter().all(|descriptor| {
-        descriptor.model_version() == first.model_version()
+        descriptor.mode() == first.mode()
+            && descriptor.model_name() == first.model_name()
+            && descriptor.model_version() == first.model_version()
             && descriptor.is_production() == first.is_production()
     });
     DetectionCapability {
+        mode: if uniform {
+            first.mode().as_str().to_owned()
+        } else {
+            "mixed".to_owned()
+        },
         model_name: if uniform {
             first.model_name().to_owned()
         } else {
@@ -842,6 +850,7 @@ struct SystemCapabilities {
 
 #[derive(Clone, Debug, Serialize)]
 struct DetectionCapability {
+    mode: String,
     model_name: String,
     model_version: String,
     is_production_model: bool,
@@ -2839,6 +2848,10 @@ struct CameraResponse {
     live_offered: u64,
     live_dropped: u64,
     detection_enabled: bool,
+    detection_mode: Option<&'static str>,
+    detection_overlay_max_age_ms: u64,
+    detection_person_state: Option<String>,
+    detection_face_state: Option<String>,
     detection_state: Option<String>,
     detection_queue_depth: Option<usize>,
     detection_queue_capacity: Option<usize>,
@@ -2919,6 +2932,24 @@ impl From<&CameraStatusSnapshot> for CameraResponse {
                     value.detection.state,
                     surveillance_detector::detector::DetectionState::Disabled
                 )
+            }),
+            detection_mode: snapshot
+                .health
+                .as_ref()
+                .and_then(|h| h.detection.backend.as_ref())
+                .map(|b| b.mode().as_str()),
+            detection_person_state: snapshot
+                .health
+                .as_ref()
+                .and_then(|h| h.detection.person_lane)
+                .map(|s| format!("{s:?}")),
+            detection_face_state: snapshot
+                .health
+                .as_ref()
+                .and_then(|h| h.detection.face_lane)
+                .map(|s| format!("{s:?}")),
+            detection_overlay_max_age_ms: snapshot.health.as_ref().map_or(3000, |h| {
+                u64::try_from(h.detection.overlay_max_age.as_millis()).unwrap_or(u64::MAX)
             }),
             detection_state: snapshot
                 .health
@@ -3169,6 +3200,9 @@ fn render_metrics(
             "storage_pressure_changed",
             "person_detection_observed",
             "detector_state_changed",
+            "configuration_changed",
+            "face_detection_observed",
+            "person_presence_observed",
         ]
         .into_iter()
         .zip(events.event_kinds)
@@ -3454,6 +3488,38 @@ fn render_metrics(
                 surveillance_detector::detector::DetectionState::Stopped => 6,
             },
         );
+        for (lane, state, counters) in [
+            ("person", detection.person_lane, detection.person_counters),
+            ("face", detection.face_lane, detection.face_counters),
+        ] {
+            let state = state.map_or(0, |s| match s {
+                surveillance_detector::detector::DetectionState::Running => 2,
+                surveillance_detector::detector::DetectionState::Starting => 1,
+                surveillance_detector::detector::DetectionState::Degraded => 3,
+                surveillance_detector::detector::DetectionState::Terminal => 4,
+                _ => 0,
+            });
+            for (name, value) in [
+                ("state", state),
+                ("offered_total", counters.offered),
+                ("dropped_total", counters.replaced),
+                ("stale_total", counters.stale),
+                ("completed_total", counters.completed),
+                ("failures_total", counters.failed),
+                ("preprocessing_micros_total", counters.preprocessing_micros),
+                ("inference_micros_total", counters.inference_micros),
+            ] {
+                let _=writeln!(output,"surveillance_detection_lane_{name}{{camera_id=\"{camera}\",lane=\"{lane}\"}} {value}");
+            }
+            for (bound, value) in [
+                "10000", "50000", "100000", "250000", "500000", "1000000", "+Inf",
+            ]
+            .into_iter()
+            .zip(counters.latency_buckets)
+            {
+                let _=writeln!(output,"surveillance_detection_lane_inference_micros_bucket{{camera_id=\"{camera}\",lane=\"{lane}\",le=\"{bound}\"}} {value}");
+            }
+        }
         detection_gate_metrics(&mut output, camera, detection.counters);
         for (name, value) in [
             (
@@ -3664,6 +3730,10 @@ fn render_metrics(
                 publication.counters.adapter_restarts,
             ),
             (
+                "surveillance_livekit_detection_packets_dropped_total",
+                publication.counters.detection_packets_dropped,
+            ),
+            (
                 "surveillance_livekit_send_failures_total",
                 publication.counters.send_failures,
             ),
@@ -3712,6 +3782,12 @@ fn detection_gate_metrics(
     camera: &str,
     counters: surveillance_detector::detector::DetectionCounters,
 ) {
+    metric(
+        output,
+        "surveillance_detector_output_capacity_dropped_total",
+        camera,
+        counters.output_capacity_dropped,
+    );
     metric(
         output,
         "surveillance_detector_gate_skipped_total",

@@ -13,11 +13,10 @@ use surveillance_camera::connection::{ConnectionState, StopReason};
 use surveillance_camera::supervisor::{JitterSource, SupervisorStopReason};
 use surveillance_config::settings::OneCameraConfig;
 use surveillance_detector::{
-    backend::PersonInferenceBackend,
+    backend::ModeInferenceBackend,
     decoder::{FfmpegDecoderConfig, FfmpegH264Decoder},
     detector::{DetectionHealth, DetectionOwner},
     gate::GatePolicy,
-    model_output::YOLOX_LETTERBOX_ALIGNMENT,
     sampler::TimestampSampler,
 };
 use surveillance_events::{
@@ -128,7 +127,82 @@ impl CameraPipeline {
             config.live_queue,
             config.detection_queue,
         );
-        let (detection, detection_health) = if config.detection_enabled {
+        let (detection, detection_health) = if config.detection_enabled
+            && config.detection_mode == surveillance_detector::inference::DetectionMode::PersonFace
+        {
+            let person_config = config.inference.clone();
+            let face_config = config.face_inference.clone();
+            let (person, face) = tokio::join!(
+                tokio::task::spawn_blocking(move || ModeInferenceBackend::select(
+                    &person_config,
+                    surveillance_detector::inference::DetectionMode::Person
+                )),
+                tokio::task::spawn_blocking(move || ModeInferenceBackend::select(
+                    &face_config,
+                    surveillance_detector::inference::DetectionMode::Face
+                ))
+            );
+            let selected = |result: Result<
+                Result<ModeInferenceBackend, surveillance_detector::backend::BackendError>,
+                tokio::task::JoinError,
+            >,
+                            lane: &'static str| {
+                match result {
+                    Ok(Ok(model)) => Some(Box::new(model)
+                        as Box<dyn surveillance_detector::inference::DetectionInference>),
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            lane,
+                            failure_category = error.category(),
+                            "detection lane unavailable; media continues"
+                        );
+                        None
+                    }
+                    Err(_) => {
+                        tracing::warn!(lane, "detection lane initialization task failed");
+                        None
+                    }
+                }
+            };
+            let decoder = FfmpegH264Decoder::start(FfmpegDecoderConfig {
+                executable: config.detection_decoder.clone(),
+                width: 640,
+                height: 640,
+                hwaccel: config.detection_hwaccel.clone(),
+                letterbox_alignment: config.face_inference.letterbox_alignment,
+                frame_limits: FrameLimits::new(640, 640, config.decoded_frame_max_bytes)
+                    .map_err(|_| CameraPipelineError::DetectionConfiguration)?,
+                response_timeout: config.detection_decode_timeout,
+                max_access_unit_bytes: config.max_access_unit_bytes,
+            })
+            .map_err(|_| CameraPipelineError::DetectionConfiguration)?;
+            let sampler =
+                TimestampSampler::new(config.detection_sample_rate, config.detection_max_gap)
+                    .map_err(|_| CameraPipelineError::DetectionConfiguration)?;
+            let combined = surveillance_detector::combined::CombinedConfig {
+                camera: config.camera_id.clone(),
+                person: selected(person, "person"),
+                face: selected(face, "face"),
+                person_geometry: (config.inference.input_width, config.inference.input_height),
+                face_geometry: (640, 640),
+                policy: config.presence_policy,
+                permits: surveillance_detector::combined::admission(config.inference_concurrency)
+                    .map_err(|_| CameraPipelineError::DetectionConfiguration)?,
+                face_interval: std::time::Duration::from_secs_f64(
+                    1.0 / f64::from(config.face_sample_fps),
+                ),
+                roi: config.detection_roi_exclude,
+            };
+            let (owner, health) = DetectionOwner::start_combined(
+                combined,
+                subscriptions.detection,
+                sampler,
+                decoder,
+                event_bus,
+            );
+            health.set_overlay_max_age(config.presence_policy.freshness());
+            (Some(owner), health)
+        } else if config.detection_enabled {
             // Frames are produced at the model's input geometry, not the
             // camera's, so the bound is on what the detector actually holds.
             // At 1080p into a 416x416 model this is roughly a fifth of what the
@@ -147,40 +221,58 @@ impl CameraPipeline {
             // pipeline rather than silently running the fixture. The error
             // carries the reason so an operator can act on it.
             let inference_config = config.inference.clone();
-            let inference = tokio::task::spawn_blocking(move || {
-                PersonInferenceBackend::select(&inference_config)
+            let detection_mode = config.detection_mode;
+            let selected = tokio::task::spawn_blocking(move || {
+                ModeInferenceBackend::select(&inference_config, detection_mode)
             })
-            .await
-            .map_err(|_| CameraPipelineError::InferenceBackendTask)?
-            .map_err(|error| CameraPipelineError::InferenceBackend(error.to_string()))?;
-            let decoder = FfmpegH264Decoder::start(FfmpegDecoderConfig {
-                executable: config.detection_decoder.clone(),
-                width: config.inference.input_width,
-                height: config.inference.input_height,
-                hwaccel: config.detection_hwaccel.clone(),
-                letterbox_alignment: YOLOX_LETTERBOX_ALIGNMENT,
-                frame_limits: limits,
-                response_timeout: config.detection_decode_timeout,
-                max_access_unit_bytes: config.max_access_unit_bytes,
-            })
-            .map_err(|_| CameraPipelineError::DetectionConfiguration)?;
-            let gate_policy = GatePolicy::new(
-                config.detection_motion_threshold_percent,
-                config.detection_gate_cooldown,
-                config.detection_gate_heartbeat,
-            )
-            .map_err(|_| CameraPipelineError::DetectionConfiguration)?;
-            let (owner, health) = DetectionOwner::start_observed(
-                config.camera_id.clone(),
-                subscriptions.detection,
-                sampler,
-                decoder,
-                inference,
-                gate_policy,
-                event_bus,
-                config.detection_roi_exclude,
-            );
-            (Some(owner), health)
+            .await;
+            let failure_category = match &selected {
+                Ok(Err(error)) => error.category(),
+                Err(_) => "initialization_task",
+                Ok(Ok(_)) => "none",
+            };
+            if let Ok(Ok(inference)) = selected {
+                let decoder = FfmpegH264Decoder::start(FfmpegDecoderConfig {
+                    executable: config.detection_decoder.clone(),
+                    width: config.inference.input_width,
+                    height: config.inference.input_height,
+                    hwaccel: config.detection_hwaccel.clone(),
+                    letterbox_alignment: config.inference.letterbox_alignment,
+                    frame_limits: limits,
+                    response_timeout: config.detection_decode_timeout,
+                    max_access_unit_bytes: config.max_access_unit_bytes,
+                })
+                .map_err(|_| CameraPipelineError::DetectionConfiguration)?;
+                let gate_policy = GatePolicy::new(
+                    config.detection_motion_threshold_percent,
+                    config.detection_gate_cooldown,
+                    config.detection_gate_heartbeat,
+                )
+                .map_err(|_| CameraPipelineError::DetectionConfiguration)?;
+                let (owner, health) = DetectionOwner::start_observed(
+                    config.camera_id.clone(),
+                    subscriptions.detection,
+                    sampler,
+                    decoder,
+                    inference,
+                    gate_policy,
+                    event_bus,
+                    config.detection_roi_exclude,
+                );
+                health.set_overlay_max_age(config.detection_overlay_max_age);
+                (Some(owner), health)
+            } else {
+                tracing::warn!(camera_id = %config.camera_id, failure_category, "configured detection model unavailable; recording and live publication continue");
+                drop(subscriptions.detection);
+                (
+                    None,
+                    DetectionHealth::unavailable_observed(
+                        &config.camera_id,
+                        &event_bus,
+                        failure_category,
+                    ),
+                )
+            }
         } else {
             drop(subscriptions.detection);
             (None, DetectionHealth::disabled())

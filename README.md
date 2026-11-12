@@ -12,6 +12,49 @@ production identity infrastructure, packaging, and several product decisions
 remain open. See [Current capabilities](#current-capabilities) before treating a
 development result as a production claim.
 
+## Run locally
+
+On macOS, with the prerequisites installed, open a terminal and run:
+
+```bash
+cd /Users/abuhamza/dev/camera_project
+make prerequisites
+make webcam-devices
+CAMERA_ID=camera-01 WEBCAM_DEVICE=0 make run
+```
+
+Use your checkout's directory if it differs. Select the video device index shown
+by `make webcam-devices`; replace `WEBCAM_DEVICE=0` if needed. Allow camera access
+for the terminal application in macOS settings.
+
+Wait for **SENTINEL ONLINE**, then open **http://127.0.0.1:3001/** and log in:
+
+- Username: `operator`
+- Password: `sentinel-local`
+
+The command starts the database, LiveKit, server, webcam capture, development
+login proxy, and real person/face detection. First startup may download model
+artifacts and take longer to compile. Keep this terminal open.
+
+In another terminal, check the running system:
+
+```bash
+cd /Users/abuhamza/dev/camera_project
+make live
+make ready
+```
+
+Open **Live** in the dashboard to view the camera. After at least 60 seconds,
+open **Playback** to search saved recordings. To stop, press **Ctrl-C once** in
+the startup terminal and wait for the shutdown messages. Start again with the
+same command to reuse the saved database and recordings.
+
+For a startup failure, inspect `.local/webcam-run/logs/build.log` and
+`.local/webcam-run/logs/server.log`. For device selection, optional settings,
+and recording checks, follow [the detailed startup guide](#start-the-system-step-by-step).
+The [latest verification](#latest-local-verification--2026-10-20) records the
+remaining RTSP recovery, shutdown, build, and dependency-check failures.
+
 ## Documentation
 
 - **[Client system guide](docs/CLIENT_SYSTEM_GUIDE.md)** — plain-language
@@ -25,7 +68,7 @@ development result as a production claim.
 - [Architecture decisions](docs/adr/) — accepted design choices and reversal
   criteria.
 
-## Local webcam quick start
+## Start the system, step by step
 
 `make run` uses the webcam without an RTSP proxy:
 
@@ -40,7 +83,11 @@ FFmpeg handles operating-system capture and H.264 encoding. The Rust camera
 pipeline owns the child process, parsing, lifecycle, reconnect epochs, queues,
 recording, and downstream consumers.
 
-### 1. Install prerequisites
+Run these commands from the repository root. Use two terminals: keep the stack
+running in terminal A and run checks in terminal B. Do not start a second stack
+on the same ports.
+
+### 1. Check prerequisites
 
 Required commands:
 
@@ -48,14 +95,23 @@ Required commands:
 - PostgreSQL (`initdb`, `pg_ctl`, and `psql`)
 - FFmpeg (`ffmpeg`, `ffprobe`, and optionally `ffplay`)
 - LiveKit Server (`livekit-server`)
-- Python 3 (`python3`), `curl`, and `lsof`
+- Python 3 (`python3`), Node.js (`node`, for dashboard tests), `curl`, and `lsof`
 
 On macOS, install the third-party services with your preferred package manager,
 then verify the basic media tools:
 
 ```bash
 make prerequisites
+rustc --version
+node --version
+python3 --version
 ```
+
+`make prerequisites` must exit successfully. It checks executables, not service
+health, Node.js, model accuracy, or camera permission. If PostgreSQL is installed
+but its commands are missing, add that installation's `bin` directory to `PATH`.
+The dependency security gate additionally needs `cargo-deny` and `cargo-audit`;
+see [the security test steps](#4-run-the-dependency-and-security-gate).
 
 The launcher checks FFmpeg, LiveKit, and port-inspection dependencies before
 changing runtime state.
@@ -68,32 +124,86 @@ List AVFoundation devices:
 make webcam-devices
 ```
 
-The launcher defaults to video device `0` only for local development. On first
+The launcher defaults to video device `0` at 1280×720 and 30 FPS for local development.
+Override `VIDEO_FPS` with a mode supported by your camera. On first
 use, macOS may ask for camera access.
 Grant the terminal application access under **System Settings -> Privacy &
 Security -> Camera**.
 
-### 3. Start SENTINEL
+### 3. Start SENTINEL in terminal A
 
-Start the stack:
+Start the stack with a camera identity used consistently in later commands:
 
 ```bash
-make run
+CAMERA_ID=camera-01 WEBCAM_DEVICE=0 make run
 ```
 
-Then open:
+The launcher opens the development login page automatically:
 
 ```text
 http://127.0.0.1:3001/
 ```
 
-The stack starts PostgreSQL and a loopback development login proxy so recording
-search, playback, settings, and authenticated dashboard requests work locally.
+Wait for **SENTINEL ONLINE**, then open the printed dashboard URL and log in.
+The default local login is `operator` / `sentinel-local`; the launcher prints the
+effective credentials. These are development credentials only.
+
+The stack starts PostgreSQL, LiveKit, the Rust server, and a loopback development
+login proxy so recording search, playback, settings, and authenticated dashboard
+requests work locally. By default it verifies/downloads the development models
+and loads ONNX Runtime before building the server. First startup needs network
+access when these artifacts are not cached. Logs are under
+`.local/webcam-run/logs/`; inspect `build.log` if compilation fails.
 
 Keep the terminal running. Press Ctrl-C once to stop the server-owned webcam
 process and the launcher-owned LiveKit process. Recordings are preserved.
 
-### 4. Override local fixture values
+### 4. Check health in terminal B
+
+```bash
+make live
+make ready
+make metrics
+```
+
+Each command must exit successfully. Liveness alone does not prove recording or
+video delivery. Readiness should report the camera connected; metrics should
+show media progressing and recording segment completions after a segment boundary.
+An empty recording list immediately after startup is normal: wait at least
+60 seconds, then continue with the verification steps below.
+
+### 5. Check the dashboard
+
+1. Open `http://127.0.0.1:3001/#live` and log in through port **3001**.
+2. Confirm moving live video, not just a connected status or a still frame.
+3. Open a second tab and confirm both keep playing for at least 20 seconds.
+4. With detection enabled, confirm the person/face capability readout appears.
+   Face boxes require a visible face; person presence may continue without one.
+   A zero count is valid for an empty scene and does not qualify accuracy.
+5. Open Playback after a segment finalizes. Search the camera and the current
+   UTC time range, then play a recording. Confirm its image and duration.
+6. Check System and Settings for dependency state and resolved configuration.
+
+For the automated two-tab decode check, follow [test step 5](#5-check-real-browser-decoding).
+Physical webcam turn-away and Firefox remain separate manual checks.
+
+### 6. Stop and verify saved recordings
+
+Press Ctrl-C once in terminal A and wait for shutdown to finish. The launcher
+joins the server and its FFmpeg source, login proxy, LiveKit, and PostgreSQL.
+It preserves recordings and database state for the next run.
+
+```bash
+CAMERA_ID=camera-01 make recordings
+CAMERA_ID=camera-01 make verify-recordings
+```
+
+The second command must decode every finalized MP4 without errors. A
+`.partial.mp4` is excluded; inspect server logs and reconciliation state if it
+remains after graceful shutdown. Do not delete partials to make a check pass.
+Restart with the same command and confirm historical recordings remain searchable.
+
+### 7. Override local fixture values
 
 All values are optional:
 
@@ -113,11 +223,15 @@ Use the development build for the normal edit/run loop:
 make run
 ```
 
-Use the optimized binary for manual qualification or performance measurements:
+Use the optimized binary for manual qualification or performance measurements.
+On the currently affected macOS toolchain, use the verified release workaround:
 
 ```bash
-make run-release
+CARGO_PROFILE_RELEASE_STRIP=none CAMERA_ID=camera-01 make run-release
 ```
+
+On hosts without the documented SQLx linker issue, use
+`CAMERA_ID=camera-01 make run-release`.
 
 Do not publish performance numbers from `make run`; it deliberately uses the
 faster-to-build development profile.
@@ -142,11 +256,34 @@ Persistent local state defaults to:
 recordings/          finalized and partial recording segments
 ```
 
+The HTTP server and development login proxy listen on loopback. LiveKit WebRTC
+media uses the machine's active private IPv4 address, with UDP on `LIVEKIT_PORT + 2`
+(7882 by default); TCP fallback is disabled. This supports browsers that reject
+loopback ICE. Media still requires a signed, camera-scoped viewer token.
+
+Set `LIVEKIT_MEDIA_IP=127.0.0.1` for loopback-only media, or choose a private IPv4
+address assigned to this machine to override automatic route selection. The
+launcher prints the selected media address. With loopback-only media, Firefox
+may need `media.peerconnection.ice.loopback=true` in `about:config`. Multiple
+tabs receive distinct viewer identities so they cannot evict one another.
+
+To qualify actual browser decoding while the stack is running, supply Playwright
+from a separate installation and run:
+
+```bash
+PLAYWRIGHT_MODULE_PATH=/path/to/node_modules/playwright make verify-live-browser
+```
+
+Install Playwright's Chromium browser in that installation first. The check logs
+in, uses a separate development viewer identity, and requires playback and decoded
+frame counts to advance across multiple dashboard refreshes.
+
 ## Security model
 
 ### Local development
 
-`make run` binds every component to loopback and serves the development login at
+`make run` binds its HTTP, database, and LiveKit signalling listeners to loopback
+and serves the development login at
 `http://127.0.0.1:3001/`. The launcher prints its local credentials; override
 them with `SENTINEL_DEV_USERNAME` and `SENTINEL_DEV_PASSWORD`. This is not a
 deployable authentication design.
@@ -204,7 +341,7 @@ show that a process boundary is necessary; it is not part of the current system.
 | Recording index and retention | Implemented with PostgreSQL reconciliation and watermarks | Backup/restore and target storage sizing remain open |
 | Live browser video | Implemented through viewer-gated transcoding and LiveKit | First-picture time, viewer-visible reconnect, latency, representative cameras, and production concurrency remain open |
 | Time-range search and playback | Implemented with segment-aligned stream-copy semantics | No frame-exact arbitrary boundaries; browser seeking is limited by the assembled media |
-| Detection pipeline | Systems seam implemented | `DeterministicFakeInference` is the only inference implementation; no production accuracy claim |
+| Detection pipeline | Systems seam implemented | Real YOLOX person and YuNet face ONNX adapters available; fake backend retained for deterministic tests; production accuracy unqualified |
 | ROI, rules, heatmaps, analytics | Not implemented | Blocked on product semantics, including what a heatmap means |
 | Authentication and authorization | Server authorization implemented; local browser login available | Production identity provider and TLS/deployment boundary are not packaged |
 | Packaging and operations | Partial runbooks and metrics exist | No confirmed Linux target, service package, upgrade/rollback, or complete backup runbook |
@@ -231,9 +368,46 @@ For the local stack:
 - **System** reports server capabilities and dependency state.
 - **Logout** revokes the in-memory development session.
 
-Detection is disabled by `make run` because the repository has no production
-model. Enabling fake inference would spend decode resources and display
-synthetic facts as if they represented a real detector.
+`make run` and `make run-release` enable real ONNX inference by default.
+They select **person presence with face-only boxes** (`person_face`) at a 70% confidence threshold. On first use
+they download the checksum-verified YOLOX person model, YuNet face model and pinned
+ONNX Runtime 1.28.3 into `.local/onnx/`. The runtime bundle supports Apple Silicon
+macOS and Linux x64/ARM64; other hosts must supply `ORT_DYLIB_PATH`.
+The default detection confidence threshold is 70%. Override it with
+`SURVEILLANCE_DETECTION_FACE_SCORE_THRESHOLD_PERCENT` (0–100); changes require a
+camera pipeline restart.
+This development model has not been qualified for production surveillance accuracy.
+
+Set `SURVEILLANCE_DETECTION_ENABLED=false` to skip inference and artifact downloads,
+and `SENTINEL_OPEN_BROWSER=false` to skip opening the browser. Face overrides use
+`SURVEILLANCE_DETECTION_FACE_MODEL_PATH` and
+`SURVEILLANCE_DETECTION_FACE_MODEL_SHA256`; this adapter requires a YuNet-compatible
+640×640 artifact. The live UI shows faces detected, with no recognition or unique
+identity count. No outlines are burned into recordings.
+
+Set `SURVEILLANCE_DETECTION_MODE=person` to retain the YOLOX person path. Its custom
+model overrides are `SURVEILLANCE_DETECTION_MODEL_PATH` and
+`SURVEILLANCE_DETECTION_MODEL_SHA256`, with `SURVEILLANCE_DETECTION_INPUT_WIDTH`
+and `_HEIGHT` matching its geometry. Set `ORT_DYLIB_PATH` to use an installed
+compatible runtime. See [face detection specification](docs/face-detection/SPEC.md)
+and [ADR 016](docs/adr/016-face-only-live-detection.md).
+[Combined mode](docs/person-presence/SPEC.md) uses independent person and face lanes.
+Back-facing fixture evidence stays in the presence readout without drawing a body box.
+See [qualification and remaining reliability gates](docs/person-presence/VERIFICATION.md).
+Set `SURVEILLANCE_DETECTION_MODE=face` to restore face-only mode.
+
+To qualify real face observations in the running browser alongside decoded video,
+run `SENTINEL_EXPECT_FACE=true make verify-live-browser` with Playwright supplied
+through `PLAYWRIGHT_MODULE_PATH`. See [verification evidence and open gates](docs/face-detection/VERIFICATION.md).
+
+In face-only mode, overlay expiry defaults to three seconds. Set the validated duration
+`SURVEILLANCE_CAMERA_DETECTION_OVERLAY_MAX_AGE` (for example `5s`, at most `60s`);
+it applies after a pipeline restart. Combined mode uses the presence freshness
+duration instead (one second by default, `camera.detection.presence_freshness_duration`).
+Camera health exposes `detection_mode` and
+`detection_overlay_max_age_ms`; face-mode live packets use `face/v1`.
+The macOS release build currently requires `CARGO_PROFILE_RELEASE_STRIP=none`
+to avoid the documented SQLx proc-macro linker issue.
 
 ## HTTP API
 
@@ -440,7 +614,8 @@ import. Readiness and reconciliation metrics expose degraded repair state.
 
 With PostgreSQL or a non-loopback deployment boundary configured, this is
 expected: protected routes require a valid bearer token or a trusted proxy
-assertion. The no-database `make run` fixture is the only administrator fallback.
+assertion. Use the development login on port `3001`; `make run` starts PostgreSQL and
+does not provide an anonymous administrator API on port `3000`.
 
 ### Startup stops at the webcam
 
@@ -473,42 +648,242 @@ Confirm that indexed segments overlap the requested UTC range and that the files
 still exist. Current playback is segment-aligned and does not guarantee
 frame-exact boundaries or arbitrary browser seeking.
 
-## Development and validation
+## Test the system, step by step
 
-Run the complete local quality gate:
+Run automated checks before starting the manual webcam smoke test. Store logs
+outside committed source; the following examples use `target/verification/`.
+A passing command must exit with status zero. Inspect its log before moving on;
+redirected output is not evidence of success by itself.
+
+### 1. Run deterministic checks
 
 ```bash
-make check
+mkdir -p target/verification
+make verify > target/verification/verify.log 2>&1
 ```
 
-It runs shell and proxy checks, Rust formatting, Clippy with warnings denied,
-workspace tests, a release build, `cargo deny`, and `cargo audit`.
-
-The equivalent core Rust commands are:
+This checks shell syntax, Python helpers, dashboard JavaScript, Rust formatting,
+default-feature Clippy/tests, and the default-feature release build. It does
+**not** enable ONNX features, run ignored integration tests, or audit dependencies.
+On the current macOS toolchain the plain release build has a known SQLx
+proc-macro `mis-aligned LINKEDIT string pool` failure. Preserve that failure and
+rerun using the explicit workaround:
 
 ```bash
+CARGO_PROFILE_RELEASE_STRIP=none make verify > target/verification/verify-no-strip.log 2>&1
+```
+
+The workaround also applies to `make run-release`. It is not proof that the
+plain release gate passes. Sandbox `Operation not permitted` errors from local
+socket binding or child-process inspection require an execution environment
+that permits those test operations; they are not application test results.
+
+### 2. Check every Rust feature, including ONNX
+
+After the launcher's first successful model/runtime preparation on Apple Silicon:
+
+```bash
+export ORT_DYLIB_PATH="$PWD/.local/onnx/onnxruntime-osx-arm64-1.28.3/lib/libonnxruntime.dylib"
+test -f "$ORT_DYLIB_PATH"
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-cargo build --workspace --release
+CARGO_PROFILE_RELEASE_STRIP=none cargo build --workspace --all-features --release
 ```
 
-Ignored tests require external programs or services such as FFmpeg/libx264,
-PostgreSQL, or LiveKit. `cargo test` reports them but does not execute
-them. Run the corresponding fixture when changing that integration:
+On Linux, supply the actual compatible `libonnxruntime.so` path instead. Compiling
+ONNX features does not prepare a loadable runtime: tests that initialize the
+adapter need `ORT_DYLIB_PATH` too. `make verify-onnx` runs ONNX Clippy/tests with
+that same runtime requirement. Model-based ignored tests additionally need their
+pinned artifacts and frame fixtures; see
+[person presence evidence](docs/person-presence/VERIFICATION.md).
 
-| Area | Fixture |
-|---|---|
-| FFmpeg source and RTSP ingest/reconnect | camera tests plus `scripts/phase0/` |
-| PostgreSQL, playback, reconciliation, and retention | `scripts/phase4/postgres-fixture.sh` |
-| LiveKit publication and outage isolation | `scripts/phase5/` |
-| Persistent configuration | `scripts/phase7/config-fixture.sh` |
-| Security boundary | `scripts/phase8/security-fixture.sh` |
-| Authenticated dashboard and capacity evidence | `scripts/phase9/` |
+### 3. Exercise real PostgreSQL and media integrations
 
-Use the workload, hardware, codec, resolution, FPS, bitrate, camera count, viewer
-count, and test duration when reporting results. Architecture alone is not scale
-evidence.
+These fixtures create temporary local databases, apply migrations and clean up
+their own database processes. FFmpeg/libx264 and PostgreSQL commands must be on
+`PATH`. Run them separately so each failure has its own log:
+
+```bash
+bash scripts/phase4/postgres-fixture.sh > target/verification/postgres.log 2>&1
+bash scripts/phase7/config-fixture.sh > target/verification/config.log 2>&1
+```
+
+Phase 4 covers metadata constraints, overlapping searches, real MP4 playback,
+unreadable-media refusal, reconciliation, retention, and database outage/recovery.
+Phase 7 covers settings persistence, transactional audit, restart persistence,
+and store-outage degradation. Neither demonstrates real disk-full behavior on
+the eventual deployment filesystem.
+
+### 4. Run the dependency and security gate
+
+Install the audit tools if they are missing:
+
+```bash
+cargo install --locked cargo-deny
+cargo install --locked cargo-audit
+```
+
+```bash
+make audit
+bash scripts/phase8/security-fixture.sh
+make check
+```
+
+`make check` combines `make verify` and `make audit`; it stops at the first
+failure. On affected macOS hosts also run
+`CARGO_PROFILE_RELEASE_STRIP=none make check` and label that workaround explicitly.
+The security fixture requires both audit tools before it reaches its database
+checks. Missing tools, unavailable advisory feeds, or a policy violation mean
+this gate is incomplete or failed; do not describe it as green.
+
+### 5. Check real browser decoding
+
+Start the stack using the startup steps above. Install Playwright into an
+independent test directory, keeping the repository free of extra dependencies:
+
+```bash
+mkdir -p .local/browser-tests
+npm install --prefix .local/browser-tests playwright
+.local/browser-tests/node_modules/.bin/playwright install chromium
+PLAYWRIGHT_MODULE_PATH="$PWD/.local/browser-tests/node_modules/playwright" make verify-live-browser
+```
+
+The test logs in through the proxy, opens two viewers, and verifies advancing
+playback time and decoded-frame counters across dashboard refreshes. A successful
+WebRTC connection alone is insufficient. With combined detection enabled:
+
+```bash
+SENTINEL_EXPECT_PRESENCE=true \
+PLAYWRIGHT_MODULE_PATH="$PWD/.local/browser-tests/node_modules/playwright" \
+make verify-live-browser
+```
+
+This requires real, available person observations and non-fixture face packets;
+it does not require a positive face count in every image. Use
+`SENTINEL_EXPECT_FACE=true` for `SURVEILLANCE_DETECTION_MODE=face`.
+Playwright's package and installed browser revision must match.
+
+### 6. Repeat the full stack with a file-backed RTSP source
+
+This path exercises production RTSP ingestion without using a physical webcam.
+Supply an installed MediaMTX binary and a known H.264 MP4. Use a separate state
+and recording root to avoid mixing qualification evidence with webcam data.
+Create `.local/rtsp-test.yml`:
+
+```yaml
+logLevel: info
+rtspAddress: 127.0.0.1:8554
+rtspTransports: [tcp]
+rtmp: false
+hls: false
+webrtc: false
+srt: false
+paths:
+  qualification:
+    source: publisher
+```
+
+In terminal A, start MediaMTX:
+
+```bash
+mediamtx .local/rtsp-test.yml
+```
+
+In terminal B, loop the source in real time:
+
+```bash
+ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height,r_frame_rate -of json /absolute/path/source.mp4
+ffmpeg -re -stream_loop -1 -i /absolute/path/source.mp4 \
+  -c:v copy -an -rtsp_transport tcp -f rtsp rtsp://127.0.0.1:8554/qualification
+```
+
+Require H.264 and set the actual width/height below (1280×720 is an example).
+In terminal C, start the normal stack against that fixture:
+
+```bash
+STATE_DIR="$PWD/.local/rtsp-test" \
+RECORDING_ROOT="$PWD/.local/rtsp-test-recordings" \
+CAMERA_ID=qualification-01 VIDEO_WIDTH=1280 VIDEO_HEIGHT=720 \
+SENTINEL_RTSP_FIXTURE_URL=rtsp://127.0.0.1:8554/qualification \
+SENTINEL_OPEN_BROWSER=false scripts/dev/local-webcam-stack.sh
+```
+
+Run the health, browser and playback checks from another terminal. The launcher
+accepts only credential-free loopback RTSP fixture URLs. For the marked
+front/back/empty detection sequence, build a source using
+`scripts/dev/build-presence-scenes.sh FRONT_IMAGE COCO_77_IMAGE OUTPUT_MP4`, then
+run `scripts/dev/check-presence-scenes.cjs` with the same Playwright environment.
+That scene checker requires the helper's 1280×720 output and supplied public
+images; an arbitrary video cannot satisfy its scene assertions.
+
+Stop the stack first, then FFmpeg, then MediaMTX with Ctrl-C in their terminals.
+Finally decode saved files:
+
+```bash
+RECORDING_ROOT=./.local/rtsp-test-recordings CAMERA_ID=qualification-01 make verify-recordings
+```
+
+### 7. Check recovery and sustained operation
+
+While the file-backed stack is recording, stop only the RTSP publisher. Confirm
+liveness remains available, camera health reports degradation/reconnection, and
+logs explain the source loss. Restart the publisher and confirm a new connected
+epoch and new playable segments. Repeat the browser check after recovery.
+
+Keep a named workload running long enough to investigate the known recorder
+backpressure failure. Save `/metrics`, server/LiveKit logs, duration, completed
+segments and any partials. A short smoke test cannot close that reliability gate.
+Do not increase queue capacity to hide drops. Physical webcam, Firefox, genuine
+disk-full and 10/20-camera target-hardware tests remain separate qualifications.
+
+## Latest local verification — 2026-10-20
+
+Tested on Apple Silicon macOS with Rust 1.92.0, Node.js 26.11.0 and Python 3.15.0.
+The workload was one file-backed H.264 RTSP source, 1280×720 at 20 FPS, combined
+YOLOX/YuNet CPU inference at 70%, local PostgreSQL/LiveKit and Chromium viewers.
+This is development evidence, not a capacity or production-accuracy claim.
+
+- Formatting and all-target/all-feature Clippy passed.
+- Default-feature `make verify` passed with `CARGO_PROFILE_RELEASE_STRIP=none`:
+  580 Rust tests passed, 34 ignored; 46 dashboard tests and 24 Python helper tests passed.
+- All-feature Rust tests passed with the cached `ORT_DYLIB_PATH`: 587 passed,
+  39 ignored. Two ignored real-model presence tests were run separately and passed.
+- All-feature release build passed with stripping disabled. Plain `make verify`
+  failed at the known macOS SQLx release linker issue.
+- Phase 4 PostgreSQL/media fixture passed (13 tests), including corrupt-media
+  refusal, playback, reconciliation, retention and database outage/recovery.
+  Its unreadable-media test was corrected to use a valid nonempty `.mp4`
+  metadata contract before asserting that FFmpeg rejects the corrupt bytes.
+- Phase 7 configuration fixture passed (28 tests plus SQL checks).
+- Login, authenticated API reads, recording search and a two-second HTTP MP4
+  download passed; the downloaded media decoded without errors. Anonymous
+  access to the direct camera API returned `401`.
+- Chromium passed the two-viewer advancing-frame check and marked scene checks:
+  front 3 people/2 faces, back 1 person/0 faces, empty 0/0. MediaMTX showed one
+  surveillance RTSP reader.
+- An intentional RTSP publisher outage preserved `/live`, degraded `/ready`,
+  and recovered into a second camera connection epoch when publishing resumed.
+  Recording resumed, but the post-recovery browser check **failed** after 45
+  seconds. Live frame/publication and detection inference counters stopped
+  advancing while health still reported Running/Publishing; live media
+  rejections and detection drops increased. Recovery of these consumers remains
+  a confirmed local failure requiring investigation.
+- All 17 finalized recordings decoded without FFmpeg errors after the roughly
+  eight-minute run, including segments created after source recovery. The
+  launcher took about 33 seconds to join the server before stopping other
+  services; prompt graceful shutdown is not qualified by this run.
+- `cargo deny check` **failed** its advisory policy with seven vulnerability
+  findings (four rustls, three zip); bans, licenses and sources passed. This
+  reports dependency-policy findings, not demonstrated application exploits.
+  `make audit` and the Phase 8 security fixture also stopped because `cargo-audit`
+  is unavailable; the complete `make check` gate is not green.
+
+Local raw logs and isolated runtime state are in
+`target/verification-2026-10-20/` (ignored build output, not a committed artifact).
+The historical sustained recorder-backpressure incident remains unresolved;
+this smoke test does not close it. Physical webcam, Firefox, representative
+accuracy, target storage and 10/20-camera qualification remain unverified.
 
 ## Repository map
 
@@ -519,7 +894,7 @@ crates/auth       principals, roles, scope, and bearer-token verification
 crates/camera     camera lifecycle and one-owner ingestion
 crates/config     layered settings and secret handling
 crates/database   PostgreSQL repositories and migrations
-crates/detector   sampled detection pipeline and fake inference seam
+crates/detector   sampled detection, ONNX person/face lanes, presence, test backend
 crates/events     bounded domain-event contracts
 crates/livekit    independent live-publication consumer
 crates/media      encoded/decoded media and bounded distribution
@@ -556,6 +931,8 @@ the latest dated context snapshot and the current code.
 
 Before a production readiness claim, SENTINEL still needs at least:
 
+- investigation and resolution of the saved sustained-run `RecorderBackpressure`
+  failure and preceding LiveKit closed-engine warnings;
 - representative camera qualification, including the required codec/profile
   matrix and reconnect behavior;
 - sustained 10-camera and 20-camera measurements on named target hardware;

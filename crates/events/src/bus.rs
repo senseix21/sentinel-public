@@ -79,7 +79,7 @@ struct Registry {
     subscribers: BTreeMap<u64, Weak<Mutex<Queue>>>,
     publications: u64,
     outcomes: PublishReport,
-    event_kinds: [u64; 7],
+    event_kinds: [u64; 9],
     delivery_classes: [u64; 4],
 }
 
@@ -88,7 +88,7 @@ pub struct EventBusMetrics {
     pub subscribers: usize,
     pub publications: u64,
     pub outcomes: PublishReport,
-    pub event_kinds: [u64; 7],
+    pub event_kinds: [u64; 9],
     pub delivery_classes: [u64; 4],
 }
 
@@ -400,6 +400,8 @@ const fn event_kind_index(kind: EventKind) -> usize {
         EventKind::PersonDetectionObserved => 4,
         EventKind::DetectorStateChanged => 5,
         EventKind::ConfigurationChanged => 6,
+        EventKind::FaceDetectionObserved => 7,
+        EventKind::PersonPresenceObserved => 8,
     }
 }
 const fn delivery_class_index(class: DeliveryClass) -> usize {

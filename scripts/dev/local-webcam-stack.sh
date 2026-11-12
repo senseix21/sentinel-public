@@ -14,7 +14,7 @@ webcam_device="${WEBCAM_DEVICE:-0}"
 webcam_backend="${WEBCAM_BACKEND:-}"
 video_width="${VIDEO_WIDTH:-1280}"
 video_height="${VIDEO_HEIGHT:-720}"
-video_fps="${VIDEO_FPS:-15}"
+video_fps="${VIDEO_FPS:-30}"
 video_bitrate_kbps="${VIDEO_BITRATE_KBPS:-1500}"
 recording_root="${RECORDING_ROOT:-${repo_root}/recordings}"
 build_profile="${SENTINEL_BUILD_PROFILE:-dev}"
@@ -146,6 +146,8 @@ trap 'exit 0' INT TERM
 
 banner
 status "BOOT" "Starting the MediaMTX-free local stack"
+source "${repo_root}/scripts/dev/onnx-defaults.sh"
+prepare_onnx
 status "SOURCE" "${camera_id} · ${webcam_backend}:${webcam_device} · ${video_width}x${video_height} @ ${video_fps} FPS · ${video_bitrate_kbps} kbps"
 if [[ -f "${pg_data}/postmaster.pid" ]] && pg_ctl -D "${pg_data}" status >/dev/null 2>&1; then
   fail "PostgreSQL is already running from ${pg_data}; stop it before retrying"
@@ -163,7 +165,13 @@ database_url="postgres://127.0.0.1:${pg_port}/postgres"
 psql_command=(psql -X -q -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "${pg_port}" -d postgres)
 
 status "START" "LiveKit · ws://127.0.0.1:${livekit_port}"
-livekit-server --dev --bind 127.0.0.1 --config-body "port: ${livekit_port}" \
+# The HTTP bind does not select the WebRTC media address. Firefox may reject
+# loopback ICE even when signalling succeeds, so select a local media interface.
+# TCP fallback binds all interfaces in LiveKit; keep it disabled here.
+source "${repo_root}/scripts/dev/livekit-config.sh"
+prepare_livekit_config
+status "MEDIA" "LiveKit UDP · ${livekit_media_ip}:$((livekit_port + 2))"
+livekit-server --dev --bind 127.0.0.1 --config-body "${livekit_config}" \
   --keys "${livekit_api_key}: ${livekit_api_secret}" \
   >"${log_dir}/livekit.log" 2>&1 &
 livekit_pid=$!
@@ -185,7 +193,7 @@ cargo_features=()
 if [[ -n "${SURVEILLANCE_CARGO_FEATURES:-}" ]]; then
   cargo_features=(--features "${SURVEILLANCE_CARGO_FEATURES}")
 fi
-(cd "${repo_root}" && cargo build -p surveillance-server "${cargo_profile[@]}" "${cargo_features[@]}") \
+(cd "${repo_root}" && cargo build -p surveillance-server ${cargo_profile[@]+"${cargo_profile[@]}"} ${cargo_features[@]+"${cargo_features[@]}"}) \
   >"${log_dir}/build.log" 2>&1 \
   || fail "server build failed; see ${log_dir}/build.log"
 status "READY" "Binary · ${server_binary}"
@@ -193,8 +201,23 @@ status "READY" "Binary · ${server_binary}"
 export SURVEILLANCE_CAMERA_ID="${camera_id}"
 # Required by the legacy bootstrap settings shape and replaced before pipeline
 # construction when SURVEILLANCE_WEBCAM_DEVICE is present.
-export SURVEILLANCE_RTSP_URL="rtsp://127.0.0.1/unused-webcam-source"
-export SURVEILLANCE_WEBCAM_DEVICE="${webcam_device}"
+source_description="FFmpeg · ${webcam_backend}:${webcam_device}"
+source_note="MediaMTX is not running. FFmpeg is owned by the Rust camera session."
+if [[ -n "${SENTINEL_RTSP_FIXTURE_URL:-}" ]]; then
+  python3 - "${SENTINEL_RTSP_FIXTURE_URL}" <<'PYFIXTURE' || fail "fixture URL must be credential-free loopback RTSP"
+import sys
+from urllib.parse import urlsplit
+url=urlsplit(sys.argv[1])
+assert url.scheme=='rtsp' and url.hostname in ('127.0.0.1','localhost','::1') and not url.username and not url.password and not url.query and not url.fragment
+PYFIXTURE
+  export SURVEILLANCE_RTSP_URL="${SENTINEL_RTSP_FIXTURE_URL}"
+  unset SURVEILLANCE_WEBCAM_DEVICE
+  source_description="Local file-backed RTSP fixture"
+  source_note="The external fixture supplies RTSP. The Rust camera owns one upstream session."
+else
+  export SURVEILLANCE_RTSP_URL="rtsp://127.0.0.1/unused-webcam-source"
+  export SURVEILLANCE_WEBCAM_DEVICE="${webcam_device}"
+fi
 export SURVEILLANCE_WEBCAM_BACKEND="${webcam_backend}"
 export SURVEILLANCE_WEBCAM_FPS="${video_fps}"
 export SURVEILLANCE_WEBCAM_BITRATE_KBPS="${video_bitrate_kbps}"
@@ -204,7 +227,7 @@ export SURVEILLANCE_VIDEO_HEIGHT="${video_height}"
 export SURVEILLANCE_RECORDING_ROOT="${recording_root}"
 export SURVEILLANCE_HEALTH_BIND="127.0.0.1:${server_port}"
 export SURVEILLANCE_DATABASE_URL="${database_url}"
-export SURVEILLANCE_DETECTION_ENABLED="${SURVEILLANCE_DETECTION_ENABLED:-false}"
+export SURVEILLANCE_DETECTION_ENABLED="${SURVEILLANCE_DETECTION_ENABLED:-true}"
 export SURVEILLANCE_TRUSTED_PROXY_PEERS="127.0.0.1"
 export SURVEILLANCE_PROXY_PROOF_SECRET="${proof_secret}"
 export SURVEILLANCE_API_MUTATING_SURFACE_ENABLED="true"
@@ -264,7 +287,7 @@ cat <<EOF
 │  API / HEALTH   http://127.0.0.1:${server_port}/ready
 │  LIVEKIT        ws://127.0.0.1:${livekit_port}
 │  CAMERA         ${camera_id}
-│  SOURCE         FFmpeg · ${webcam_backend}:${webcam_device}
+│  SOURCE         ${source_description}
 │  VIDEO          ${video_width}x${video_height} @ ${video_fps} FPS · H.264
 │  LOGIN          ${dev_username} / ${dev_password}
 │  RECORDINGS     ${recording_root}
@@ -273,8 +296,17 @@ cat <<EOF
 │
 └──────────────────────────────────────────────────────────────┘
 
-   MediaMTX is not running. FFmpeg is owned by the Rust camera session.
+   ${source_note}
    Press Ctrl-C once for graceful recording finalization.
 EOF
+
+if [[ "${SENTINEL_OPEN_BROWSER:-true}" == true ]]; then
+  dashboard_url="http://127.0.0.1:${proxy_port}/"
+  case "$(uname -s)" in
+    Darwin) open "${dashboard_url}" || status "WARN" "Open ${dashboard_url} manually" ;;
+    Linux) xdg-open "${dashboard_url}" || status "WARN" "Open ${dashboard_url} manually" ;;
+    *) status "INFO" "Open ${dashboard_url} in your browser" ;;
+  esac
+fi
 
 wait "${server_pid}"

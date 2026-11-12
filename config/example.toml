@@ -105,7 +105,15 @@ inter_op_threads = 1
 # Fractions are whole percentages, as the storage watermarks are: the settings
 # value model has no float, and integers stay exact through TOML, the database
 # and JSON. Values above 100 are refused at startup, naming the key.
-score_threshold_percent = 30
+mode = "person" # make run explicitly selects face mode
+overlay_max_age = "3s"
+face_score_threshold_percent = 70
+presence_confirmation_duration = "1s"
+presence_grace_duration = "1s"
+presence_freshness_duration = "1s"
+face_sample_fps = 5
+# face_model_path and face_model_sha256 are required in face mode.
+score_threshold_percent = 70
 nms_iou_percent = 45
 
 # The motion gate. It reduces inference only: H.264 inter-frames cannot be
@@ -142,3 +150,6 @@ height = 1440
 # measured, not assumed.
 sample_fps = 10
 decoded_frame_max_bytes = 11059200
+
+[detection]
+inference_concurrency = 4

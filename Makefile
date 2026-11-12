@@ -10,7 +10,7 @@ CURL_BIN ?= curl
 WEBCAM_DEVICE ?= 0
 VIDEO_WIDTH ?= 1280
 VIDEO_HEIGHT ?= 720
-VIDEO_FPS ?= 15
+VIDEO_FPS ?= 30
 # Cap the development source at something a 720p IP camera would plausibly
 # emit. Without it libx264 runs unconstrained -- measured at 3.91 Mbps on this
 # webcam -- which is not a realistic ingest and is a poor live-publication
@@ -44,7 +44,7 @@ prerequisites: ## Verify required manual-run executables are available.
 webcam-devices: ## List macOS AVFoundation video and audio device indices.
 	@"$(FFMPEG_BIN)" -hide_banner -f avfoundation -list_devices true -i "" 2>&1 || true
 
-run: ## Run the local webcam through the Rust FFmpeg source and LiveKit.
+run: ## Run webcam + ONNX detection and open the web UI.
 	WEBCAM_DEVICE="$(WEBCAM_DEVICE)" VIDEO_WIDTH="$(VIDEO_WIDTH)" VIDEO_HEIGHT="$(VIDEO_HEIGHT)" VIDEO_FPS="$(VIDEO_FPS)" VIDEO_BITRATE_KBPS="$(VIDEO_BITRATE_KBPS)" CAMERA_ID="$(CAMERA_ID)" RECORDING_ROOT="$(RECORDING_ROOT)" scripts/dev/local-webcam-stack.sh
 
 run-release: ## Run the optimized local webcam stack.
@@ -95,9 +95,15 @@ check: ## Run the complete Rust workspace quality gate.
 	$(MAKE) verify
 	$(MAKE) audit
 
+verify-live-browser: ## Check the running local live UI; supply Playwright via PLAYWRIGHT_MODULE_PATH.
+	"$(NODE)" scripts/dev/check-live-browser.cjs
+
+.PHONY: verify-live-browser
+
 verify: ## Run the gate without the live advisory database (used by pull-request CI).
-	bash -n scripts/dev/local-webcam-stack.sh scripts/phase9/direct-camera-qualification.sh
-	python3 -m unittest scripts/dev/test_trust_boundary_proxy.py scripts/phase9/test_direct_camera_report.py
+	bash -n scripts/dev/local-webcam-stack.sh scripts/dev/onnx-defaults.sh scripts/dev/livekit-config.sh scripts/phase9/direct-camera-qualification.sh
+	python3 -m unittest scripts/dev/test_trust_boundary_proxy.py scripts/dev/test_onnx_defaults.py scripts/dev/test_livekit_loopback.py scripts/phase9/test_direct_camera_report.py
+	"$(NODE)" --check scripts/dev/check-live-browser.cjs
 	"$(NODE)" --test apps/server/ui/tests/*.test.js
 	"$(CARGO)" fmt --all --check
 	"$(CARGO)" clippy --workspace --all-targets -- -D warnings

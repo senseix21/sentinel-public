@@ -2,7 +2,7 @@
 
 use crate::{
     gate::{GateDecision, GatePolicy, MotionGate},
-    inference::{InferenceDescriptor, PersonInference},
+    inference::{DetectionInference, InferenceDescriptor, InferenceResults},
     sampler::{SampleDecision, SamplerCounters, TimestampSampler},
 };
 use std::{
@@ -188,6 +188,104 @@ mod tests {
             .unwrap_or_else(|error| panic!("join: {error}"));
         assert_eq!(exit.reason, DetectionStopReason::InputClosed);
         assert_eq!(exit.counters.inferred, 1);
+    }
+
+    struct FaceFixture {
+        model: DeterministicFakeInference,
+        calls: u32,
+    }
+    impl crate::inference::DetectionInference for FaceFixture {
+        fn model_name(&self) -> &surveillance_events::event::ModelName {
+            crate::inference::PersonInference::model_name(&self.model)
+        }
+        fn model_version(&self) -> &surveillance_events::event::ModelVersion {
+            crate::inference::PersonInference::model_version(&self.model)
+        }
+        fn mode(&self) -> crate::inference::DetectionMode {
+            crate::inference::DetectionMode::Face
+        }
+        fn is_production_model(&self) -> bool {
+            false
+        }
+        fn infer_detections(
+            &mut self,
+            _: &surveillance_media::frame::DecodedFrame,
+        ) -> Result<crate::inference::InferenceResults, crate::inference::InferenceError> {
+            use surveillance_events::event::{
+                Confidence, FaceDetection, FaceDetectionSet, NormalizedBoundingBox,
+            };
+            self.calls += 1;
+            let detections = if self.calls == 1 {
+                vec![FaceDetection {
+                    confidence: Confidence::new(0.9).unwrap(),
+                    bounding_box: NormalizedBoundingBox::new(0.2, 0.1, 0.15, 0.2).unwrap(),
+                }]
+            } else {
+                vec![]
+            };
+            Ok(crate::inference::InferenceResults::Faces(
+                FaceDetectionSet::new(detections).unwrap(),
+            ))
+        }
+    }
+    #[tokio::test]
+    async fn face_owner_emits_faces_then_empty_without_person_tracking() {
+        let (distributor, mut subscriptions) =
+            MediaDistributor::new_with_detection(capacity(2), capacity(2), capacity(2));
+        let bus = EventBus::new();
+        let mut events = bus
+            .subscribe(surveillance_events::bus::SubscriptionCapacity::new(16).unwrap())
+            .unwrap();
+        let owner = DetectionOwner::start(
+            CameraId::new("face-owner").unwrap(),
+            subscriptions.detection,
+            TimestampSampler::new(SampleRateHz::new(5).unwrap(), Duration::from_secs(2)).unwrap(),
+            FixtureH264Decoder::new(FrameLimits::new(2, 2, 12).unwrap(), 2, 2),
+            FaceFixture {
+                model: DeterministicFakeInference::new().unwrap(),
+                calls: 0,
+            },
+            GatePolicy::new(0, Duration::ZERO, Duration::ZERO).unwrap(),
+            bus,
+            None,
+        );
+        let _ = distributor.publish(keyframe(90000, 1));
+        let _ = distributor.publish(keyframe(180_000, 1));
+        drop(distributor);
+        let exit = owner.join().await.unwrap();
+        assert_eq!(exit.counters.inferred, 2);
+        assert_eq!(exit.counters.detections_produced, 1);
+        assert!(matches!(
+            subscriptions.recorder.receive().await,
+            surveillance_media::distribution::ReceiveOutcome::Item(_)
+        ));
+        assert!(matches!(
+            subscriptions.recorder.receive().await,
+            surveillance_media::distribution::ReceiveOutcome::Item(_)
+        ));
+        let observations = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut counts = Vec::new();
+            while counts.len() < 2 {
+                let event = events.receive().await.unwrap();
+                assert!(!matches!(
+                    event.payload,
+                    EventPayload::PersonDetectionObserved { .. }
+                ));
+                if let EventPayload::FaceDetectionObserved {
+                    detections,
+                    results_are_fixture,
+                    ..
+                } = &event.payload
+                {
+                    assert!(*results_are_fixture);
+                    counts.push(detections.as_slice().len());
+                }
+            }
+            counts
+        })
+        .await
+        .unwrap();
+        assert_eq!(observations, vec![1, 0]);
     }
 
     #[tokio::test]
@@ -460,6 +558,7 @@ pub struct DetectionCounters {
     pub inferred: u64,
     pub detections_produced: u64,
     pub inference_failed: u64,
+    pub output_capacity_dropped: u64,
     pub events_published: u64,
     pub event_delivery_losses: u64,
     pub decode_duration_micros: u64,
@@ -499,6 +598,34 @@ pub enum DetectionState {
     Stopped,
 }
 
+/// Per-capability counters, bounded by camera and lane labels.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LaneCounters {
+    pub offered: u64,
+    pub replaced: u64,
+    pub stale: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub preprocessing_micros: u64,
+    pub inference_micros: u64,
+    pub latency_buckets: [u64; 7],
+}
+impl LaneCounters {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            offered: 0,
+            replaced: 0,
+            stale: 0,
+            completed: 0,
+            failed: 0,
+            preprocessing_micros: 0,
+            inference_micros: 0,
+            latency_buckets: [0; 7],
+        }
+    }
+}
+
 // Not Copy: the snapshot now carries the live backend's identity, which is
 // textual. Callers clone it, which they already did through Copy.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -513,16 +640,26 @@ pub struct DetectionHealthSnapshot {
     /// `None` means no detector is running for this camera, which is not the
     /// same as running a fixture and must not be reported as though it were.
     pub backend: Option<InferenceDescriptor>,
+    pub overlay_max_age: Duration,
+    pub person_lane: Option<DetectionState>,
+    pub face_lane: Option<DetectionState>,
+    pub person_counters: LaneCounters,
+    pub face_counters: LaneCounters,
 }
 
 #[derive(Clone)]
-pub struct DetectionHealth(Arc<Mutex<DetectionHealthSnapshot>>);
+pub struct DetectionHealth(pub(crate) Arc<Mutex<DetectionHealthSnapshot>>);
 impl DetectionHealth {
     #[must_use]
     pub const fn disabled_snapshot() -> DetectionHealthSnapshot {
         DetectionHealthSnapshot {
             state: DetectionState::Disabled,
             backend: None,
+            overlay_max_age: Duration::from_secs(3),
+            person_lane: None,
+            face_lane: None,
+            person_counters: LaneCounters::empty(),
+            face_counters: LaneCounters::empty(),
             counters: DetectionCounters {
                 gate_skipped: 0,
                 preprocess_duration_micros: 0,
@@ -535,6 +672,7 @@ impl DetectionHealth {
                 inferred: 0,
                 detections_produced: 0,
                 inference_failed: 0,
+                output_capacity_dropped: 0,
                 events_published: 0,
                 event_delivery_losses: 0,
                 decode_duration_micros: 0,
@@ -573,6 +711,26 @@ impl DetectionHealth {
     pub fn disabled() -> Self {
         Self(Arc::new(Mutex::new(Self::disabled_snapshot())))
     }
+    /// Publishes terminal detection state without taking down the camera owner.
+    #[must_use]
+    pub fn unavailable_observed(camera: &CameraId, bus: &EventBus, category: &'static str) -> Self {
+        publish_detector_state(camera, bus, EventDetectorState::Terminal, Some(category), 1);
+        Self::unavailable()
+    }
+    /// A configured model failed to start; media preservation remains independent.
+    #[must_use]
+    pub fn unavailable() -> Self {
+        let mut snapshot = Self::disabled_snapshot();
+        snapshot.state = DetectionState::Terminal;
+        snapshot.counters.inference_failed = 1;
+        Self(Arc::new(Mutex::new(snapshot)))
+    }
+    pub fn set_overlay_max_age(&self, age: Duration) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .overlay_max_age = age;
+    }
     #[must_use]
     pub fn snapshot(&self) -> DetectionHealthSnapshot {
         self.0
@@ -604,15 +762,15 @@ impl DetectionHealth {
 }
 
 pub struct DetectionOwner {
-    shutdown: watch::Sender<bool>,
-    task: JoinHandle<DetectionExit>,
+    pub(crate) shutdown: watch::Sender<bool>,
+    pub(crate) task: JoinHandle<DetectionExit>,
 }
 impl DetectionOwner {
     #[allow(
         clippy::too_many_arguments,
         reason = "assembling the detection pipeline is a flat parameter list by design"
     )]
-    pub fn start<D: H264Decoder, I: PersonInference>(
+    pub fn start<D: H264Decoder, I: DetectionInference>(
         camera_id: CameraId,
         input: MediaSubscriber<H264AccessUnit>,
         sampler: TimestampSampler,
@@ -643,7 +801,7 @@ impl DetectionOwner {
         clippy::too_many_arguments,
         reason = "assembling the detection pipeline is a flat parameter list by design"
     )]
-    pub fn start_observed<D: H264Decoder, I: PersonInference>(
+    pub fn start_observed<D: H264Decoder, I: DetectionInference>(
         camera_id: CameraId,
         mut input: MediaSubscriber<H264AccessUnit>,
         mut sampler: TimestampSampler,
@@ -658,13 +816,18 @@ impl DetectionOwner {
         // Described here, from the object this owner was handed. Asking the
         // live backend is the only form of this claim that cannot drift from
         // what is running.
-        let backend = Some(InferenceDescriptor::of(&inference));
+        let backend = Some(InferenceDescriptor::of_detection(&inference));
         let health = DetectionHealth(Arc::new(Mutex::new(DetectionHealthSnapshot {
             state: DetectionState::Starting,
             counters: DetectionCounters::default(),
             sampler: sampler.counters(),
             input: input.metrics(),
             backend,
+            overlay_max_age: Duration::from_secs(3),
+            person_lane: None,
+            face_lane: None,
+            person_counters: LaneCounters::empty(),
+            face_counters: LaneCounters::empty(),
         })));
         let task_health = health.clone();
         let task = tokio::spawn(async move {
@@ -813,7 +976,7 @@ impl DetectionOwner {
                 let inference_started = Instant::now();
                 let inference_frame = frame.clone();
                 let inferred = tokio::task::spawn_blocking(move || {
-                    let result = inference.infer(&inference_frame);
+                    let result = inference.infer_detections(&inference_frame);
                     (inference, result)
                 })
                 .await;
@@ -830,8 +993,11 @@ impl DetectionOwner {
                 let detections = match inference_result {
                     Ok(detections) => {
                         counters.inferred += 1;
+                        counters.output_capacity_dropped = counters
+                            .output_capacity_dropped
+                            .saturating_add(inference.output_capacity_dropped());
                         failure_streak = 0;
-                        if !detections.as_slice().is_empty() {
+                        if !detections.is_empty() {
                             // Starts the cooldown, so a person who stops moving
                             // keeps being examined instead of disappearing the
                             // moment the scene goes still.
@@ -876,16 +1042,32 @@ impl DetectionOwner {
                 // exclude rectangle, before they reach the tracker. Done
                 // here (not post-tracker) so the tracker never allocates an
                 // ID for a known-bad region in the first place.
-                let detections = match roi_exclude {
-                    Some(rect) => filter_detections_outside(&detections, rect),
-                    None => detections,
+                let detections = match detections {
+                    InferenceResults::Persons(set) => {
+                        let set = match roi_exclude {
+                            Some(rect) => filter_detections_outside(&set, rect),
+                            None => set,
+                        };
+                        InferenceResults::Persons(tracker.update_detections(&set))
+                    }
+                    // Faces are observed boxes, never coasted or assigned identities.
+                    InferenceResults::Faces(set) => InferenceResults::Faces(match roi_exclude {
+                        None => set,
+                        Some([left, top, width, height]) => set.retain(|face| {
+                            let center_x =
+                                face.bounding_box.left() + face.bounding_box.width() * 0.5;
+                            let center_y =
+                                face.bounding_box.top() + face.bounding_box.height() * 0.5;
+                            !(center_x >= left
+                                && center_x <= left + width
+                                && center_y >= top
+                                && center_y <= top + height)
+                        }),
+                    }),
                 };
-                // Assign stable cross-frame ids. The tracker returns a
-                // `DetectionSet` where every entry has `track_id: Some(_)`.
-                let detections = tracker.update_detections(&detections);
                 counters.detections_produced = counters
                     .detections_produced
-                    .saturating_add(u64::try_from(detections.as_slice().len()).unwrap_or(u64::MAX));
+                    .saturating_add(u64::try_from(detections.len()).unwrap_or(u64::MAX));
                 let micros = observed_at
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .ok()
@@ -909,22 +1091,39 @@ impl DetectionOwner {
                 let Ok(event_id) = EventId::new(id) else {
                     continue;
                 };
+                let media_time = SourceMediaTime {
+                    epoch,
+                    ticks: frame.media_timestamp().ticks(),
+                    timebase_hz,
+                };
+                let model = inference.model_name().clone();
+                let model_version = inference.model_version().clone();
+                let results_are_fixture = !inference.is_production_model();
+                let payload = match detections {
+                    InferenceResults::Persons(detections) => {
+                        EventPayload::PersonDetectionObserved {
+                            media_time,
+                            model,
+                            model_version,
+                            results_are_fixture,
+                            detections,
+                        }
+                    }
+                    InferenceResults::Faces(detections) => EventPayload::FaceDetectionObserved {
+                        session: None,
+                        media_time,
+                        model,
+                        model_version,
+                        results_are_fixture,
+                        detections,
+                    },
+                };
                 let Ok(event) = DomainEvent::new(
                     event_id,
                     occurred_at,
                     Some(camera_id.clone()),
                     DeliveryClass::Detection,
-                    EventPayload::PersonDetectionObserved {
-                        media_time: SourceMediaTime {
-                            epoch,
-                            ticks: frame.media_timestamp().ticks(),
-                            timebase_hz,
-                        },
-                        model: inference.model_name().clone(),
-                        model_version: inference.model_version().clone(),
-                        results_are_fixture: !inference.is_production_model(),
-                        detections,
-                    },
+                    payload,
                 ) else {
                     continue;
                 };
@@ -1010,7 +1209,7 @@ impl DetectionOwner {
 /// that mostly reaches into real coverage, and dropping it would blind the
 /// system to a person leaning past the mask. The centre is also what the
 /// tracker uses to match frames.
-fn filter_detections_outside(
+pub(crate) fn filter_detections_outside(
     detections: &surveillance_events::event::DetectionSet,
     rect: [f32; 4],
 ) -> surveillance_events::event::DetectionSet {

@@ -11,3 +11,10 @@ pub mod model_output;
 pub mod onnx;
 pub mod sampler;
 pub mod tracker;
+
+#[cfg(feature = "onnx-inference")]
+pub mod face;
+pub mod face_output;
+
+pub mod combined;
+pub mod presence;
