@@ -101,3 +101,11 @@ test("media failures get operator language instead of silence", () => {
   assert.match(mediaErrorMessage({}), /could not be played/);
   assert.match(mediaErrorMessage(null), /could not be played/);
 });
+
+test("archive source stays explicit on search, range playback and single recording URLs", () => {
+  const range = { start: "2026-10-31T18:00:00Z", end: "2026-10-31T18:01:00Z" };
+  const prefix = "/api/recording-sources/archive-2/cameras/north/recordings";
+  assert.equal(recordingSearchPath("north", range, "archive-2"), `${prefix}?start=2026-10-31T18%3A00%3A00Z&end=2026-10-31T18%3A01%3A00Z`);
+  assert.match(playbackPath("north", range.start, range.end, "archive-2"), /^\/api\/recording-sources\/archive-2\/cameras\/north\/recordings\/playback\?/);
+  assert.equal(recordingVideoPath("north", "recording-1", "full", "archive-2"), `${prefix}/recording-1/video`);
+});

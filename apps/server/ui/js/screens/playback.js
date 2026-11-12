@@ -6,16 +6,50 @@ import { contiguousRuns, coverageBuckets, playbackTime, PLAYBACK_TIMEZONES } fro
 export function createPlaybackScreen({ state, fleetCounts, fleetProblem, errorBanner, pb }) {
   function screenPlayback() {
     const counts = fleetCounts();
-    if (!pb.camera && counts.cameras.length) pb.camera = counts.cameras[0].camera_id;
-    if (!pb.date) pb.date = new Date().toISOString().slice(0, 10);
+    const sources = state.recordingSources || [];
+    const source = sources.find((entry) => entry.id === pb.source);
+    const cameras = pb.source && pb.source !== "primary"
+      ? (source?.cameras || []).map((camera) => camera.camera_id)
+      : [...new Set([...counts.cameras.map((camera) => camera.camera_id), ...(state.archiveCameras || [])])].sort();
+    if (pb.camera && !cameras.includes(pb.camera)) pb.camera = "";
+    const coverage = source?.cameras?.find((camera) => camera.camera_id === (pb.camera || cameras[0]));
+    if (!pb.camera && cameras.length) pb.camera = cameras[0];
+    if (!pb.date && coverage) pb.date = coverage.first_recorded_at.slice(0, 10);
+    if (!pb.date && (!pb.source || pb.source === "primary")) pb.date = new Date().toISOString().slice(0, 10);
   
     return `${fleetProblem()}
+      ${state.archiveError ? errorBanner(state.archiveError) : ""}
+      ${state.recordingSourcesError ? errorBanner(state.recordingSourcesError) : ""}
       <div class="card">
+        <h3>${icon("clock")} Recording folders</h3>
+        <div class="filters mt">
+          <div class="field grow"><label class="f">Recording folder</label>
+            <select class="f" data-bind="source">
+              <option value="primary" ${!pb.source || pb.source === "primary" ? "selected" : ""}>Current recordings</option>
+              ${sources.map((entry) => `<option value="${esc(entry.id)}" ${entry.id === pb.source ? "selected" : ""}>${esc(entry.label)}</option>`).join("")}
+            </select>
+          </div>
+          <button class="btn" data-act="folder-browse">Choose existing folder</button>
+        </div>
+        ${pb.folderChoices ? `<div class="filters mt">
+          <div class="field grow"><label class="f">Existing folders on the server</label><select class="f" data-bind="folder">
+            ${pb.folderChoices.map((entry) => `<option value="${esc(entry.id)}" ${entry.id === pb.folder ? "selected" : ""}>${esc(entry.label)}</option>`).join("")}
+          </select></div>
+          <button class="btn primary" data-act="folder-index" ${pb.folderBusy || !pb.folderChoices.length ? "disabled" : ""}>${pb.folderBusy ? "Starting…" : "Use folder"}</button>
+        </div>${pb.folderChoices.length ? "" : `<p class="note">No supported recording folders were found.</p>`}` : ""}
+        <p class="note">Choose saved recordings already on the server. Indexing reads the files without copying or deleting them; no camera connection is needed.</p>
+        ${source ? `<div class="tiny" id="folder-status">${esc(source.state === "indexing" ? "Indexing recordings…" : source.state)} · ${esc(source.cameras.reduce((sum, camera) => sum + camera.recordings, 0))} recordings indexed</div>` : ""}
+        ${coverage ? `<div class="tiny mt">Available for ${esc(coverage.camera_id)}: ${esc(coverage.first_recorded_at.slice(0, 10))} through ${esc(coverage.last_recorded_at.slice(0, 10))} (UTC)</div>` : ""}
+        ${source?.state === "partial" ? banner("warn", "Some files could not be indexed.", "The valid recordings are available below.") : ""}
+        ${source?.state === "failed" || source?.state === "interrupted" || source?.state === "unavailable" ? banner("warn", "This recording folder needs attention.", "Choose the folder again to retry indexing when it is available.") : ""}
+        ${pb.folderError ? errorBanner(pb.folderError) : ""}
+      </div>
+      <div class="card mt">
         <div class="filters">
           <div class="field">
             <label class="f">Camera</label>
             <select class="f" data-bind="camera">
-              ${counts.cameras.map((camera) => `<option value="${esc(camera.camera_id)}" ${camera.camera_id === pb.camera ? "selected" : ""}>${esc(camera.camera_id)}</option>`).join("")}
+              ${cameras.map((id) => `<option value="${esc(id)}" ${id === pb.camera ? "selected" : ""}>${esc(id)}</option>`).join("")}
             </select>
           </div>
           <div class="field">
@@ -29,7 +63,7 @@ export function createPlaybackScreen({ state, fleetCounts, fleetProblem, errorBa
           <div class="field"><label class="f">To</label><input class="f" type="time" step="1" data-bind="to" value="${esc(pb.to)}"></div>
           <div class="row">
             <button class="btn" data-act="pb-clear">Clear</button>
-            <button class="btn primary" data-act="pb-load" ${pb.busy ? "disabled" : ""}>${icon("refresh")} ${pb.busy ? "Loading…" : "Load"}</button>
+            <button class="btn primary" data-act="pb-load" ${pb.busy || !pb.camera ? "disabled" : ""}>${icon("refresh")} ${pb.busy ? "Loading…" : "Load"}</button>
           </div>
         </div>
       </div>
@@ -136,6 +170,7 @@ export function createPlaybackScreen({ state, fleetCounts, fleetProblem, errorBa
           </div>
           <div class="tiny muted">Duration is optional. A duration returns footage from the recording start; Full returns the complete recording.</div>
         </div>
+        ${result.next_cursor ? `<p class="note">More recordings match this range. Narrow the time range to view later footage.</p>` : ""}
         ${coverage(recordings)}
         <div class="wrap mt"><table>
           <thead><tr><th>Started</th><th>Ended</th><th>Codec</th><th>Resolution</th><th>Size</th><th>Status</th><th></th></tr></thead>

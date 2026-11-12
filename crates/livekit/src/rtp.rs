@@ -121,6 +121,14 @@ impl H264Adapter {
         }
     }
 
+    /// Forget timestamp and codec state at a new decodable run. Parameter sets
+    /// from a previous camera session must not initialise its replacement.
+    pub(crate) fn reset(&mut self) {
+        self.mapper = RtpTimestampMapper::default();
+        self.sps = None;
+        self.pps = None;
+    }
+
     pub fn packetize(
         &mut self,
         epoch: PublicationEpoch,

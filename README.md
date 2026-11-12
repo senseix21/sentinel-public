@@ -14,27 +14,27 @@ development result as a production claim.
 
 ## Run locally
 
-On macOS, with the prerequisites installed, open a terminal and run:
+With the prerequisites installed, run from the repository root:
 
 ```bash
-cd /Users/abuhamza/dev/camera_project
-make prerequisites
-make webcam-devices
-CAMERA_ID=camera-01 WEBCAM_DEVICE=0 make run
+make run
 ```
 
-Use your checkout's directory if it differs. Select the video device index shown
-by `make webcam-devices`; replace `WEBCAM_DEVICE=0` if needed. Allow camera access
-for the terminal application in macOS settings.
+No webcam, camera IP or display is required. This starts the dashboard,
+PostgreSQL, LiveKit and development login proxy with no bootstrap camera. Open
+**Cameras** to add an RTSP endpoint, dimensions and optional camera credentials.
+New cameras are saved stopped; click **Start** to connect. The server must be
+able to reach the camera's address, through its LAN or a configured VPN/tunnel.
+A laptop webcam has no RTSP IP unless you explicitly publish it through a bridge.
 
 Wait for **SENTINEL ONLINE**, then open **http://127.0.0.1:3001/** and log in:
 
 - Username: `operator`
 - Password: `sentinel-local`
 
-The command starts the database, LiveKit, server, webcam capture, development
-login proxy, and real person/face detection. First startup may download model
-artifacts and take longer to compile. Keep this terminal open.
+The command starts the database, LiveKit, server and development login proxy.
+It does not open a capture device, download models, or start a decoder while
+there are no running cameras. Keep this terminal open.
 
 In another terminal, check the running system:
 
@@ -49,11 +49,262 @@ open **Playback** to search saved recordings. To stop, press **Ctrl-C once** in
 the startup terminal and wait for the shutdown messages. Start again with the
 same command to reuse the saved database and recordings.
 
-For a startup failure, inspect `.local/webcam-run/logs/build.log` and
-`.local/webcam-run/logs/server.log`. For device selection, optional settings,
+For a startup failure, inspect `.local/server-run/logs/build.log` and
+`.local/server-run/logs/server.log`. For device selection, optional settings,
 and recording checks, follow [the detailed startup guide](#start-the-system-step-by-step).
-The [latest verification](#latest-local-verification--2026-10-20) records the
+The [latest verification](#latest-local-verification--2026-10-23) records the
 remaining RTSP recovery, shutdown, build, and dependency-check failures.
+
+## Run on the dev server and open the dashboard
+
+No camera or display is needed to start the application. Use two terminals on
+your laptop: one keeps the server running, and the other keeps the tunnel open.
+
+### 1. Start the application on the server
+
+In terminal A on your laptop:
+
+```bash
+ssh root@172.104.62.66
+```
+
+Then, inside that SSH session:
+
+```bash
+cd /home/dev/camera_project
+make run
+```
+
+Wait for **SENTINEL ONLINE** and leave this terminal open. On this provisioned
+server, the launcher automatically switches to the existing `sentinel-test`
+repository owner before starting PostgreSQL. LiveKit automatically falls back
+to loopback on a public-only server, so no `LIVEKIT_MEDIA_IP` override is needed
+for dashboard startup.
+
+If the optional synthetic demo is running, stop it before `make run`, since it
+uses the same ports:
+
+```bash
+systemctl stop sentinel-demo.service sentinel-demo-source.service
+```
+
+### 2. Forward the dashboard port from your laptop
+
+In terminal B on your laptop, outside the SSH session:
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:3001:127.0.0.1:3001 root@172.104.62.66
+```
+
+Enter the SSH password and leave this terminal open. A blank terminal after
+authentication is normal. Reuse an existing tunnel on port 3001 if one is
+already running.
+
+### 3. Open the dashboard and configure cameras
+
+Open **http://127.0.0.1:3001/** in your laptop's browser and sign in:
+
+- Username: `operator`
+- Password: `sentinel-local`
+
+An empty camera list is normal on first startup. Open **Cameras**, enter a camera
+identifier, RTSP endpoint, stream dimensions and optional camera credentials,
+then click **Add camera** followed by **Start**. The server must be able to reach
+the camera's network address. Configuration and running/stopped choices survive
+restarts; starting the dashboard itself never requires a webcam.
+
+This tunnel provides dashboard/API access and HTTP recording playback. Live
+WebRTC viewing also requires reachable LiveKit signalling and media endpoints;
+forwarding port 3001 alone does not configure those connections.
+
+### 4. Stop when finished
+
+Press **Ctrl+C** in terminal A and wait for the shutdown messages to stop the
+application. Press **Ctrl+C** in terminal B to close the tunnel. Closing only the
+tunnel leaves the application running. Reuse `make run` and the same tunnel
+command the next time.
+
+## Play existing dev-server recordings without a camera
+
+The following footage was found on the server on **2026-11-01**. These camera
+identifiers are the names used for playback:
+
+- **`dev-test-pattern`** — 1,372 synthetic demo recordings from **October 31
+  through November 1, 2026 (UTC)**, stored in
+  `/home/dev/camera_project/.local/server-demo/recordings/`.
+- **`camera-01`** — 5 copied laptop recordings from **October 29, 2026 (UTC)**,
+  around **17:46–17:48 UTC**, stored in
+  `/home/dev/camera_project/.local/laptop-recordings/`. These copies are not
+  indexed automatically; select this folder in Playback to index them.
+
+Counts describe that inventory check; configured retention may remove footage
+later. Normal `make run` uses `.local/server-run`, whose recording index was
+empty at the time of the check. It does not automatically load the separate
+demo database or laptop copies.
+
+To choose these recordings entirely from the dashboard:
+
+1. Start normally on the server:
+
+   ```bash
+   cd /home/dev/camera_project
+   make run
+   ```
+
+2. Keep your port-3001 SSH tunnel open, open **http://127.0.0.1:3001/**, and
+   sign in with the development login above.
+3. Open **Playback** and click **Choose existing folder**.
+4. Select **`.local/server-demo/recordings`** for the synthetic demo, or
+   **`.local/laptop-recordings`** for the copied laptop footage. Click **Use folder**.
+5. Wait for indexing. Camera names and available UTC dates appear automatically;
+   select **`dev-test-pattern`** for demo footage or **`camera-01`** for the laptop
+   recordings. Choose a date/time range, click **Load**, then **Play recording**.
+
+No `STATE_DIR` or recording-directory argument is needed in `make run`. Registered
+folders and their indexes survive server restarts, and the browser remembers its
+last selected folder. The current recorder's destination remains separate.
+Indexing and playback read archive files in place: they do not copy, move or
+apply the active recording-retention policy to those files. No connected camera
+is required. Folder indexing requires an administrator; camera-scoped viewers
+can play indexed footage they are authorized to see.
+
+The picker lists supported SENTINEL recording layouts under approved server
+roots, by default the checkout's `.local/` tree. It does not browse arbitrary
+server files or upload laptop folders. To approve another location, configure
+`SURVEILLANCE_RECORDING_BROWSE_ROOTS` before startup (colon-separated paths on
+Linux/macOS). Folders must contain the existing
+`camera-id/YYYY/MM/DD/HH-MM-SS--recording-id.mp4` layout with H.264 recordings.
+Symlink folders are refused. Discovery is bounded to 5,000 directory entries,
+two nested levels and 32 sources; point the approved roots closer to an archive
+if a larger tree exceeds these bounds. Index scans use the configured
+reconciliation scan limit, and each probe uses the playback probe deadline.
+
+Only one folder is indexed at a time. The dashboard reports indexing progress,
+partial imports, unavailable folders and interrupted/failed jobs. Valid indexed
+footage remains playable after a partial import; choose the folder again to retry.
+The optional source demo below is needed only to generate new synthetic footage.
+
+## Optional: open the synthetic recording demo, step by step
+
+The headless dev server does not need a display or webcam to serve saved video.
+You watch recordings in your laptop's browser through an SSH tunnel.
+
+For normal dashboard startup, use the `make run` instructions above. Stop that
+stack before starting this optional demo, which uses the same ports and has its
+own database and recording directory.
+
+This demo guide applies to the **already-provisioned demo server** at
+`172.104.62.66`. Its `sentinel-demo` and `sentinel-demo-source` systemd services
+were installed separately; a fresh clone does not create those services.
+The source is generated video labeled **TEST FOOTAGE - NOT A LIVE CAMERA**,
+with camera ID `dev-test-pattern`. Detection is disabled for this demo.
+
+### 1. Check the demo on the server
+
+From your laptop, connect:
+
+```bash
+ssh root@172.104.62.66
+```
+
+Enter the SSH password shared privately. Nothing appears while you type the
+password; press Enter when finished. Do not put that password in this README.
+
+At the server's `root@localhost` prompt, run:
+
+```bash
+cd /home/dev/camera_project
+systemctl start sentinel-demo.service
+systemctl is-active sentinel-demo.service sentinel-demo-source.service
+```
+
+Both services should report `active`. The first startup can take time; inspect
+progress with:
+
+```bash
+journalctl -u sentinel-demo.service -n 30 --no-pager
+```
+
+The synthetic recording demo is separate from normal application startup.
+For a camera-free dashboard, stop both demo services and use:
+
+```bash
+cd /home/dev/camera_project
+make run
+```
+
+On this provisioned server the launcher switches from root to the existing
+repository owner, `sentinel-test`, before starting PostgreSQL. No user is created.
+For another deployment, run as an unprivileged repository owner or set
+`SENTINEL_DEV_USER` when invoking the launcher as root.
+
+### 2. Open the SSH tunnel from your laptop
+
+Open a **second terminal on your laptop**, outside the SSH session, and run:
+
+```bash
+ssh -N -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:3001:127.0.0.1:3001 root@172.104.62.66
+```
+
+Enter the server's SSH password again. After authentication, a blank terminal
+is normal: `-N` opens the tunnel without a remote shell. **Leave it open.**
+If this tunnel is already running, reuse it instead of starting another copy.
+
+### 3. Sign in through your laptop's browser
+
+Open **http://127.0.0.1:3001/** on your laptop. This address reaches the server
+through the tunnel; it is not a public dashboard address.
+
+Use the development dashboard login:
+
+- Username: `operator`
+- Password: `sentinel-local`
+
+These are dashboard development credentials, separate from the SSH password.
+
+### 4. Load the demo recordings
+
+1. Open **Playback**.
+2. Select camera **dev-test-pattern**.
+3. Set **Timezone** to **UTC**.
+4. Select the UTC date when the footage was recorded. For new footage, use the
+   current UTC date, which can differ from your local calendar date.
+5. If your browser shows a **12-hour clock**, set **From** to **12:00 AM** and
+   **To** to **11:59 PM**. Set the AM/PM fields explicitly. If seconds are shown,
+   use **12:00:00 AM** through **11:59:59 PM**.
+6. If your browser shows a **24-hour clock**, use **00:00** through **23:59**.
+7. Click **Load**.
+8. In the matched segments, click **Play recording**.
+
+**12:00 AM means midnight; 12:00 PM means noon.** These times are interpreted
+in the selected timezone, so keep UTC selected for the instructions above.
+
+Allow at least 30-60 seconds after startup for a recording segment to finalize.
+The demo retains approximately one day of footage; an older date may have no
+remaining recordings. This guide demonstrates recording and playback, not a
+physical camera or live detection. The HTTP tunnel alone does not configure
+remote WebRTC live viewing.
+
+### 5. Close the tunnel or stop the demo
+
+Press **Ctrl+C** in the laptop's tunnel terminal to close your connection.
+The server continues recording until its service is stopped.
+
+To stop the demo, run this **on the server**:
+
+```bash
+systemctl stop sentinel-demo.service
+```
+
+The source service stops with it. Existing recordings are preserved until the
+configured retention policy removes them. Start it again with
+`systemctl start sentinel-demo.service`.
+
+If the tunnel reports **Address already in use**, an existing tunnel or local
+application is using laptop port 3001. Reuse the existing demo tunnel, or close
+the previous tunnel with Ctrl+C before reconnecting.
 
 ## Documentation
 
@@ -70,7 +321,12 @@ remaining RTSP recovery, shutdown, build, and dependency-check failures.
 
 ## Start the system, step by step
 
-`make run` uses the webcam without an RTSP proxy:
+`make run` starts with no bootstrap camera. It restores dashboard registrations
+and resumes only cameras whose saved desired state is running. Stopped and
+unreachable cameras do not block login or `/ready`; inspect their camera rows
+and health resources for connection status.
+
+Optional webcam testing uses **`make webcam`** (or `make webcam-release`):
 
 ```text
 webcam -> server-owned FFmpeg -> bounded H.264 distributor
@@ -116,9 +372,10 @@ see [the security test steps](#4-run-the-dependency-and-security-gate).
 The launcher checks FFmpeg, LiveKit, and port-inspection dependencies before
 changing runtime state.
 
-### 2. Select the webcam
+### 2. Select a source (optional)
 
-List AVFoundation devices:
+For a webcam smoke test on macOS, list AVFoundation devices. Skip this step
+for a headless server or dashboard-configured RTSP cameras:
 
 ```bash
 make webcam-devices
@@ -132,10 +389,16 @@ Security -> Camera**.
 
 ### 3. Start SENTINEL in terminal A
 
-Start the stack with a camera identity used consistently in later commands:
+Start the application without a camera:
 
 ```bash
-CAMERA_ID=camera-01 WEBCAM_DEVICE=0 make run
+make run
+```
+
+Or explicitly start the webcam fixture with a camera identity:
+
+```bash
+CAMERA_ID=camera-01 WEBCAM_DEVICE=0 make webcam
 ```
 
 The launcher opens the development login page automatically:
@@ -214,7 +477,7 @@ VIDEO_HEIGHT=1080 \
 VIDEO_FPS=15 \
 VIDEO_BITRATE_KBPS=2500 \
 CAMERA_ID=office-webcam \
-make run
+make webcam
 ```
 
 Use the development build for the normal edit/run loop:
@@ -227,11 +490,11 @@ Use the optimized binary for manual qualification or performance measurements.
 On the currently affected macOS toolchain, use the verified release workaround:
 
 ```bash
-CARGO_PROFILE_RELEASE_STRIP=none CAMERA_ID=camera-01 make run-release
+CARGO_PROFILE_RELEASE_STRIP=none CAMERA_ID=camera-01 make webcam-release
 ```
 
 On hosts without the documented SQLx linker issue, use
-`CAMERA_ID=camera-01 make run-release`.
+`CAMERA_ID=camera-01 make webcam-release`.
 
 Do not publish performance numbers from `make run`; it deliberately uses the
 faster-to-build development profile.
@@ -244,17 +507,30 @@ The launcher owns and supervises this local stack:
 |---|---|---|
 | PostgreSQL | `127.0.0.1:55432` | Recording index, settings, identities, and audit |
 | LiveKit | `ws://127.0.0.1:7880` | WebRTC distribution to browser viewers |
-| FFmpeg child | selected webcam | Captures and encodes H.264 into the Rust source owner |
+| FFmpeg child (only with `make webcam`) | selected webcam | Captures and encodes H.264 into the Rust source owner |
 | SENTINEL server | `http://127.0.0.1:3000` | API, dashboard assets, ingest, recording, and publication |
 | Development proxy | `http://127.0.0.1:3001` | Loopback login and trusted identity assertion |
 
-Persistent local state defaults to:
+Persistent local state for `make run` defaults to:
 
 ```text
-.local/webcam-run/logs service logs
-.local/webcam-run/pgdata persistent PostgreSQL data
-recordings/          finalized and partial recording segments
+.local/server-run/logs        service logs
+.local/server-run/pgdata      persistent PostgreSQL data
+.local/server-run/cameras.json protected camera configuration and desired state
+recordings/                  finalized and partial recording segments
 ```
+
+`make webcam` retains `.local/webcam-run` for its separate development fixture.
+Set `STATE_DIR` and `RECORDING_ROOT` explicitly to reuse an existing stack's
+state. Never run two stacks on the same state directory or listener ports.
+Camera credentials live in the catalog, which requires mode **0600**. Back it up
+as a secret, together with the database and recordings; do not commit it. Set
+`SURVEILLANCE_CAMERA_CATALOG_PATH` to select another location. A standalone Rust
+server defaults to `.local/cameras.json`. Catalog corruption or insecure
+permissions fails startup rather than silently discarding registrations.
+Start/Stop update durable intent; Ctrl-C preserves it. Remove stops the camera
+and deletes registration, while indexed footage remains selectable in Playback.
+See [ADR 019](docs/adr/019-camera-independent-startup.md).
 
 The HTTP server and development login proxy listen on loopback. LiveKit WebRTC
 media uses the machine's active private IPv4 address, with UDP on `LIVEKIT_PORT + 2`
@@ -368,7 +644,10 @@ For the local stack:
 - **System** reports server capabilities and dependency state.
 - **Logout** revokes the in-memory development session.
 
-`make run` and `make run-release` enable real ONNX inference by default.
+`make webcam` and `make webcam-release` enable real ONNX inference by default.
+Camera-free startup downloads no models; dashboard detection is disabled by
+default. Enabling detection requires a separately configured backend; a build
+without a model reports fixture inference and supports no accuracy claim.
 They select **person presence with face-only boxes** (`person_face`) at a 70% confidence threshold. On first use
 they download the checksum-verified YOLOX person model, YuNet face model and pinned
 ONNX Runtime 1.28.3 into `.local/onnx/`. The runtime bundle supports Apple Silicon
@@ -587,21 +866,21 @@ file-layer behavior:
 
 ## Logs, metrics, and health
 
-For `make run`, inspect:
+For `make run`, inspect `.local/server-run/logs/`:
 
 ```text
-.local/webcam-run/logs/build.log
-.local/webcam-run/logs/server.log
-.local/webcam-run/logs/livekit.log
-.local/webcam-run/logs/postgres.log
-.local/webcam-run/logs/proxy.log
+build.log
+server.log
+livekit.log
+postgres.log
+proxy.log
 ```
 
-`/live` answers whether the process can serve requests. `/ready` reports whether
-required dependencies and camera state are ready; an individual camera can be
-degraded without taking down unrelated recording pipelines. `/metrics` exports
-bounded-cardinality Prometheus metrics for camera, queues, recording, storage,
-detection, LiveKit, API, security, and reconciliation behavior.
+For `make webcam`, the equivalent directory is `.local/webcam-run/logs/`.
+`/live` answers whether the process can serve requests. `/ready` reports
+application dependency readiness independently of camera count or connectivity.
+Use camera resources and `/metrics` for camera degradation, queue, recording,
+storage, detection, LiveKit, security and reconciliation status.
 
 Startup recording reconciliation runs as an owned background repair task rather
 than blocking `/live`. Already indexed immutable files are skipped when their
@@ -614,7 +893,7 @@ import. Readiness and reconciliation metrics expose degraded repair state.
 
 With PostgreSQL or a non-loopback deployment boundary configured, this is
 expected: protected routes require a valid bearer token or a trusted proxy
-assertion. Use the development login on port `3001`; `make run` starts PostgreSQL and
+assertion. Use the development login on port `3001`; the development launcher starts PostgreSQL and
 does not provide an anonymous administrator API on port `3000`.
 
 ### Startup stops at the webcam
@@ -826,6 +1105,36 @@ RECORDING_ROOT=./.local/rtsp-test-recordings CAMERA_ID=qualification-01 make ver
 
 ### 7. Check recovery and sustained operation
 
+For the isolated file-backed stack above, enable the MediaMTX API on loopback in
+its YAML before starting MediaMTX:
+
+```yaml
+api: true
+apiAddress: 127.0.0.1:9997
+```
+
+Then run the automated recovery fixture (replace the source file with the same
+H.264 MP4 used by your publisher):
+
+```bash
+SENTINEL_RECOVERY_SOURCE=/absolute/path/source.mp4 \
+SENTINEL_RTSP_FIXTURE_URL=rtsp://127.0.0.1:8554/qualification \
+SENTINEL_RECOVERY_CAMERA=qualification-01 \
+PLAYWRIGHT_MODULE_PATH="$PWD/.local/browser-tests/node_modules/playwright" \
+node scripts/dev/check-rtsp-recovery.cjs
+```
+
+Run this only against the isolated development fixture: it disconnects the
+selected MediaMTX publisher, starts an owned replacement FFmpeg publisher, and
+stops that replacement when finished. Restart your original publisher afterward
+if you want to keep using the fixture. The test keeps two Chromium viewers open,
+requires a new camera epoch, advancing inference/publication, a complete new
+recording segment, advancing viewer frames and exactly one upstream reader.
+Recorder rejection/failure counters must not increase. It requires the ONNX
+combined detection configuration and a source that the browser can decode;
+this is a recovery check, not an accuracy or latency benchmark.
+
+
 While the file-backed stack is recording, stop only the RTSP publisher. Confirm
 liveness remains available, camera health reports degradation/reconnection, and
 logs explain the source loss. Restart the publisher and confirm a new connected
@@ -836,6 +1145,38 @@ backpressure failure. Save `/metrics`, server/LiveKit logs, duration, completed
 segments and any partials. A short smoke test cannot close that reliability gate.
 Do not increase queue capacity to hide drops. Physical webcam, Firefox, genuine
 disk-full and 10/20-camera target-hardware tests remain separate qualifications.
+
+## Latest local verification — 2026-10-23
+
+The RTSP reconnect stalls observed on October 20 are fixed for the local fixture.
+Detection teardown now disconnects its full frame queue before joining the reader.
+Live publication resets pacing, RTP mapping and decoder state together at a new
+media run, keeping the existing room and track. Combined detection reports
+Degraded while resetting or failing decode and Running after decoded frames return.
+
+Two deterministic regressions first reproduced the old deadlock/publication
+stall, then passed with the fixes; another covers detection health recovery.
+All-feature workspace tests passed: **590 passed, 39 ignored**. Formatting,
+all-target/all-feature Clippy, the default `make verify` gate and all-feature
+release passed, using `CARGO_PROFILE_RELEASE_STRIP=none` for macOS release builds.
+The two real FFmpeg decode tests were also executed explicitly and passed.
+
+Three automated local outage/recovery cycles passed with real ONNX models and
+two Chromium viewers. The final clean-state replay required a complete new
+recording segment: camera epoch 1→2, inference 29→270, publication 27→631 access
+units, completed segments 0→2, no recorder rejections/failures, and exactly one
+surveillance RTSP reader. Both existing browser tabs continued advancing frames.
+All 33 files from the earlier run and three clean-state files decoded. Rust server
+and detection teardown finished within one second; whole-stack shutdown varied
+from about one second to 26 seconds, with the latter waiting on LiveKit.
+Use [the recovery fixture](#7-check-recovery-and-sustained-operation) to repeat it.
+
+Raw logs are in `target/verification-2026-10-23/` (ignored local output).
+Long source-offline gaps in the manually interrupted run produced two immutable
+recording-metadata conflict errors; that separate indexing/reconciliation issue
+needs investigation. This is not a sustained-load qualification. The older
+recorder-backpressure incident, dependency advisories, plain macOS release issue,
+physical-camera/Firefox checks and production capacity/accuracy gates remain open.
 
 ## Latest local verification — 2026-10-20
 

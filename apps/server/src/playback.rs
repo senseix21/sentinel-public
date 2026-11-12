@@ -70,6 +70,11 @@ impl PlaybackAssembler {
         }
     }
 
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Starts one owned stream-copy child after validating every planned file.
     /// The emitted interval is segment-aligned, not frame-accurate.
     ///

@@ -11,11 +11,14 @@ publish = false
 workspace = true
 
 [features]
+# Development-only entry point for the isolated coverage-guided fuzz workspace.
+fuzzing = []
 # Passes the detector's optional ONNX backend through, so a build either has
 # real inference everywhere or nowhere.
 onnx-inference = ["surveillance-detector/onnx-inference"]
 
 [dependencies]
+fs2.workspace = true
 jiff.workspace = true
 chrono = { workspace = true }
 subtle = { workspace = true }
@@ -30,6 +33,7 @@ surveillance-media = { path = "../../crates/media" }
 surveillance-livekit = { path = "../../crates/livekit" }
 surveillance-recorder = { path = "../../crates/recorder" }
 surveillance-storage = { path = "../../crates/storage" }
+sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -40,5 +44,4 @@ url.workspace = true
 [dev-dependencies]
 # Only to prove the vendored LiveKit browser SDK is byte-for-byte the bundle
 # recorded in `ui/vendor/README.md`. Not used by the server itself.
-sha2 = { workspace = true }
 sqlx.workspace = true

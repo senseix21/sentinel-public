@@ -5,7 +5,10 @@ use std::{
     error::Error,
     fmt,
     num::NonZeroUsize,
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
     time::Duration,
 };
 
@@ -18,6 +21,7 @@ use tokio::{
 };
 
 use crate::{
+    camera_catalog::{CameraCatalog, CameraRegistration},
     metadata_writer::MetadataWriterHandle,
     one_camera::{OneCameraExit, OneCameraHealth, OneCameraHealthSnapshot, PipelineStopReason},
     pipeline::{classify_exit, ActionableFailure, CameraPipeline, CameraPipelineError},
@@ -150,6 +154,7 @@ pub enum SupervisorOperationError {
     PipelineStart,
     PipelineJoin,
     ShuttingDown,
+    Persistence,
 }
 
 impl fmt::Display for SupervisorOperationError {
@@ -180,6 +185,7 @@ type Reply = oneshot::Sender<Result<(), SupervisorOperationError>>;
 
 enum Command {
     Add(Arc<OneCameraConfig>, Reply),
+    Register(Arc<OneCameraConfig>, CameraRegistration, Reply),
     Start(CameraId, Reply),
     Stop(CameraId, Reply),
     Remove(CameraId, Reply),
@@ -192,9 +198,16 @@ pub struct CameraSupervisorHandle {
     response_timeout: Duration,
     registry: CameraHealthRegistry,
     event_bus: EventBus,
+    catalog_available: Arc<AtomicBool>,
 }
 
 impl CameraSupervisorHandle {
+    /// Whether durable registration storage is available for mutation.
+    #[must_use]
+    pub fn catalog_available(&self) -> bool {
+        self.catalog_available.load(Ordering::Relaxed)
+    }
+
     #[must_use]
     pub fn health_registry(&self) -> CameraHealthRegistry {
         self.registry.clone()
@@ -211,6 +224,18 @@ impl CameraSupervisorHandle {
     /// Returns bounded transport or typed operation failure.
     pub async fn add(&self, config: Arc<OneCameraConfig>) -> Result<(), SupervisorRequestError> {
         self.request(|reply| Command::Add(config, reply)).await
+    }
+
+    /// Adds a durable stopped camera. Persistence precedes runtime visibility.
+    /// # Errors
+    /// Returns bounded transport, validation or persistence failure.
+    pub async fn register(
+        &self,
+        config: Arc<OneCameraConfig>,
+        camera: CameraRegistration,
+    ) -> Result<(), SupervisorRequestError> {
+        self.request(|reply| Command::Register(config, camera, reply))
+            .await
     }
 
     /// Starts one configured camera; repeated active starts are idempotent.
@@ -269,6 +294,8 @@ pub struct CameraSupervisor {
     commands: mpsc::Receiver<Command>,
     registry: CameraHealthRegistry,
     entries: BTreeMap<CameraId, CameraEntry>,
+    catalog: Option<CameraCatalog>,
+    catalog_available: Arc<AtomicBool>,
     operations: JoinSet<OperationCompletion>,
     shutting_down: bool,
     shutdown_reply: Option<Reply>,
@@ -333,11 +360,14 @@ impl CameraSupervisor {
     ) -> (Self, CameraSupervisorHandle) {
         let (tx, rx) = mpsc::channel(command_capacity.get());
         let registry = CameraHealthRegistry::new(maximum_cameras);
+        let catalog_available = Arc::new(AtomicBool::new(true));
         (
             Self {
                 commands: rx,
                 registry: registry.clone(),
                 entries: BTreeMap::new(),
+                catalog: None,
+                catalog_available: Arc::clone(&catalog_available),
                 operations: JoinSet::new(),
                 shutting_down: false,
                 shutdown_reply: None,
@@ -350,8 +380,16 @@ impl CameraSupervisor {
                 response_timeout,
                 registry,
                 event_bus,
+                catalog_available,
             },
         )
+    }
+
+    /// Installs the single persistence owner before its command loop starts.
+    #[must_use]
+    pub fn with_catalog(mut self, catalog: CameraCatalog) -> Self {
+        self.catalog = Some(catalog);
+        self
     }
 
     pub async fn run(mut self) {
@@ -365,7 +403,7 @@ impl CameraSupervisor {
             tokio::select! {
                 command = self.commands.recv(), if !self.shutting_down => {
                     match command {
-                        Some(command) => self.handle_command(command),
+                        Some(command) => self.handle_command(command).await,
                         None => self.begin_shutdown(None),
                     }
                 }
@@ -383,8 +421,58 @@ impl CameraSupervisor {
         }
     }
 
-    fn handle_command(&mut self, command: Command) {
+    async fn handle_command(&mut self, command: Command) {
+        // All mutations pass this single owner. No HTTP task can race catalog
+        // replacement against another command or outlive a canceled request.
+        let intent = match &command {
+            Command::Start(id, _) => Some((id.clone(), Some(true))),
+            Command::Stop(id, _) => Some((id.clone(), Some(false))),
+            Command::Remove(id, _) => Some((id.clone(), None)),
+            _ => None,
+        };
+        if let Some((id, running)) = intent {
+            if self.entries.contains_key(&id) {
+                if let Some(catalog) = self.catalog.as_mut() {
+                    if catalog.intent(id.as_str(), running).await.is_err() {
+                        self.catalog_available
+                            .store(catalog.available(), Ordering::Relaxed);
+                        tracing::error!(camera_id = %id, "camera intent persistence failed");
+                        match command {
+                            Command::Start(_, reply)
+                            | Command::Stop(_, reply)
+                            | Command::Remove(_, reply) => {
+                                let _ = reply.send(Err(SupervisorOperationError::Persistence));
+                            }
+                            _ => {}
+                        }
+                        return;
+                    }
+                }
+            }
+        }
         match command {
+            Command::Register(config, camera, reply) => {
+                if self.entries.contains_key(&config.camera_id) {
+                    let _ = reply.send(Err(SupervisorOperationError::DuplicateCamera));
+                } else if self.entries.len() >= self.registry.maximum.get() {
+                    let _ = reply.send(Err(SupervisorOperationError::RegistryFull));
+                } else {
+                    let saved = match self.catalog.as_mut() {
+                        Some(catalog) => {
+                            let saved = catalog.add(camera).await.is_ok();
+                            self.catalog_available
+                                .store(catalog.available(), Ordering::Relaxed);
+                            saved
+                        }
+                        None => false,
+                    };
+                    if saved {
+                        self.add(config, reply);
+                    } else {
+                        let _ = reply.send(Err(SupervisorOperationError::Persistence));
+                    }
+                }
+            }
             Command::Add(config, reply) => self.add(config, reply),
             Command::Start(camera_id, reply) => self.start(camera_id, reply),
             Command::Stop(camera_id, reply) => self.stop(camera_id, reply, false),

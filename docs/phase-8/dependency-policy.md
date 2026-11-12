@@ -102,14 +102,23 @@ Roadmap instruction 11. Targets, in threat-model priority order:
    hand-rolled and reachable pre-authentication.
 3. `apps/server` recording time-range and query parsing.
 
-Status: **not implemented.** `cargo-fuzz` requires a nightly toolchain, and this
-workspace pins `rust-version = "1.88"` on stable with `unsafe_code = "forbid"`.
-Introducing a nightly toolchain to the gate is a change to the build contract
-that belongs in its own decision, not as a side effect of Phase 8.
+Status: **partially implemented.** [ADR 018](../adr/018-isolated-playback-fuzzing.md)
+keeps nightly and libFuzzer in a separate tooling workspace. The normal
+workspace retains its pinned stable toolchain and `unsafe_code = "forbid"`.
+Its default-disabled `fuzzing` feature only exposes an in-memory parser harness.
 
-What exists instead, and what it is worth: the depayloader has explicit
-rejection tests for malformed, truncated, oversized, and discontinuous payloads
-(Phase 0/2), and the HTTP layer has bounded-request and malformed-request tests.
-Those are hand-chosen cases, not a fuzzer. The roadmap item is recorded `[~]`,
-not `[x]`, and the gap is that nobody has run a coverage-guided fuzzer against
-these parsers.
+`fuzz/` contains two coverage-guided targets: playback range/segment planning,
+and playback HTTP/query/cursor parsing. Commands, bounds, seed cases, and replay
+instructions are in [the fuzz README](../../fuzz/README.md). Execution evidence,
+including a confirmed cursor bug, is in
+[the playback fuzz report](playback-fuzzing-2026-10-31.md).
+
+The HTTP harness owns its program entry point to avoid a transitive native
+library's `main` taking over on macOS. A small documented unsafe FFI call to
+libFuzzer is confined to this test binary, outside the production workspace.
+No unsafe production Rust was introduced.
+
+Camera H.264 depayloading, socket framing, and configuration fuzzing remain
+absent. Existing deterministic malformed-request/media rejection tests remain
+valuable but are not reported as coverage-guided fuzzing. The roadmap item stays
+`[~]`, not `[x]`; a short clean run is not a full security qualification.

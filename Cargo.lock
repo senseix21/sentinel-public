@@ -3598,6 +3598,7 @@ name = "surveillance-server"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "fs2",
  "jiff",
  "serde",
  "serde_json",

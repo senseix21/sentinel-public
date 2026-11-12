@@ -5,6 +5,7 @@ pub mod auth;
 pub mod cameras;
 pub mod config;
 pub mod events;
+pub mod recording_sources;
 pub mod recordings;
 pub mod rois;
 pub mod settings;

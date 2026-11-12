@@ -244,6 +244,22 @@ async fn overlap_query_is_camera_scoped_half_open_ordered_and_paginated() {
             .await
             .unwrap_or_else(|error| panic!("fixture insert succeeds: {error}"));
     }
+    let archives = repository
+        .archive_cameras(Some(vec!["query-camera".to_owned()]))
+        .await
+        .unwrap_or_else(|error| panic!("archive scope query: {error}"));
+    assert_eq!(archives, vec!["query-camera"]);
+    assert!(repository
+        .archive_cameras(Some(Vec::new()))
+        .await
+        .unwrap_or_else(|error| panic!("empty archive scope: {error}"))
+        .is_empty());
+    let all_archives = repository
+        .archive_cameras(None)
+        .await
+        .unwrap_or_else(|error| panic!("all archive cameras: {error}"));
+    assert!(all_archives.contains(&"query-camera".to_owned()));
+    assert!(all_archives.contains(&"other-camera".to_owned()));
     let range = RecordingTimeRange::new(
         SystemTime::UNIX_EPOCH + Duration::from_secs(630),
         SystemTime::UNIX_EPOCH + Duration::from_secs(750),
@@ -391,4 +407,106 @@ async fn retention_claim_is_oldest_first_bounded_and_recoverable() {
             .unwrap_or_else(|error| panic!("status: {error}")),
         Some(RecordingStatus::Completed)
     );
+}
+
+#[tokio::test]
+#[ignore = "requires scripts/phase4/postgres-fixture.sh"]
+async fn archive_indexes_isolate_duplicate_ids_paths_and_retention() {
+    let repository = repository(2, Duration::from_secs(2)).await;
+    repository
+        .migrate()
+        .await
+        .unwrap_or_else(|error| panic!("migration: {error}"));
+    let first_id = repository
+        .register_recording_source(
+            std::path::Path::new("/archive-fixture/first"),
+            "First archive",
+        )
+        .await
+        .unwrap_or_else(|error| panic!("register: {error}"));
+    let second_id = repository
+        .register_recording_source(
+            std::path::Path::new("/archive-fixture/second"),
+            "Second archive",
+        )
+        .await
+        .unwrap_or_else(|error| panic!("register: {error}"));
+    let first = repository
+        .for_archive(&first_id)
+        .unwrap_or_else(|error| panic!("scope: {error}"));
+    let second = repository
+        .for_archive(&second_id)
+        .unwrap_or_else(|error| panic!("scope: {error}"));
+    let id = RecordingId::new("archive-duplicate").unwrap_or_else(|error| panic!("id: {error}"));
+    let camera = CameraId::new("archive-camera").unwrap_or_else(|error| panic!("camera: {error}"));
+    for (scoped, timestamp) in [(&repository, 60), (&first, 120), (&second, 180)] {
+        let row = completed(
+            id.as_str(),
+            camera.as_str(),
+            "archive-camera/same.mp4",
+            timestamp,
+        );
+        scoped
+            .insert_or_confirm_completed(&row)
+            .await
+            .unwrap_or_else(|error| panic!("source insert: {error}"));
+        scoped
+            .insert_or_confirm_completed(&row)
+            .await
+            .unwrap_or_else(|error| panic!("source replay: {error}"));
+        let result = scoped
+            .find_completed(&camera, &id)
+            .await
+            .unwrap_or_else(|error| panic!("source read: {error}"));
+        assert_eq!(
+            result.map(|row| row.started_at()),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(timestamp))
+        );
+    }
+    assert!(first
+        .claim_retention_candidates(SystemTime::now(), SystemTime::now(), 10, u64::MAX)
+        .await
+        .is_err());
+    assert!(first.deletion_pending_page(10).await.is_err());
+    assert!(first.finalize_deletion(&id).await.is_err());
+    first
+        .mark_inconsistent(&id)
+        .await
+        .unwrap_or_else(|error| panic!("mark: {error}"));
+    assert!(repository
+        .find_completed(&camera, &id)
+        .await
+        .unwrap_or_else(|error| panic!("primary: {error}"))
+        .is_some());
+    assert!(second
+        .find_completed(&camera, &id)
+        .await
+        .unwrap_or_else(|error| panic!("second: {error}"))
+        .is_some());
+    assert!(first
+        .find_completed(&camera, &id)
+        .await
+        .unwrap_or_else(|error| panic!("first: {error}"))
+        .is_none());
+    assert!(second
+        .source_cameras(Some(Vec::new()))
+        .await
+        .unwrap_or_else(|error| panic!("scope: {error}"))
+        .is_empty());
+    assert_eq!(
+        second
+            .source_cameras(None)
+            .await
+            .unwrap_or_else(|error| panic!("summary: {error}"))[0]
+            .recordings,
+        1
+    );
+    let repeated = repository
+        .register_recording_source(
+            std::path::Path::new("/archive-fixture/second"),
+            "Second archive",
+        )
+        .await
+        .unwrap_or_else(|error| panic!("register again: {error}"));
+    assert_eq!(repeated, second_id);
 }

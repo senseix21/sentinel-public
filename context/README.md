@@ -4,6 +4,14 @@ This directory contains compact, dated handoff snapshots. Its purpose is to let 
 
 ## Latest snapshot
 
+**2026-11-01 (Playback folders):** [Dashboard recording folders](2026-11-01/playback-folders.md) — choose an existing server folder after plain `make run`; bounded read-only indexing, durable source namespaces, source-scoped playback and recording dates. Both actual server recording collections decoded in Chromium.
+
+**2026-11-01:** [Camera-independent startup](2026-11-01/camera-independent-startup.md) — durable dashboard camera setup, desired state, write-only RTSP credentials, separate dependency readiness and archived-camera playback. Local workspace, PostgreSQL and browser checks passed; see the snapshot for scope and remaining hardware gates.
+
+**2026-10-31:** [`context/2026-10-31/`](2026-10-31/) — isolated playback fuzz targets ran 605,965 clean executions after finding and fixing two cursor bugs; 592 workspace tests passed with 39 ignored. Plain macOS release remains blocked by the SQLx LINKEDIT issue; the explicit unstripped workaround passed. Runtime qualification and production gates from October 23 remain open.
+
+**2026-10-23:** [`context/2026-10-23/`](2026-10-23/) — RTSP consumer recovery fixed and regression-tested; three real two-viewer outage replays passed, 590 Rust tests passed, 36 recordings decoded and Rust server/detection teardown is prompt. Whole-stack shutdown still varied while waiting on LiveKit. Long-outage metadata conflicts remain a separate investigation.
+
 **2026-10-20 12:35 +06:** [`context/2026-10-20-1235/`](2026-10-20-1235/) — README startup/testing walkthrough; local system qualification passed initial live/recording checks but exposed live/detection stalls after RTSP recovery and failing dependency advisories. Read this snapshot before the historical entries below.
 
 **2026-10-09 23:36 +06:** [`context/2026-10-09-2336/`](2026-10-09-2336/) — combined default implemented; real back-facing RTSP/browser and face failure tests pass. Sustained recorder backpressure remains unresolved.
@@ -22,10 +30,10 @@ This directory contains compact, dated handoff snapshots. Its purpose is to let 
 
 Read in this order:
 
-1. [`next-actions.md`](2026-10-20-1235/next-actions.md) — remaining reliability and production gates.
-2. [`repository-status.md`](2026-10-20-1235/repository-status.md) — implementation and verification.
-3. [`architecture.md`](2026-10-09-2336/architecture.md) — combined mode and ownership.
-4. [`decisions-and-open-questions.md`](2026-10-09-2336/decisions-and-open-questions.md) — qualification gates.
+1. [`next-actions.md`](2026-10-31/next-actions.md) — focused follow-up and remaining production gates.
+2. [`repository-status.md`](2026-10-31/repository-status.md) — fuzzing implementation and verification.
+3. [`architecture.md`](2026-10-31/architecture.md) — isolated fuzz tooling and unchanged media ownership.
+4. [`decisions-and-open-questions.md`](2026-10-31/decisions-and-open-questions.md) — scope and qualification gates.
 
 The paused detection model/runtime design remains in the previous snapshot:
 [`detection-model-design.md`](2026-08-14-1914/detection-model-design.md).

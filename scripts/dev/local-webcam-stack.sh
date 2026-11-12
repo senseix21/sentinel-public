@@ -4,6 +4,8 @@ set -euo pipefail
 # Local development stack without an RTSP proxy:
 # webcam -> server-owned FFmpeg -> bounded H.264 distributor -> recorder/LiveKit.
 
+source_mode="${SENTINEL_SOURCE_MODE:-webcam}"
+[[ "${source_mode}" == none || "${source_mode}" == webcam || "${source_mode}" == fixture ]] || { echo "invalid SENTINEL_SOURCE_MODE" >&2; exit 1; }
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 state_dir="${STATE_DIR:-${repo_root}/.local/webcam-run}"
 log_dir="${state_dir}/logs"
@@ -147,8 +149,12 @@ trap 'exit 0' INT TERM
 banner
 status "BOOT" "Starting the MediaMTX-free local stack"
 source "${repo_root}/scripts/dev/onnx-defaults.sh"
-prepare_onnx
-status "SOURCE" "${camera_id} · ${webcam_backend}:${webcam_device} · ${video_width}x${video_height} @ ${video_fps} FPS · ${video_bitrate_kbps} kbps"
+if [[ "${source_mode}" != none ]]; then
+  prepare_onnx
+  status "SOURCE" "${camera_id} · ${webcam_backend}:${webcam_device} · ${video_width}x${video_height} @ ${video_fps} FPS · ${video_bitrate_kbps} kbps"
+else
+  status "SOURCE" "No bootstrap camera; configure RTSP cameras on the dashboard"
+fi
 if [[ -f "${pg_data}/postmaster.pid" ]] && pg_ctl -D "${pg_data}" status >/dev/null 2>&1; then
   fail "PostgreSQL is already running from ${pg_data}; stop it before retrying"
 fi
@@ -203,7 +209,12 @@ export SURVEILLANCE_CAMERA_ID="${camera_id}"
 # construction when SURVEILLANCE_WEBCAM_DEVICE is present.
 source_description="FFmpeg · ${webcam_backend}:${webcam_device}"
 source_note="MediaMTX is not running. FFmpeg is owned by the Rust camera session."
-if [[ -n "${SENTINEL_RTSP_FIXTURE_URL:-}" ]]; then
+if [[ "${source_mode}" == none ]]; then
+  unset SURVEILLANCE_CAMERA_ID SURVEILLANCE_RTSP_URL SURVEILLANCE_WEBCAM_DEVICE SURVEILLANCE_RTSP_USERNAME SURVEILLANCE_RTSP_PASSWORD
+  camera_id="none (configure on dashboard)"
+  source_description="No bootstrap camera"
+  source_note="Open Cameras in the dashboard to register an RTSP camera, then press Start."
+elif [[ -n "${SENTINEL_RTSP_FIXTURE_URL:-}" ]]; then
   python3 - "${SENTINEL_RTSP_FIXTURE_URL}" <<'PYFIXTURE' || fail "fixture URL must be credential-free loopback RTSP"
 import sys
 from urllib.parse import urlsplit
@@ -225,6 +236,7 @@ export SURVEILLANCE_WEBCAM_KEYFRAME_INTERVAL="${video_fps}"
 export SURVEILLANCE_VIDEO_WIDTH="${video_width}"
 export SURVEILLANCE_VIDEO_HEIGHT="${video_height}"
 export SURVEILLANCE_RECORDING_ROOT="${recording_root}"
+export SURVEILLANCE_CAMERA_CATALOG_PATH="${SURVEILLANCE_CAMERA_CATALOG_PATH:-${state_dir}/cameras.json}"
 export SURVEILLANCE_HEALTH_BIND="127.0.0.1:${server_port}"
 export SURVEILLANCE_DATABASE_URL="${database_url}"
 export SURVEILLANCE_DETECTION_ENABLED="${SURVEILLANCE_DETECTION_ENABLED:-true}"
@@ -237,7 +249,7 @@ export SURVEILLANCE_LIVEKIT_API_SECRET="${livekit_api_secret}"
 export SURVEILLANCE_LIVEKIT_NAMESPACE="local"
 export RUST_LOG="${RUST_LOG:-info}"
 
-status "START" "Rust server + owned FFmpeg source · http://127.0.0.1:${server_port}"
+status "START" "Rust application · http://127.0.0.1:${server_port}"
 "${server_binary}" >"${log_dir}/server.log" 2>&1 &
 server_pid=$!
 pipeline_ready=""
@@ -250,8 +262,8 @@ for _ in {1..300}; do
   sleep 0.1
 done
 [[ -n "${pipeline_ready}" ]] \
-  || fail "camera pipeline readiness timed out; check camera permission/device and ${log_dir}/server.log"
-status "READY" "Camera pipeline · connected and recording"
+  || fail "application readiness timed out; see ${log_dir}/server.log"
+status "READY" "Application dependencies · ready (camera status is independent)"
 
 "${psql_command[@]}" >/dev/null <<SQL \
   || fail "could not create the local principal; see ${log_dir}/server.log"
@@ -288,7 +300,7 @@ cat <<EOF
 │  LIVEKIT        ws://127.0.0.1:${livekit_port}
 │  CAMERA         ${camera_id}
 │  SOURCE         ${source_description}
-│  VIDEO          ${video_width}x${video_height} @ ${video_fps} FPS · H.264
+│  VIDEO          source-specific; no capture until a camera starts
 │  LOGIN          ${dev_username} / ${dev_password}
 │  RECORDINGS     ${recording_root}
 │  LOGS           ${log_dir}

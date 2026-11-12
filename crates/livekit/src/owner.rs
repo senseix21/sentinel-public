@@ -242,14 +242,13 @@ impl<A: PublicationAdapter> LivePublicationOwner<A> {
             increment(&self.health.0.counters.connection_attempts);
             match self.adapter.connect().await {
                 Ok(()) => {
-                    publication_epoch = publication_epoch.saturating_add(1);
                     increment(&self.health.0.counters.connection_successes);
                     if failures > 0 {
                         increment(&self.health.0.counters.reconnects);
                     }
                     self.health.transition(PublicationState::Publishing, None);
                     match self
-                        .publish_session(&mut media, publication_epoch, &mut shutdown)
+                        .publish_session(&mut media, &mut publication_epoch, &mut shutdown)
                         .await
                     {
                         SessionExit::Requested => {
@@ -386,19 +385,44 @@ impl<A: PublicationAdapter> LivePublicationOwner<A> {
     ) -> Option<(Vec<u8>, u32)> {
         let Ok(annex_b) = media.annex_b(unit) else {
             increment(&self.health.0.counters.media_rejections);
+            self.health.transition(
+                PublicationState::Degraded,
+                Some(PublicationFailureCategory::MalformedMedia),
+            );
             return None;
         };
         let Ok(rtp_timestamp) = media.timestamp(epoch, unit) else {
             increment(&self.health.0.counters.media_rejections);
+            self.health.transition(
+                PublicationState::Degraded,
+                Some(PublicationFailureCategory::TimestampDiscontinuity),
+            );
             return None;
         };
         Some((annex_b, rtp_timestamp))
     }
 
+    fn timeline_changed(
+        (epoch, timestamp): (u64, surveillance_media::packet::MediaTimestamp),
+        unit: &H264AccessUnit,
+    ) -> bool {
+        epoch != unit.connection_epoch()
+            || timestamp.timebase_hz() != unit.timestamp().timebase_hz()
+            || unit.timestamp().ticks() < timestamp.ticks()
+    }
+
+    fn begin_media_run(media: &mut H264Adapter, epoch: &mut u64) -> Result<(), SessionExit> {
+        *epoch = epoch.checked_add(1).ok_or(SessionExit::Terminal(
+            PublicationFailureCategory::TimestampDiscontinuity,
+        ))?;
+        media.reset();
+        Ok(())
+    }
+
     async fn publish_session(
         &mut self,
         media: &mut H264Adapter,
-        publication_epoch: u64,
+        publication_epoch: &mut u64,
         shutdown: &mut watch::Receiver<bool>,
     ) -> SessionExit {
         let mut ready = false;
@@ -406,7 +430,7 @@ impl<A: PublicationAdapter> LivePublicationOwner<A> {
             surveillance_media::packet::MediaTimestamp,
             tokio::time::Instant,
         )> = None;
-        let mut last_timestamp = None;
+        let mut last_media = None;
         loop {
             tokio::select! {
                 biased;
@@ -416,22 +440,22 @@ impl<A: PublicationAdapter> LivePublicationOwner<A> {
                     ReceiveOutcome::Empty => {},
                     ReceiveOutcome::Item(unit) => {
                         let timestamp = unit.timestamp();
-                        if last_timestamp.is_some_and(|last: surveillance_media::packet::MediaTimestamp| {
-                            last.timebase_hz() != timestamp.timebase_hz() || timestamp.ticks() < last.ticks()
-                        }) {
+                        if last_media.is_some_and(|previous| Self::timeline_changed(previous, &unit)) {
                             self.note_timeline_discontinuity();
                             ready = false;
                             pacing_origin = None;
                         }
-                        last_timestamp = Some(timestamp);
+                        last_media = Some((unit.connection_epoch(), timestamp));
                         if !ready {
                             if !unit.is_keyframe() || !unit.has_parameter_sets() {
                                 increment(&self.health.0.counters.parameter_set_waits);
                                 continue;
                             }
+                            if let Err(exit) = Self::begin_media_run(media, publication_epoch) {
+                                return exit;
+                            }
                             ready = true;
                             pacing_origin = Some((timestamp, tokio::time::Instant::now()));
-                            self.health.transition(PublicationState::Publishing, None);
                         }
                         let Some((origin, wall_origin)) = pacing_origin else {
                             // `ready` and `pacing_origin` are set and cleared
@@ -459,7 +483,7 @@ impl<A: PublicationAdapter> LivePublicationOwner<A> {
                         // than any session, and the alternative would be to send a
                         // timestamp that ran backwards.
                         let capture_timestamp_us = i64::try_from(media_elapsed.as_micros()).unwrap_or(i64::MAX);
-                        let epoch = crate::rtp::PublicationEpoch::new(publication_epoch);
+                        let epoch = crate::rtp::PublicationEpoch::new(*publication_epoch);
                         let Some((annex_b, rtp_timestamp)) = self.adapt(media, &unit, epoch) else {
                             continue;
                         };
@@ -478,6 +502,9 @@ impl<A: PublicationAdapter> LivePublicationOwner<A> {
                         // published frame would read zero for exactly as long
                         // as the gate it controls was holding media back.
                         self.health.record_adapter(self.adapter.observe());
+                        if outcome.is_ok() {
+                            self.health.transition(PublicationState::Publishing, None);
+                        }
                         match outcome {
                             Ok(SendOutcome::Published) => {}
                             Ok(SendOutcome::Dropped) => {
@@ -872,6 +899,52 @@ mod tests {
              clears would stick for the life of the connection after the first \
              camera reconnect, which is a signal an operator learns to ignore"
         );
+    }
+
+    #[tokio::test]
+    async fn camera_epoch_and_backward_timeline_recover_without_media_rejection() {
+        for (next_epoch, next_ticks) in [(1, 0), (2, 0), (2, 180_000)] {
+            let capacity = QueueCapacity::new(4).unwrap();
+            let (distributor, subscriptions) = MediaDistributor::new(capacity, capacity);
+            drop(subscriptions.recorder);
+            let (owner, health) =
+                LivePublicationOwner::new(config(), MemoryAdapter::healthy(), subscriptions.live);
+            let (shutdown, stop) = watch::channel(false);
+            let task = tokio::spawn(owner.run(stop));
+            let first = (*keyframe_at(90_000))
+                .clone()
+                .with_connection_epoch(1)
+                .unwrap();
+            distributor.publish(Arc::new(first));
+            for _ in 0..200 {
+                if health.snapshot().counters.access_units == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert_eq!(health.snapshot().counters.access_units, 1);
+            let next = (*keyframe_at(next_ticks))
+                .clone()
+                .with_connection_epoch(next_epoch)
+                .unwrap();
+            distributor.publish(Arc::new(next));
+            for _ in 0..200 {
+                if health.snapshot().counters.access_units == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let snapshot = health.snapshot();
+            shutdown.send_replace(true);
+            task.await.unwrap();
+            assert_eq!(
+                snapshot.counters.access_units, 2,
+                "epoch {next_epoch}: publication must resume"
+            );
+            assert_eq!(snapshot.counters.media_rejections, 0);
+            assert_eq!(snapshot.counters.timestamp_discontinuities, 1);
+            assert_eq!(snapshot.state, PublicationState::Publishing);
+        }
     }
 
     /// Evidence from a publication that met a decoder binary mid-replacement.

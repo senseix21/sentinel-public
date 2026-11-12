@@ -42,6 +42,7 @@ pub struct ReconciliationOwner {
     active_partial_grace: Duration,
     interval: Duration,
     metrics: Phase4Metrics,
+    cancellation: Option<watch::Receiver<bool>>,
 }
 
 impl ReconciliationOwner {
@@ -64,12 +65,19 @@ impl ReconciliationOwner {
             active_partial_grace,
             interval,
             metrics: Phase4Metrics::default(),
+            cancellation: None,
         }
     }
 
     #[must_use]
     pub fn with_metrics(mut self, metrics: Phase4Metrics) -> Self {
         self.metrics = metrics;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cancellation(mut self, cancellation: watch::Receiver<bool>) -> Self {
+        self.cancellation = Some(cancellation);
         self
     }
 
@@ -122,6 +130,13 @@ impl ReconciliationOwner {
             ..ReconciliationPass::default()
         };
         for candidate in discovery.candidates {
+            if self
+                .cancellation
+                .as_ref()
+                .is_some_and(|signal| *signal.borrow())
+            {
+                return Err("cancelled");
+            }
             let path = candidate_path(&candidate);
             let Ok(identity) = ReconciliationIdentity::parse(&self.layout, path) else {
                 pass.malformed = pass.malformed.saturating_add(1);
@@ -264,6 +279,13 @@ impl ReconciliationOwner {
 
         let mut cursor = None;
         loop {
+            if self
+                .cancellation
+                .as_ref()
+                .is_some_and(|signal| *signal.borrow())
+            {
+                return Err("cancelled");
+            }
             let page = self
                 .repository
                 .completed_evidence_page(cursor.as_ref(), self.database_page)

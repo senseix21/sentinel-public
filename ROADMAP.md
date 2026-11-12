@@ -370,6 +370,7 @@ Publish live camera feeds with low latency without coupling LiveKit availability
 ### Tests
 
 - [x] Publisher starts/stops without adding an upstream camera connection.
+- [x] Local RTSP camera-epoch recovery: reset pacing, RTP mapping and viewer-gated decoder as one media run; two existing Chromium viewers resume and detection/recording continue. `scripts/dev/check-rtsp-recovery.cjs` and deterministic teardown/timestamp regressions cover the 2026-10-20 failure. Representative-camera and LiveKit-server outage gates remain separate.
 - [~] LiveKit startup outage and bounded slow writes do not interrupt recorder admission; real server stop/restart while recording remains to be deterministically qualified.
 - [~] Shutdown leaves no publisher process; duplicate-track recovery after real server restart remains unverified.
 - [x] A non-retryable adapter failure stops publication once instead of reconnecting forever, and recording continues. Covered by `a_non_retryable_send_failure_stops_publication_instead_of_reconnecting`, and measured live on 2026-08-16: `livekit_connection_attempts_total=1`, `send_failures_total=1`, `state=8` (Stopped), `camera_connection_epochs_total=1`, `recorder_segments_completed_total=8`. Evidence: `docs/phase-5/local-evidence-2026-08-16.md`.
@@ -493,9 +494,28 @@ remains unconfirmed**, which blocks items 8 and 9 in part.
 - [!] Package the service for the confirmed Linux target with restart and resource limits. Blocked: no confirmed distribution, unit type, storage layout, or upgrade owner. ADR 009 declines to guess one.
 - [~] Write deployment, upgrade, rollback, backup/restore, disk-full, camera-offline, database-outage, and LiveKit-outage runbooks. The four target-independent runbooks are written in `docs/phase-8/runbooks/`. Deployment, upgrade, rollback, and backup/restore are blocked on the same unconfirmed target. Of the four written, three were exercised and the LiveKit one was not; none was executed by a separate operator following it literally, which is the standard the handoff sets.
 - [x] Add dependency policy with `cargo audit`/`cargo deny` and document system-library patching. `deny.toml`, `.cargo/audit.toml`, and `make audit` in the gate; both pass. `docs/phase-8/dependency-policy.md` documents the FFmpeg/RTSP patching cadence and trigger. RUSTSEC-2023-0071 is ignored with verification that `rsa` is not in the build graph, not with a blanket exclusion.
-- [!] Fuzz externally supplied parsers and range/configuration inputs where useful. Not implemented: `cargo-fuzz` needs a nightly toolchain, and adding one to a gate pinned to stable 1.88 with `unsafe_code = "forbid"` is its own decision. Targets are named and prioritised in `docs/phase-8/dependency-policy.md`. Existing hand-chosen rejection tests are not a substitute and are not reported as one.
+- [~] Fuzz externally supplied parsers and range/configuration inputs where useful. ADR 018 isolates nightly/libFuzzer in `fuzz/`, preserving the production stable toolchain. Coverage-guided playback HTTP/query/cursor and segment-plan targets are implemented and exercised; the cursor round-trip invariant exposed a pre-Unix-epoch pagination bug, with a failing stable regression captured before its fix. See `fuzz/README.md` for reproducible bounded runs and `docs/phase-8/playback-fuzzing-2026-10-31.md` for evidence and limits. Camera H.264 depayloading, socket framing, and configuration fuzzing remain unimplemented; the overall item is not complete.
 
 ### Operator dashboard (not a Phase 8 instruction; recorded because it ships)
+
+- [x] Playback recording-folder picker (2026-11-01, ADR 020): approved server
+  folders can be selected after plain `make run`. One bounded owned worker
+  indexes media in place into durable source namespaces, without copying or
+  deleting archives. Camera-scoped search/playback URLs carry source identity;
+  current recorder retention cannot claim archive rows. Folder/camera/date
+  selection and actual browser decoding are exercised with duplicate IDs across
+  two archives, and source indexes survive process-owner restart.
+
+
+- [x] Camera-independent startup (2026-11-01, ADR 019): `make run` starts the
+  dashboard without a webcam or bootstrap RTSP camera. Supervisor-owned secret
+  catalog persists dashboard registration and running/stopped intent; credentials
+  are write-only. Camera failures are separate from application readiness.
+  Playback merges runtime and indexed archive identities. `make webcam` and
+  `make fixture` retain explicit manual sources. Verified with zero-camera login,
+  authenticated RTSP configuration, offline start, restart, stop/remove and
+  archive scope tests. Physical RTSP camera connectivity remains unqualified.
+
 
 - [~] Local live decoding qualified on 2026-10-09 after a reported blank-video
   failure: signalling succeeded but ICE received zero bytes because the dev SFU

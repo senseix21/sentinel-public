@@ -1,0 +1,2 @@
+# Preserve exact fuzz inputs, including HTTP CRLF and deliberately invalid UTF-8.
+seeds/** binary

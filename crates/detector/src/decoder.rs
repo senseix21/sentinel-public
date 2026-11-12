@@ -306,6 +306,9 @@ fn stop_decoder(active: &mut Option<ActiveDecoder>) {
     let Some(mut decoder) = active.take() else {
         return;
     };
+    // Disconnect before joining: the reader may be blocked sending a flushed
+    // frame into this bounded queue. Killing FFmpeg cannot unblock that send.
+    drop(decoder.frames);
     drop(decoder.input);
     let _ = decoder.child.kill();
     let _ = decoder.child.wait();
@@ -343,4 +346,46 @@ fn frame_bytes(width: u32, height: u32) -> Result<usize, DecodeError> {
         .and_then(|width| width.checked_mul(height as usize))
         .and_then(|pixels| pixels.checked_mul(3))
         .ok_or(DecodeError::Oversized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stopping_with_a_full_frame_queue_joins_the_reader() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take().unwrap();
+        let (frames_tx, frames) = mpsc::sync_channel(1);
+        frames_tx.send(Ok(Arc::from([0_u8]))).unwrap();
+        let (sending, started) = mpsc::sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            sending.send(()).unwrap();
+            // Full queue: teardown must disconnect the receiver before joining.
+            let _ = frames_tx.send(Ok(Arc::from([1_u8])));
+        });
+        started.recv().unwrap();
+        let mut active = Some(ActiveDecoder {
+            child,
+            input,
+            frames,
+            reader: Some(reader),
+            epoch: 1,
+            pending: std::collections::VecDeque::new(),
+        });
+        let (done, finished) = mpsc::sync_channel(1);
+        let stopper = std::thread::spawn(move || {
+            stop_decoder(&mut active);
+            done.send(()).unwrap();
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "reset/drop must unblock the frame reader before joining it"
+        );
+        stopper.join().unwrap();
+    }
 }

@@ -18,6 +18,8 @@ pub enum TimestampAuthority {
 pub struct EncodedAccessUnit<'a> {
     pub annex_b: &'a [u8],
     pub rtp_timestamp: u32,
+    /// Monotonic decodable-run identity. Changes on room reconnect or media
+    /// discontinuity; adapters must discard decoder state from an older run.
     pub epoch: u64,
     /// Whether a decoder can begin here: an IDR carrying its parameter sets.
     ///
